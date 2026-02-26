@@ -16,14 +16,11 @@ pub struct ScopeRule {
 
 #[derive(Debug)]
 pub struct Config {
-    pub claude_bin: String,
     pub max_tail: usize,
     pub log_dir: Option<String>,
     pub image: Option<String>,
     pub scope_rules: Vec<ScopeRule>,
     pub guards: Vec<String>,
-    pub runner: String,
-    pub judge: Option<String>,
 }
 
 impl Config {
@@ -31,15 +28,11 @@ impl Config {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {}", path.display(), e))?;
 
-        let mut claude_bin = String::from("claude");
         let mut max_tail: usize = 200;
         let mut log_dir: Option<String> = None;
         let mut image: Option<String> = None;
         let mut scope_rules = Vec::new();
         let mut guards = Vec::new();
-        let mut runner = String::from("loop");
-        let mut judge: Option<String> = None;
-
         for (line_num, raw_line) in content.lines().enumerate() {
             // Strip comments
             let line = match raw_line.find('#') {
@@ -65,7 +58,6 @@ impl Config {
             };
 
             match directive {
-                "claude" => claude_bin = value.to_string(),
                 "max-tail" => {
                     max_tail = value.parse::<usize>().map_err(|_| {
                         format!(
@@ -95,8 +87,6 @@ impl Config {
                     prefix: value.to_string(),
                 }),
                 "guard" => guards.push(value.to_string()),
-                "runner" => runner = value.to_string(),
-                "judge" => judge = Some(value.to_string()),
                 other => {
                     return Err(format!(
                         "{}:{}: unknown directive '{}'",
@@ -109,14 +99,11 @@ impl Config {
         }
 
         Ok(Config {
-            claude_bin,
             max_tail,
             log_dir,
             image,
             scope_rules,
             guards,
-            runner,
-            judge,
         })
     }
 

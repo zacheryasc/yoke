@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+#[allow(dead_code)]
 pub struct GuardResult {
     pub name: String,
     pub passed: bool,

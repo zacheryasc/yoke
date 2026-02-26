@@ -4,7 +4,11 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn sigint_handler(_sig: i32) {
-    INTERRUPTED.store(true, Ordering::Relaxed);
+    if INTERRUPTED.swap(true, Ordering::Relaxed) {
+        // Second Ctrl+C — force exit immediately.
+        // _exit is async-signal-safe (unlike std::process::exit).
+        _exit(130);
+    }
     // Kill the child to close the pipe and unblock reader.lines().
     // Rust's BufReader retries on EINTR internally, so the only way
     // to break out of the blocking read is to close the write end.
@@ -17,6 +21,7 @@ extern "C" fn sigint_handler(_sig: i32) {
 unsafe extern "C" {
     safe fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     safe fn kill(pid: i32, sig: i32) -> i32;
+    safe fn _exit(status: i32) -> !;
 }
 
 pub fn install() {

@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::ChildStdout;
 
-use crate::json::{extract_num, extract_str};
+use crate::json::{extract_num, extract_str, unescape_json};
 
 // ANSI escape codes
 const RESET: &str = "\x1b[0m";
@@ -16,6 +16,7 @@ struct StreamState {
     turn_num: u32,
     current_msg_id: Option<String>,
     seen_init: bool,
+    in_thinking: bool,
 }
 
 impl StreamState {
@@ -24,6 +25,7 @@ impl StreamState {
             turn_num: 0,
             current_msg_id: None,
             seen_init: false,
+            in_thinking: false,
         }
     }
 }
@@ -127,36 +129,43 @@ pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>) {
                     );
                 }
             }
-            // assistant → probe content for tool_use or text
+            // assistant → only tool_use summaries (text already shown via stream_event deltas)
             Some("assistant") => {
                 if line.contains("\"tool_use\"") {
                     let desc = format_tool_call(&line);
                     println!("{}{}>>{} {}{}", YELLOW, BOLD, RESET, desc, RESET);
-                } else if let Some(text) = extract_str(&line, "text") {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        for text_line in trimmed.lines() {
-                            println!("{}  {}{}", DIM, text_line, RESET);
-                        }
-                    }
                 }
             }
             // stream_event → streaming deltas
             Some("stream_event") => {
                 if line.contains("\"content_block_delta\"") {
-                    if line.contains("\"text_delta\"") {
-                        if let Some(text) = extract_str(&line, "text") {
-                            print!("{}{}{}", DIM, text, RESET);
-                            std::io::stdout().flush().ok();
-                        }
+                    if line.contains("\"thinking_delta\"") {
+                        // Show activity during extended thinking
+                        print!("{}·{}", DIM, RESET);
+                        std::io::stdout().flush().ok();
+                    } else if line.contains("\"text_delta\"")
+                        && let Some(text) = extract_str(&line, "text")
+                    {
+                        let text = unescape_json(text);
+                        print!("{}{}{}", DIM, text, RESET);
+                        std::io::stdout().flush().ok();
                     }
                     // input_json_delta → skip silently
                 } else if line.contains("\"content_block_start\"") {
-                    if !line.contains("\"tool_use\"") {
+                    if line.contains("\"thinking\"") {
+                        print!("{}{}thinking {}", DIM, CYAN, RESET);
+                        std::io::stdout().flush().ok();
+                        state.in_thinking = true;
+                    } else if !line.contains("\"tool_use\"") {
                         println!();
                     }
                 } else if line.contains("\"content_block_stop\"") {
-                    println!();
+                    if state.in_thinking {
+                        println!();
+                        state.in_thinking = false;
+                    } else {
+                        println!();
+                    }
                 }
                 // message_start, message_delta, message_stop → skip
             }

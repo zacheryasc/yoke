@@ -9,6 +9,7 @@ pub struct BoundaryResult {
 
 /// Collect all changed files from git (staged, unstaged, and untracked).
 /// Returns (changed_files, deleted_files, modified_files).
+#[allow(clippy::type_complexity)]
 fn collect_changes() -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
@@ -113,6 +114,13 @@ pub fn check(config: &Config) -> BoundaryResult {
     let mut violations = Vec::new();
 
     for file in &changed {
+        // Skip .loop/ files — they are harness infrastructure, not user code.
+        // The protocol requires Claude to write notes.md, and the harness
+        // itself writes guard-results.md and verdict.md.
+        if file.starts_with(".loop/") {
+            continue;
+        }
+
         let tag = config.resolve_tag(file);
 
         match tag {

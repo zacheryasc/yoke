@@ -1,3 +1,29 @@
+/// Unescape basic JSON string escape sequences into real characters.
+pub fn unescape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Extract the string value for a given key from a flat JSON line.
 /// Looks for `"key": "value"` and returns the value (unescaped basic sequences).
 /// Returns `None` if the key is not found or the value is not a string.

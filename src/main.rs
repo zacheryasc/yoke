@@ -16,7 +16,6 @@ const NOTES_PATH: &str = ".loop/notes.md";
 const GUARD_RESULTS_PATH: &str = ".loop/guard-results.md";
 const PROTOCOL_PATH: &str = ".loop/protocol.md";
 const PLAN_PATH: &str = ".loop/plan.md";
-const TASK_PATH: &str = ".loop/task.md";
 const JUDGE_PATH: &str = ".loop/judge.md";
 const VERDICT_PATH: &str = ".loop/verdict.md";
 
@@ -84,12 +83,12 @@ You may run any commands you find useful during implementation.
 - **One stage per iteration.** Implement a single stage, update notes, and exit. Do not attempt multiple stages.
 - **Retry discipline.** If you have failed on the same issue for 3 consecutive iterations (check your notes), try a fundamentally different approach. Do not repeat the same fix.
 - **Be concise in notes.** Future-you needs signal, not noise. Record what matters: what stage, what changed, what broke, what to try next.
+- **Do not waste time.** Set sane timeouts and do not lets tests run indefinitely. Do not run the full test suite before exiting, if the guard check is going to do that anyway.
 "#;
 
 const DEFAULT_GUARD_CONF: &str = "\
 # Guard configuration
 
-claude      claude
 image       claude-code-sandbox:latest
 
 # Max lines of guard output to keep
@@ -104,57 +103,80 @@ allow       .
 guard       cargo check
 ";
 
-const DEFAULT_BRUTE_PROTOCOL: &str = r#"# Brute Protocol
+const DEFAULT_BRUTE_PROTOCOL: &str = r#"# Protocol: Brute + Plan Runner (Triple Loop)
 
-You are a worker in an automated brute-force loop. Your single goal is described
-in `.loop/task.md`. You iterate until a blind judge (a separate Claude instance
-with zero implementation context) confirms the task is complete.
+You are operating inside an automated triple loop — not a conversation.
+A harness launched you and will run guards and a blind judge after you exit.
+
+The outer brute loop retries until a judge says PASS.
+Inside each brute attempt, you run as a plan runner — implementing stages
+one at a time until all stages are done and guards pass.
 
 ## Files
 
 | File | Access | Purpose |
 |---|---|---|
 | `.loop/protocol.md` | read | These instructions. |
-| `.loop/task.md` | read | The goal. |
-| `.loop/judge.md` | read | What the judge will test. Study this. |
+| `.loop/plan.md` | read | The feature plan with stages to implement. |
+| `.loop/judge.md` | read | What the judge will test. Study this — knowing the test helps you pass it. |
 | `.loop/notes.md` | read+write | Your scratchpad across iterations. |
-| `.loop/verdict.md` | read | The judge's last verdict. |
-| `.loop/ci.conf` | read | Configuration. |
+| `.loop/verdict.md` | read | The judge's last verdict (from previous brute attempt). |
+| `.loop/guard-results.md` | read | Guard results from the last iteration. |
+| `.loop/guard.conf` | read | Configuration. Scope rules, guards, settings. |
 
-## Per-Iteration
+All paths are relative to the repository root.
 
-1. Read `.loop/task.md` — understand the goal.
-2. Read `.loop/notes.md` — recall what you have tried.
-3. Read `.loop/verdict.md` — the judge's exact complaints from last iteration.
-4. Make changes to accomplish the task.
-5. Update `.loop/notes.md` with what you changed and why.
-6. Exit — the harness runs guards then the judge.
+## Per-Iteration Steps
+
+1. **Read the plan** (`.loop/plan.md`). Understand the full feature and all its stages.
+2. **Read your notes** (`.loop/notes.md`). This is your memory — check which stage you are on, what you tried, and what you learned.
+3. **Read the verdict** (`.loop/verdict.md`). If the judge previously failed your work, this contains their exact complaints. Fix what they say is broken before advancing.
+4. **Read guard results** (`.loop/guard-results.md`). If non-empty, the previous iteration's guards ran. If a guard failed, fix it before advancing.
+5. **Determine task**. Either fix a guard/judge failure or implement the next incomplete stage.
+6. **Implement**. Make the code changes for exactly one stage.
+7. **Update notes**. Write to `.loop/notes.md`:
+   - Which stage you just worked on
+   - What you changed and why
+   - Any issues or observations for your future self
+   - A `STATUS` line at the **top** of the file (see below)
+8. **Exit**. Stop. Do not loop — the outer script handles iteration.
+
+## STATUS Signaling
+
+The first line of `.loop/notes.md` must be one of:
+
+- `STATUS: IN_PROGRESS` — You have more work to do (stages remain, or you expect guard failures).
+- `STATUS: DONE` — All stages are implemented and you believe guards will pass.
+
+## What Happens After You Exit
+
+1. Guards run (diff boundary check + configured guard commands).
+2. If guards pass and STATUS is DONE, the plan loop ends.
+3. Then the judge (a fresh Claude with zero implementation context) verifies the feature.
+4. If the judge says FAIL, you get another brute attempt — your notes are preserved but STATUS is reset to IN_PROGRESS so you re-enter the plan loop with the judge's feedback.
 
 ## Rules
 
-- No git operations.
-- Do not modify protocol.md, task.md, judge.md, or ci.conf.
-- Study judge.md — knowing the test helps you pass it.
-- The judge's feedback is ground truth. Fix what they say is broken.
-- After 3 similar verdicts, try a fundamentally different approach.
-- Be concise in notes.
+- **No git operations.** Do not commit, push, branch, or modify git config.
+- **Do not modify `protocol.md`, `plan.md`, `judge.md`, or `guard.conf`.** These are read-only.
+- **One stage per iteration.** Implement a single stage, update notes, and exit.
+- **Study judge.md.** Knowing the test helps you pass it.
+- **The judge's feedback is ground truth.** Fix what they say is broken.
+- **Retry discipline.** If you have failed on the same issue for 3 consecutive iterations, try a fundamentally different approach.
+- **Be concise in notes.** Future-you needs signal, not noise.
+- **Do not waste time.** Set sane timeouts and do not lets tests run indefinitely. Do not run the full test suite before exiting, if the guard check is going to do that anyway.
 "#;
 
 const DEFAULT_BRUTE_CONF: &str = "\
 # Brute runner configuration
 
-runner      brute
-claude      claude
+image       claude-code-sandbox:latest
 max-tail    200
 
 allow       .
 
-# Guards (run before judge, fail-fast)
+# Guards (run after each plan stage, fail-fast)
 guard       cargo check
-
-# Judge — a fresh Claude that verifies the feature blind.
-# The value is the Claude binary (same format as the claude directive).
-judge       claude
 ";
 
 /// Files that Claude must not be allowed to permanently alter.
@@ -190,19 +212,19 @@ fn print_usage() {
     eprintln!();
     eprintln!("{}COMMANDS:{}", BOLD, RESET);
     eprintln!(
-        "  {}init{}                    Initialize .loop/ directory with default files",
+        "  {}init{}             Initialize .loop/ for staged plan loop (default)",
         BOLD, RESET
     );
     eprintln!(
-        "  {}init --runner <type>{}    Initialize for a specific runner (loop or brute)",
+        "  {}init brute{}       Initialize .loop/ for brute mode (plan stages + judge)",
         BOLD, RESET
     );
     eprintln!(
-        "  {}run{}                     Launch the CI loop (invoke Claude, run guards, iterate)",
+        "  {}run{}              Launch the loop (invoke Claude, run guards, iterate)",
         BOLD, RESET
     );
     eprintln!(
-        "  {}run --dry-run{}           Single iteration: boundary check + guards only, no Claude",
+        "  {}run --dry-run{}    Single iteration: boundary check + guards only, no Claude",
         BOLD, RESET
     );
     eprintln!();
@@ -221,7 +243,7 @@ fn print_usage() {
 
 fn print_run_help() {
     eprintln!(
-        "{}{}yoke run{} — execute the CI loop{}",
+        "{}{}yoke run{} — execute the loop{}",
         BOLD, CYAN, RESET, RESET
     );
     eprintln!();
@@ -231,13 +253,14 @@ fn print_run_help() {
     );
     eprintln!();
     eprintln!("{}OPTIONS:{}", BOLD, RESET);
-    eprintln!("  --dry-run    Run one iteration without invoking Claude");
-    eprintln!("               (boundary check + configured guards only)");
+    eprintln!("  --dry-run       Run one iteration without invoking Claude");
+    eprintln!("                  (boundary check + configured guards only)");
+    eprintln!("  --no-sandbox    Allow running without a container image");
     eprintln!();
-    eprintln!("{}RUNNER TYPES:{}", BOLD, RESET);
-    eprintln!("  The runner type is determined by the 'runner' directive in {}.", CONF_PATH);
-    eprintln!("  {}loop{}    (default) Staged plan runner — iterates until STATUS: DONE and guards pass.", BOLD, RESET);
-    eprintln!("  {}brute{}   Blind-judge runner — iterates until an independent judge says PASS.", BOLD, RESET);
+    eprintln!("{}MODES:{}", BOLD, RESET);
+    eprintln!("  Detected automatically from .loop/ contents.");
+    eprintln!("  {}loop{}    (default) Staged plan loop — iterates until STATUS: DONE and guards pass.", BOLD, RESET);
+    eprintln!("  {}brute{}   Plan stages + judge — detected when {} exists.", BOLD, RESET, JUDGE_PATH);
     eprintln!();
     eprintln!("{}WORKFLOW (loop):{}", BOLD, RESET);
     eprintln!("  1. Load config from {}", CONF_PATH);
@@ -251,12 +274,12 @@ fn print_run_help() {
     eprintln!();
     eprintln!("{}WORKFLOW (brute):{}", BOLD, RESET);
     eprintln!("  1. Load config from {}", CONF_PATH);
-    eprintln!("  2. Backup protected files (protocol.md, task.md, judge.md, ci.conf)");
-    eprintln!("  3. Per iteration:");
+    eprintln!("  2. Backup protected files (protocol.md, plan.md, task.md, judge.md, guard.conf)");
+    eprintln!("  3. Per brute attempt:");
     eprintln!("     a. Restore protected files, clear verdict");
-    eprintln!("     b. Invoke worker Claude");
-    eprintln!("     c. Run diff boundary check + configured guards");
-    eprintln!("     d. If guards pass, invoke judge (fresh Claude, zero context)");
+    eprintln!("     b. Run plan loop (stages + guards until DONE)");
+    eprintln!("     c. Invoke judge (fresh Claude, zero context)");
+    eprintln!("     d. If judge FAILs, reset STATUS and retry");
     eprintln!("  4. Exit when judge returns VERDICT: PASS");
 }
 
@@ -267,19 +290,17 @@ fn print_init_help() {
     );
     eprintln!();
     eprintln!(
-        "{}USAGE:{} yoke init [--runner <type>]",
+        "{}USAGE:{} yoke init [brute]",
         BOLD, RESET
     );
     eprintln!();
-    eprintln!("{}OPTIONS:{}", BOLD, RESET);
-    eprintln!("  --runner <type>  Runner type: loop (default) or brute");
+    eprintln!("{}MODES:{}", BOLD, RESET);
+    eprintln!("  {}(default){}  Staged plan loop. Creates:", BOLD, RESET);
+    eprintln!("              guard.conf, protocol.md, plan.md, notes.md, guard-results.md");
     eprintln!();
-    eprintln!("{}RUNNER TYPES:{}", BOLD, RESET);
-    eprintln!("  {}loop{}   (default) Staged plan runner. Creates:", BOLD, RESET);
-    eprintln!("           ci.conf, protocol.md, plan.md, notes.md, guard-results.md");
-    eprintln!();
-    eprintln!("  {}brute{}  Blind-judge runner. Creates:", BOLD, RESET);
-    eprintln!("           ci.conf, protocol.md, task.md, judge.md, notes.md, verdict.md");
+    eprintln!("  {}brute{}      Plan stages + judge. Creates:", BOLD, RESET);
+    eprintln!("              guard.conf, protocol.md, plan.md, task.md, judge.md,");
+    eprintln!("              notes.md, verdict.md, guard-results.md");
     eprintln!();
     eprintln!("Existing files are never overwritten.");
 }
@@ -326,11 +347,11 @@ fn preflight() {
         }
     }
     // Ensure notes file exists
-    if !Path::new(NOTES_PATH).exists() {
-        if let Err(e) = fs::write(NOTES_PATH, "") {
-            log_error(&format!("cannot create {}: {}", NOTES_PATH, e));
-            process::exit(1);
-        }
+    if !Path::new(NOTES_PATH).exists()
+        && let Err(e) = fs::write(NOTES_PATH, "")
+    {
+        log_error(&format!("cannot create {}: {}", NOTES_PATH, e));
+        process::exit(1);
     }
     // Clear guard results
     let _ = fs::write(GUARD_RESULTS_PATH, "");
@@ -361,13 +382,13 @@ fn restore_protected(backup_dir: &Path) {
     for path in PROTECTED_FILES {
         let src_name = Path::new(path).file_name().unwrap();
         let backup_file = backup_dir.join(src_name);
-        if backup_file.exists() {
-            if let Err(e) = fs::copy(&backup_file, path) {
-                eprintln!(
-                    "{}{}[yoke] WARNING:{} failed to restore {}: {}",
-                    BOLD, YELLOW, RESET, path, e
-                );
-            }
+        if backup_file.exists()
+            && let Err(e) = fs::copy(&backup_file, path)
+        {
+            eprintln!(
+                "{}{}[yoke] WARNING:{} failed to restore {}: {}",
+                BOLD, YELLOW, RESET, path, e
+            );
         }
     }
 }
@@ -377,6 +398,30 @@ fn is_done() -> bool {
     match fs::read_to_string(NOTES_PATH) {
         Ok(content) => content.starts_with("STATUS: DONE"),
         Err(_) => false,
+    }
+}
+
+/// Reset the STATUS line in notes.md back to IN_PROGRESS, preserving all other content.
+fn reset_notes_status() {
+    match fs::read_to_string(NOTES_PATH) {
+        Ok(content) => {
+            let new_content = if content.starts_with("STATUS: DONE") {
+                content.replacen("STATUS: DONE", "STATUS: IN_PROGRESS", 1)
+            } else if content.starts_with("STATUS: IN_PROGRESS") {
+                content // already in progress
+            } else {
+                // No STATUS line at top — prepend one
+                format!("STATUS: IN_PROGRESS\n{}", content)
+            };
+            if let Err(e) = fs::write(NOTES_PATH, new_content) {
+                log_error(&format!("failed to reset STATUS in {}: {}", NOTES_PATH, e));
+            } else {
+                log("Reset STATUS to IN_PROGRESS for next brute attempt");
+            }
+        }
+        Err(e) => {
+            log_error(&format!("failed to read {}: {}", NOTES_PATH, e));
+        }
     }
 }
 
@@ -409,7 +454,6 @@ fn invoke_claude(runner: &mut LoopRunner, config: &Config, iteration: u32) -> bo
         c.args([
             "run",
             "--rm",
-            "-i",
             "--network=host",
             "--cap-add=NET_ADMIN",
             "--cap-add=NET_RAW",
@@ -447,24 +491,25 @@ fn invoke_claude(runner: &mut LoopRunner, config: &Config, iteration: u32) -> bo
         }
 
         c.arg(image.as_str());
-        c.arg(&config.claude_bin);
+        c.arg("claude");
         c.args(claude_args);
         c
     } else {
         log(&format!("Launching Claude (iteration {})...", iteration));
-        let mut c = Command::new(&config.claude_bin);
+        let mut c = Command::new("claude");
         c.args(claude_args);
         c
     };
 
     let mut child = match cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
-            let bin = if config.image.is_some() { "docker" } else { &config.claude_bin };
+            let bin = if config.image.is_some() { "docker" } else { "claude" };
             log_error(&format!("failed to spawn '{}': {}", bin, e));
             return false;
         }
@@ -523,14 +568,6 @@ fn invoke_claude(runner: &mut LoopRunner, config: &Config, iteration: u32) -> bo
 /// Invoke the judge — a fresh Claude with zero implementation context.
 /// Returns true if the judge's verdict is PASS.
 fn invoke_judge(runner: &mut LoopRunner, config: &Config, iteration: u32) -> bool {
-    let judge_bin = match &config.judge {
-        Some(bin) => bin.clone(),
-        None => {
-            log_error("no 'judge' directive in config — cannot invoke judge");
-            return false;
-        }
-    };
-
     let judge_prompt = "\
 Read .loop/judge.md. It describes what to verify.
 Test the feature exactly as described. You have full shell access.
@@ -547,9 +584,10 @@ VERDICT: FAIL
 <what you tested, what went wrong, and what the correct behavior should be>";
 
     let claude_args = [
-        "--dangerously-skip-permissions",
+        "--verbose",
         "--output-format",
         "stream-json",
+        "--dangerously-skip-permissions",
         "-p",
         judge_prompt,
     ];
@@ -569,7 +607,6 @@ VERDICT: FAIL
         c.args([
             "run",
             "--rm",
-            "-i",
             "--network=host",
             "--cap-add=NET_ADMIN",
             "--cap-add=NET_RAW",
@@ -602,24 +639,25 @@ VERDICT: FAIL
         }
 
         c.arg(image.as_str());
-        c.arg(&judge_bin);
+        c.arg("claude");
         c.args(claude_args);
         c
     } else {
         log(&format!("Launching judge (iteration {})...", iteration));
-        let mut c = Command::new(&judge_bin);
+        let mut c = Command::new("claude");
         c.args(claude_args);
         c
     };
 
     let mut child = match cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
-            let bin = if config.image.is_some() { "docker" } else { &judge_bin };
+            let bin = if config.image.is_some() { "docker" } else { "claude" };
             log_error(&format!("failed to spawn judge '{}': {}", bin, e));
             return false;
         }
@@ -748,7 +786,7 @@ fn run_all_guards(config: &Config) -> bool {
     all_passed
 }
 
-fn init(runner: &str) -> i32 {
+fn init(mode: &str) -> i32 {
     let loop_dir = Path::new(".loop");
     if !loop_dir.exists() {
         if let Err(e) = fs::create_dir(loop_dir) {
@@ -758,7 +796,7 @@ fn init(runner: &str) -> i32 {
         log("Created .loop/");
     }
 
-    let files: Vec<(&str, &str)> = match runner {
+    let files: Vec<(&str, &str)> = match mode {
         "loop" => vec![
             (CONF_PATH, DEFAULT_GUARD_CONF),
             (PROTOCOL_PATH, DEFAULT_PROTOCOL),
@@ -769,18 +807,19 @@ fn init(runner: &str) -> i32 {
         "brute" => vec![
             (CONF_PATH, DEFAULT_BRUTE_CONF),
             (PROTOCOL_PATH, DEFAULT_BRUTE_PROTOCOL),
-            (TASK_PATH, ""),
+            (PLAN_PATH, ""),
             (JUDGE_PATH, ""),
             (NOTES_PATH, ""),
             (VERDICT_PATH, ""),
+            (GUARD_RESULTS_PATH, ""),
         ],
         other => {
-            log_error(&format!("unknown runner type '{}'", other));
+            log_error(&format!("unknown mode '{}'", other));
             return 2;
         }
     };
 
-    log(&format!("Initializing '{}' runner...", runner));
+    log(&format!("Initializing '{}' mode...", mode));
 
     for (path, content) in &files {
         let p = Path::new(path);
@@ -798,28 +837,14 @@ fn init(runner: &str) -> i32 {
     0
 }
 
-fn run_loop(dry_run: bool) -> i32 {
-    // Load config
-    let config = match Config::load(Path::new(CONF_PATH)) {
-        Ok(c) => c,
-        Err(e) => {
-            log_error(&e);
-            process::exit(1);
-        }
-    };
-
-    log(&format!(
-        "Config loaded: claude={}, max_tail={}, {} scope rules, {} guards{}",
-        config.claude_bin,
-        config.max_tail,
-        config.scope_rules.len(),
-        config.guards.len(),
-        config.image.as_ref().map_or(
-            String::from(", sandbox=off"),
-            |img| format!(", image={}", img)
-        )
-    ));
-
+/// Core plan-loop runner that can be called standalone or nested inside brute.
+///
+/// - `config`: already-loaded Config
+/// - `dry_run`: if true, skip Claude invocation (one iteration only)
+/// - `nested`: if true, running inside brute (adjusts output banners)
+///
+/// Returns Ok(()) on success (STATUS: DONE + guards pass), Err(i32) with exit code on failure.
+fn run_plan_loop(config: &Config, dry_run: bool, nested: bool) -> Result<(), i32> {
     // Preflight
     preflight();
     log("Preflight OK");
@@ -834,22 +859,37 @@ fn run_loop(dry_run: bool) -> i32 {
     loop {
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return 130;
+            return Err(130);
         }
         iteration += 1;
         eprintln!();
-        eprintln!(
-            "{}{}╔══════════════════════════════════════╗{}",
-            BOLD, CYAN, RESET
-        );
-        eprintln!(
-            "{}{}║         Iteration {:>4}              ║{}",
-            BOLD, CYAN, iteration, RESET
-        );
-        eprintln!(
-            "{}{}╚══════════════════════════════════════╝{}",
-            BOLD, CYAN, RESET
-        );
+        if nested {
+            eprintln!(
+                "{}{}┌──────────────────────────────────────┐{}",
+                BOLD, CYAN, RESET
+            );
+            eprintln!(
+                "{}{}│      Plan Iteration {:>4}             │{}",
+                BOLD, CYAN, iteration, RESET
+            );
+            eprintln!(
+                "{}{}└──────────────────────────────────────┘{}",
+                BOLD, CYAN, RESET
+            );
+        } else {
+            eprintln!(
+                "{}{}╔══════════════════════════════════════╗{}",
+                BOLD, CYAN, RESET
+            );
+            eprintln!(
+                "{}{}║         Iteration {:>4}              ║{}",
+                BOLD, CYAN, iteration, RESET
+            );
+            eprintln!(
+                "{}{}╚══════════════════════════════════════╝{}",
+                BOLD, CYAN, RESET
+            );
+        }
 
         // Restore protected files
         restore_protected(&runner.backup_dir);
@@ -859,18 +899,18 @@ fn run_loop(dry_run: bool) -> i32 {
 
         if dry_run {
             log("(dry-run) Skipping Claude invocation");
-        } else if !invoke_claude(&mut runner, &config, iteration) {
+        } else if !invoke_claude(&mut runner, config, iteration) {
             log_error("Claude invocation failed — aborting loop");
-            return 1;
+            return Err(1);
         }
 
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return 130;
+            return Err(130);
         }
 
         // Run guards
-        let guards_passed = run_all_guards(&config);
+        let guards_passed = run_all_guards(config);
 
         if guards_passed {
             log(&format!(
@@ -880,7 +920,7 @@ fn run_loop(dry_run: bool) -> i32 {
 
             if dry_run {
                 log("(dry-run) Guards passed \u{2014} exiting after one iteration");
-                return 0;
+                return Ok(());
             }
 
             if is_done() {
@@ -890,7 +930,7 @@ fn run_loop(dry_run: bool) -> i32 {
                     GREEN, BOLD, RESET
                 );
                 eprintln!();
-                return 0;
+                return Ok(());
             } else {
                 log("Guards passed but STATUS is not DONE \u{2014} continuing");
             }
@@ -902,14 +942,41 @@ fn run_loop(dry_run: bool) -> i32 {
 
             if dry_run {
                 log("(dry-run) Exiting after one iteration");
-                return 1;
+                return Err(1);
             }
         }
     }
 }
 
+fn run_loop(dry_run: bool) -> i32 {
+    // Load config
+    let config = match Config::load(Path::new(CONF_PATH)) {
+        Ok(c) => c,
+        Err(e) => {
+            log_error(&e);
+            process::exit(1);
+        }
+    };
+
+    log(&format!(
+        "Config loaded: max_tail={}, {} scope rules, {} guards{}",
+        config.max_tail,
+        config.scope_rules.len(),
+        config.guards.len(),
+        config.image.as_ref().map_or(
+            String::from(", sandbox=off"),
+            |img| format!(", image={}", img)
+        )
+    ));
+
+    match run_plan_loop(&config, dry_run, false) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
+
 /// Protected files for the brute runner.
-const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, TASK_PATH, JUDGE_PATH, CONF_PATH];
+const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, JUDGE_PATH, CONF_PATH];
 
 fn run_brute(dry_run: bool) -> i32 {
     // Load config
@@ -922,9 +989,7 @@ fn run_brute(dry_run: bool) -> i32 {
     };
 
     log(&format!(
-        "Config loaded: runner=brute, claude={}, judge={}, max_tail={}, {} scope rules, {} guards{}",
-        config.claude_bin,
-        config.judge.as_deref().unwrap_or("(none)"),
+        "Config loaded: mode=brute, max_tail={}, {} scope rules, {} guards{}",
         config.max_tail,
         config.scope_rules.len(),
         config.guards.len(),
@@ -934,21 +999,32 @@ fn run_brute(dry_run: bool) -> i32 {
         )
     ));
 
-    // Preflight: require protocol.md, task.md, judge.md, ci.conf
-    for path in &[PROTOCOL_PATH, TASK_PATH, JUDGE_PATH, CONF_PATH] {
+    // Preflight: require protocol.md, judge.md, guard.conf
+    for path in &[PROTOCOL_PATH, JUDGE_PATH, CONF_PATH] {
         if !Path::new(path).exists() {
             log_error(&format!("required file not found: {}", path));
             process::exit(1);
         }
     }
 
-    // Create notes.md and verdict.md if missing
-    for path in &[NOTES_PATH, VERDICT_PATH] {
-        if !Path::new(path).exists() {
-            if let Err(e) = fs::write(path, "") {
-                log_error(&format!("cannot create {}: {}", path, e));
+    // Fail fast if critical content files are empty
+    for path in &[JUDGE_PATH] {
+        match fs::read_to_string(path) {
+            Ok(content) if content.trim().is_empty() => {
+                log_error(&format!("{} is empty — fill it in before running", path));
                 process::exit(1);
             }
+            _ => {}
+        }
+    }
+
+    // Create notes.md and verdict.md if missing
+    for path in &[NOTES_PATH, VERDICT_PATH] {
+        if !Path::new(path).exists()
+            && let Err(e) = fs::write(path, "")
+        {
+            log_error(&format!("cannot create {}: {}", path, e));
+            process::exit(1);
         }
     }
 
@@ -1002,13 +1078,13 @@ fn run_brute(dry_run: bool) -> i32 {
         for path in BRUTE_PROTECTED_FILES {
             let src_name = Path::new(path).file_name().unwrap();
             let backup_file = runner.backup_dir.join(src_name);
-            if backup_file.exists() {
-                if let Err(e) = fs::copy(&backup_file, path) {
-                    eprintln!(
-                        "{}{}[yoke] WARNING:{} failed to restore {}: {}",
-                        BOLD, YELLOW, RESET, path, e
-                    );
-                }
+            if backup_file.exists()
+                && let Err(e) = fs::copy(&backup_file, path)
+            {
+                eprintln!(
+                    "{}{}[yoke] WARNING:{} failed to restore {}: {}",
+                    BOLD, YELLOW, RESET, path, e
+                );
             }
         }
 
@@ -1016,10 +1092,20 @@ fn run_brute(dry_run: bool) -> i32 {
         let _ = fs::write(VERDICT_PATH, "");
 
         if dry_run {
-            log("(dry-run) Skipping Claude invocation");
-        } else if !invoke_claude(&mut runner, &config, iteration) {
-            log_error("Claude invocation failed — aborting loop");
-            return 1;
+            log("(dry-run) Skipping worker invocation");
+        } else {
+            log("Using plan runner as worker...");
+            match run_plan_loop(&config, false, true) {
+                Ok(()) => log("Plan runner completed successfully"),
+                Err(130) => {
+                    log("Interrupted \u{2014} shutting down");
+                    return 130;
+                }
+                Err(_) => {
+                    log_error("Plan runner failed — aborting brute loop");
+                    return 1;
+                }
+            }
         }
 
         if signal::interrupted() {
@@ -1027,30 +1113,35 @@ fn run_brute(dry_run: bool) -> i32 {
             return 130;
         }
 
-        // Run guards
-        let guards_passed = run_all_guards(&config);
-
-        if !guards_passed {
-            log(&format!(
-                "{}Guards failed \u{2014} worker will see results next iteration{}",
-                YELLOW, RESET
-            ));
-            if dry_run {
+        // Run guards (skip when not dry-run — the plan loop already ran them)
+        if dry_run {
+            let passed = run_all_guards(&config);
+            if !passed {
+                log(&format!(
+                    "{}Guards failed{}", YELLOW, RESET
+                ));
                 log("(dry-run) Exiting after one iteration");
                 return 1;
             }
-            continue;
-        }
-
-        log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
-
-        if dry_run {
+            log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
             log("(dry-run) Guards passed \u{2014} exiting after one iteration");
             return 0;
         }
 
         // Guards passed — invoke judge
-        log("Guards passed \u{2014} invoking judge...");
+        eprintln!();
+        eprintln!(
+            "{}{}┌─ Judge ────────────────────────────────┐{}",
+            BOLD, YELLOW, RESET
+        );
+        eprintln!(
+            "{}{}│  Invoking judge (attempt {:>4})          │{}",
+            BOLD, YELLOW, iteration, RESET
+        );
+        eprintln!(
+            "{}{}└────────────────────────────────────────┘{}",
+            BOLD, YELLOW, RESET
+        );
         let pass = invoke_judge(&mut runner, &config, iteration);
 
         if signal::interrupted() {
@@ -1072,6 +1163,10 @@ fn run_brute(dry_run: bool) -> i32 {
             "{}Judge says FAIL \u{2014} worker will see verdict next iteration{}",
             YELLOW, RESET
         ));
+
+        // Reset STATUS to IN_PROGRESS so the plan runner re-executes on the
+        // next brute attempt, but preserve all notes.
+        reset_notes_status();
     }
 }
 
@@ -1090,27 +1185,21 @@ fn main() {
                 print_init_help();
                 return;
             }
-            let mut runner = "loop";
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--runner" => {
-                        i += 1;
-                        if i >= args.len() {
-                            log_error("--runner requires a value (loop or brute)");
-                            process::exit(2);
-                        }
-                        runner = &args[i];
-                    }
-                    other => {
-                        log_error(&format!("unknown flag '{}'", other));
-                        print_init_help();
-                        process::exit(2);
-                    }
+            let mode = match args.get(2).map(|a| a.as_str()) {
+                None => "loop",
+                Some("brute") => "brute",
+                Some(other) => {
+                    log_error(&format!("unknown argument '{}'", other));
+                    print_init_help();
+                    process::exit(2);
                 }
-                i += 1;
+            };
+            if args.len() > 3 {
+                log_error(&format!("unexpected argument '{}'", args[3]));
+                print_init_help();
+                process::exit(2);
             }
-            process::exit(init(runner));
+            process::exit(init(mode));
         }
         "run" => {
             // Check for --help before other flags
@@ -1118,11 +1207,18 @@ fn main() {
                 print_run_help();
                 return;
             }
-            let dry_run = args.get(2).is_some_and(|a| a == "--dry-run");
-            if args.len() > 2 && !dry_run {
-                log_error(&format!("unknown flag '{}'", args[2]));
-                print_run_help();
-                process::exit(2);
+            let mut dry_run = false;
+            let mut no_sandbox = false;
+            for arg in &args[2..] {
+                match arg.as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--no-sandbox" => no_sandbox = true,
+                    other => {
+                        log_error(&format!("unknown flag '{}'", other));
+                        print_run_help();
+                        process::exit(2);
+                    }
+                }
             }
             // Load config to determine runner type
             let config = match Config::load(Path::new(CONF_PATH)) {
@@ -1132,13 +1228,16 @@ fn main() {
                     process::exit(1);
                 }
             };
-            match config.runner.as_str() {
-                "loop" => process::exit(run_loop(dry_run)),
-                "brute" => process::exit(run_brute(dry_run)),
-                other => {
-                    log_error(&format!("unknown runner type '{}' in config", other));
-                    process::exit(2);
-                }
+            if config.image.is_none() && !no_sandbox {
+                log_error("no 'image' directive in config — refusing to run without sandbox");
+                eprintln!("  Add 'image <name>' to {} or pass --no-sandbox to override.", CONF_PATH);
+                process::exit(2);
+            }
+            let is_brute = Path::new(JUDGE_PATH).exists();
+            if is_brute {
+                process::exit(run_brute(dry_run))
+            } else {
+                process::exit(run_loop(dry_run))
             }
         }
         "--help" | "-h" | "help" => {
