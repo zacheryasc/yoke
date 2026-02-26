@@ -135,15 +135,42 @@ pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>) {
                 } else if let Some(text) = extract_str(&line, "text") {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
-                        for text_line in trimmed.lines().take(3) {
-                            let truncated = if text_line.len() > 120 {
-                                &text_line[..120]
-                            } else {
-                                text_line
-                            };
-                            println!("{}  {}{}", DIM, truncated, RESET);
+                        for text_line in trimmed.lines() {
+                            println!("{}  {}{}", DIM, text_line, RESET);
                         }
                     }
+                }
+            }
+            // stream_event → streaming deltas
+            Some("stream_event") => {
+                if line.contains("\"content_block_delta\"") {
+                    if line.contains("\"text_delta\"") {
+                        if let Some(text) = extract_str(&line, "text") {
+                            print!("{}{}{}", DIM, text, RESET);
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    // input_json_delta → skip silently
+                } else if line.contains("\"content_block_start\"") {
+                    if !line.contains("\"tool_use\"") {
+                        println!();
+                    }
+                } else if line.contains("\"content_block_stop\"") {
+                    println!();
+                }
+                // message_start, message_delta, message_stop → skip
+            }
+            // user → tool result summaries
+            Some("user") => {
+                if line.contains("\"tool_result\"") {
+                    // Estimate content length from the line
+                    let content_len = if let Some(start) = line.find("\"content\":\"") {
+                        let after = &line[start + 11..];
+                        after.find('"').unwrap_or(after.len())
+                    } else {
+                        0
+                    };
+                    println!("{}  \u{2190} result ({}b){}", DIM, content_len, RESET);
                 }
             }
             // result → green bold summary
