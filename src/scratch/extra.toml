@@ -1,0 +1,11 @@
+# Extra scratch config for visual testing
+
+[display]
+theme = "dark"
+line_numbers = true
+word_wrap = false
+
+[limits]
+max_diff_lines = 50
+max_badge_width = 40
+truncate_at = 120

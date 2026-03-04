@@ -1,6 +1,12 @@
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Backend {
+    Claude,
+    OpenCode,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScopeTag {
     Allow,
@@ -19,11 +25,13 @@ pub struct Config {
     pub max_tail: usize,
     pub log_dir: Option<String>,
     pub image: Option<String>,
+    pub model: Option<String>,
     pub scope_rules: Vec<ScopeRule>,
     pub guards: Vec<String>,
 }
 
 impl Config {
+    #[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
     pub fn load(path: &Path) -> Result<Config, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {}", path.display(), e))?;
@@ -31,6 +39,7 @@ impl Config {
         let mut max_tail: usize = 200;
         let mut log_dir: Option<String> = None;
         let mut image: Option<String> = None;
+        let mut model: Option<String> = None;
         let mut scope_rules = Vec::new();
         let mut guards = Vec::new();
         for (line_num, raw_line) in content.lines().enumerate() {
@@ -74,6 +83,9 @@ impl Config {
                 "image" => {
                     image = Some(value.to_string());
                 }
+                "model" => {
+                    model = Some(value.to_string());
+                }
                 "allow" => scope_rules.push(ScopeRule {
                     tag: ScopeTag::Allow,
                     prefix: value.to_string(),
@@ -102,6 +114,7 @@ impl Config {
             max_tail,
             log_dir,
             image,
+            model,
             scope_rules,
             guards,
         })
@@ -129,5 +142,15 @@ impl Config {
         // "." has length 1 but should match everything — already handled above.
         // If only "." matched, best_len is 1, which is correct.
         best_tag
+    }
+
+    /// Determine which backend to use based on config.
+    /// If `model` is set, use OpenCode; otherwise default to Claude CLI.
+    pub fn backend(&self) -> Backend {
+        if self.model.is_some() {
+            Backend::OpenCode
+        } else {
+            Backend::Claude
+        }
     }
 }

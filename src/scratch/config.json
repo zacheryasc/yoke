@@ -1,0 +1,21 @@
+{
+  "name": "yoke-visual-test",
+  "version": "0.1.0",
+  "settings": {
+    "max_retries": 3,
+    "timeout_ms": 5000,
+    "verbose": true,
+    "colors": {
+      "primary": "#46FF00",
+      "secondary": "#4B80FF",
+      "error": "#FF3232"
+    }
+  },
+  "features": [
+    "stream-filter",
+    "edit-diff",
+    "write-preview",
+    "bash-error-tail",
+    "thinking-timer"
+  ]
+}

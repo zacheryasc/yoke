@@ -27,6 +27,7 @@ pub fn unescape_json(s: &str) -> String {
 /// Extract the string value for a given key from a flat JSON line.
 /// Looks for `"key": "value"` and returns the value (unescaped basic sequences).
 /// Returns `None` if the key is not found or the value is not a string.
+#[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
 pub fn extract_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let needle = {
         let mut pat = String::with_capacity(key.len() + 3);
@@ -84,6 +85,7 @@ pub fn extract_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 /// Extract a numeric value for a given key from a flat JSON line.
 /// Looks for `"key": 123.45` and returns the number.
 /// Returns `None` if the key is not found or the value is not a number.
+#[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
 pub fn extract_num(line: &str, key: &str) -> Option<f64> {
     let needle = {
         let mut pat = String::with_capacity(key.len() + 3);
