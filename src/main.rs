@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 
-use config::{Backend, Config};
+use config::{Backend, Config, Periodic};
 
 const CONF_PATH: &str = ".loop/yoke.conf";
 const NOTES_PATH: &str = ".loop/notes.md";
@@ -91,6 +91,15 @@ const GREEN: &str = "\x1b[38;5;46m";
 const ORANGE: &str = "\x1b[38;5;208m";
 const RED: &str = "\x1b[38;5;196m";
 const BLUE: &str = "\x1b[38;5;75m";
+const MAGENTA: &str = "\x1b[38;5;207m";
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
 
 fn log(msg: &str) {
     eprintln!("{}{}[yoke]{} {}", ORANGE, BOLD, RESET, msg);
@@ -655,6 +664,63 @@ fn invoke_agent(runner: &mut LoopRunner, config: &Config, iteration: u32, prior_
         Backend::OpenCode => "OpenCode",
     };
     invoke_process(runner, config, prompt, label, "iteration", iteration, prior_total)
+}
+
+/// Invoke a periodic agent with its protocol file.
+/// Returns true if the invocation succeeded.
+fn invoke_periodic(runner: &mut LoopRunner, config: &Config, periodic: &Periodic, iteration: u32) -> bool {
+    let prompt = format!("Read {} and follow its instructions.", periodic.path);
+    let (status, _) = invoke_process(
+        runner, config, &prompt, &periodic.name,
+        &format!("periodic-{}", periodic.name), iteration, 0.0,
+    );
+    status
+}
+
+/// Run guard-after commands for a periodic agent.
+/// Results are written to a separate file so the worker isn't confused.
+fn run_periodic_guards(periodic: &Periodic, max_tail: usize) {
+    if periodic.guards.is_empty() {
+        return;
+    }
+    let results_path = PathBuf::from(format!(".loop/periodic-{}-results.md", periodic.name));
+    let results = guard::run_guards(&periodic.guards, max_tail, &results_path);
+
+    // Render a compact table for periodic guard results
+    if !results.is_empty() {
+        let cmd_w = results.iter().map(|r| r.name.len()).max().unwrap_or(10).max(10);
+        let stat_w = 8;
+        let time_w = 6;
+        let top    = format!("  ┌{}┬{}┬{}┐", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
+        let bottom = format!("  └{}┴{}┴{}┘", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
+        eprintln!("{}", top);
+        for r in &results {
+            let cmd_padded = format!("{:<w$}", r.name, w = cmd_w);
+            let status_cell = if r.skipped {
+                format!("{}SKIPPED {}", ORANGE, RESET)
+            } else if r.passed {
+                format!(" {} PASS {}  ", GREEN, RESET)
+            } else {
+                format!(" {} FAIL {}  ", RED, RESET)
+            };
+            let time_cell = if r.skipped {
+                format!("  -  ")
+            } else {
+                let secs = r.elapsed_secs.round() as u64;
+                format!("{:>3}s ", secs)
+            };
+            eprintln!("  │ {} │{}│ {} │", cmd_padded, status_cell, time_cell);
+        }
+        eprintln!("{}", bottom);
+
+        let all_passed = results.iter().all(|r| r.passed);
+        if !all_passed {
+            log(&format!(
+                "{}WARNING: periodic '{}' guard(s) failed — results in {}{}",
+                ORANGE, periodic.name, format!(".loop/periodic-{}-results.md", periodic.name), RESET
+            ));
+        }
+    }
 }
 
 /// Render a full-width box-drawn banner for the judge verdict.
@@ -1540,21 +1606,67 @@ fn init(mode: &str) -> i32 {
     0
 }
 
+/// Outcome of a plan loop run.
+enum PlanLoopOutcome {
+    /// STATUS: DONE + guards pass (no embedded judge).
+    Done,
+    /// STATUS: DONE + guards pass + embedded judge PASS (judge-every mode).
+    JudgePass,
+    /// Consecutive judge failures hit max-judge-failures.
+    JudgeBailout,
+    /// User interrupted (SIGINT).
+    Interrupt,
+    /// Hard error (spawn failure, missing files, etc.).
+    Error,
+}
+
 /// Core plan-loop runner that can be called standalone or nested inside brute.
 ///
 /// - `config`: already-loaded Config
 /// - `plan_path`: path to the plan file (e.g. PLAN_PATH or SUB_PLAN_PATH)
 /// - `dry_run`: if true, skip Claude invocation (one iteration only)
 /// - `nested`: if true, running inside brute (adjusts output banners)
-///
-/// Returns Ok(()) on success (STATUS: DONE + guards pass), Err(i32) with exit code on failure.
-fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) -> Result<(), i32> {
+fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) -> PlanLoopOutcome {
     // Preflight — skip guard-results clear when nested (brute handles it)
     preflight(plan_path, !nested);
+
+    // Validate judge-every requires judge.md
+    if config.judge_every.is_some() && !Path::new(JUDGE_PATH).exists() {
+        log_error("judge-every is set but .loop/judge.md not found");
+        process::exit(1);
+    }
+
+    // Validate periodic protocol paths exist and are non-empty
+    for periodic in &config.periodics {
+        let p = Path::new(&periodic.path);
+        if !p.exists() {
+            log_error(&format!(
+                "periodic '{}' references missing file: {}",
+                periodic.name, periodic.path
+            ));
+            process::exit(1);
+        }
+        match fs::read_to_string(p) {
+            Ok(content) if content.trim().is_empty() => {
+                log_error(&format!(
+                    "periodic '{}' protocol file is empty: {}",
+                    periodic.name, periodic.path
+                ));
+                process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
     log("Preflight OK");
 
     // Build protected files list dynamically based on the plan path
-    let protected: Vec<&str> = vec![PROTOCOL_PATH, plan_path, CONF_PATH];
+    let mut protected: Vec<&str> = vec![PROTOCOL_PATH, plan_path, CONF_PATH];
+    // Include periodic protocol paths in the protected set
+    let periodic_paths: Vec<String> = config.periodics.iter().map(|p| p.path.clone()).collect();
+    for pp in &periodic_paths {
+        protected.push(pp.as_str());
+    }
 
     // Backup protected files and create the runner (Drop handles cleanup)
     let backup_dir = backup_files(&protected);
@@ -1564,10 +1676,12 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
     let mut iteration: u32 = 0;
     let mut total_cost: f64 = 0.0;
 
+    let mut consecutive_judge_failures: u32 = 0;
+
     loop {
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return Err(130);
+            return PlanLoopOutcome::Interrupt;
         }
         iteration += 1;
         eprintln!();
@@ -1625,16 +1739,16 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             total_cost += iter_cost;
             if !success {
                 log_error("Claude invocation failed — aborting loop");
-                return Err(1);
+                return PlanLoopOutcome::Error;
             }
         }
 
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return Err(130);
+            return PlanLoopOutcome::Interrupt;
         }
 
-        // Run guards
+        // Run worker guards
         let guards_passed = run_all_guards(config);
 
         if guards_passed {
@@ -1642,34 +1756,139 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
                 "{}{}All guards passed{}",
                 GREEN, BOLD, RESET
             ));
-
-            if dry_run {
-                log("(dry-run) Guards passed \u{2014} exiting after one iteration");
-                return Ok(());
-            }
-
-            if is_done() {
-                eprintln!();
-                eprintln!(
-                    "{}{}  STATUS: DONE and all guards pass \u{2014} loop complete  {}",
-                    GREEN, BOLD, RESET
-                );
-                eprintln!();
-                return Ok(());
-            } else {
-                log("Guards passed but STATUS is not DONE \u{2014} continuing");
-            }
         } else {
             log(&format!(
                 "{}Some guards failed \u{2014} Claude will see results next iteration{}",
                 ORANGE, RESET
             ));
+        }
 
-            if dry_run {
+        if dry_run {
+            if guards_passed {
+                log("(dry-run) Guards passed \u{2014} exiting after one iteration");
+                return PlanLoopOutcome::Done;
+            } else {
                 log("(dry-run) Exiting after one iteration");
-                return Err(1);
+                return PlanLoopOutcome::Error;
             }
         }
+
+        // Fire periodic agents (if at cadence)
+        for periodic in &config.periodics {
+            if iteration % periodic.cadence == 0 {
+                eprintln!();
+                let upper_name = capitalize_first(&periodic.name);
+                eprintln!(
+                    "{}{}┌─ {} {}┐{}",
+                    BOLD, MAGENTA,
+                    upper_name,
+                    "─".repeat(37usize.saturating_sub(upper_name.len() + 2)),
+                    RESET
+                );
+                eprintln!(
+                    "{}{}│  Periodic agent (iteration {:>4})     │{}",
+                    BOLD, MAGENTA, iteration, RESET
+                );
+                eprintln!(
+                    "{}{}└────────────────────────────────────────┘{}",
+                    BOLD, MAGENTA, RESET
+                );
+                let ok = invoke_periodic(&mut runner, config, periodic, iteration);
+                if !ok {
+                    log(&format!(
+                        "{}WARNING: periodic '{}' invocation failed — continuing{}",
+                        ORANGE, periodic.name, RESET
+                    ));
+                }
+                run_periodic_guards(periodic, config.max_tail);
+            }
+        }
+
+        // Judge-every logic: embedded judge checks at configured cadence
+        if let Some(judge_every) = config.judge_every {
+            if guards_passed && is_done() {
+                // Always fire judge when worker signals DONE
+                eprintln!();
+                eprintln!(
+                    "{}{}┌─ Judge (DONE) ─────────────────────────┐{}",
+                    BOLD, BLUE, RESET
+                );
+                eprintln!(
+                    "{}{}│  Worker DONE — invoking judge           │{}",
+                    BOLD, BLUE, RESET
+                );
+                eprintln!(
+                    "{}{}└────────────────────────────────────────┘{}",
+                    BOLD, BLUE, RESET
+                );
+                let pass = invoke_judge(&mut runner, config, iteration);
+                if pass {
+                    return PlanLoopOutcome::JudgePass;
+                }
+                consecutive_judge_failures += 1;
+                if consecutive_judge_failures >= config.max_judge_failures {
+                    eprintln!();
+                    eprintln!(
+                        "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
+                        RED, BOLD, config.max_judge_failures, RESET
+                    );
+                    eprintln!();
+                    return PlanLoopOutcome::JudgeBailout;
+                }
+                log(&format!(
+                    "{}Judge FAIL ({}/{}) \u{2014} resetting STATUS for retry{}",
+                    ORANGE, consecutive_judge_failures, config.max_judge_failures, RESET
+                ));
+                reset_notes_status();
+                continue;
+            } else if guards_passed && iteration % judge_every == 0 {
+                // Mid-loop quality checkpoint
+                eprintln!();
+                eprintln!(
+                    "{}{}┌─ Mid-loop Judge ───────────────────────┐{}",
+                    BOLD, BLUE, RESET
+                );
+                eprintln!(
+                    "{}{}│  Quality checkpoint (iteration {:>4})   │{}",
+                    BOLD, BLUE, iteration, RESET
+                );
+                eprintln!(
+                    "{}{}└────────────────────────────────────────┘{}",
+                    BOLD, BLUE, RESET
+                );
+                let pass = invoke_judge(&mut runner, config, iteration);
+                if pass {
+                    consecutive_judge_failures = 0;
+                } else {
+                    consecutive_judge_failures += 1;
+                    if consecutive_judge_failures >= config.max_judge_failures {
+                        eprintln!();
+                        eprintln!(
+                            "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
+                            RED, BOLD, config.max_judge_failures, RESET
+                        );
+                        eprintln!();
+                        return PlanLoopOutcome::JudgeBailout;
+                    }
+                }
+                // Either way, worker continues — verdict.md has feedback
+            }
+            // When judge-every is set, the judge handles the DONE check above.
+            // If we reach here without DONE, just continue the loop.
+            continue;
+        }
+
+        // Original exit check (only reached when judge-every is NOT set)
+        if guards_passed && is_done() {
+            eprintln!();
+            eprintln!(
+                "{}{}  STATUS: DONE and all guards pass \u{2014} loop complete  {}",
+                GREEN, BOLD, RESET
+            );
+            eprintln!();
+            return PlanLoopOutcome::Done;
+        }
+        // Guards failed or not done — continue iterating
     }
 }
 
@@ -1699,8 +1918,9 @@ fn run_loop(dry_run: bool) -> i32 {
     ));
 
     match run_plan_loop(&config, PLAN_PATH, dry_run, false) {
-        Ok(()) => 0,
-        Err(code) => code,
+        PlanLoopOutcome::Done | PlanLoopOutcome::JudgePass => 0,
+        PlanLoopOutcome::JudgeBailout | PlanLoopOutcome::Error => 1,
+        PlanLoopOutcome::Interrupt => 130,
     }
 }
 
@@ -1718,9 +1938,6 @@ enum BruteResult {
 
 /// Protected files for the brute runner.
 const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, JUDGE_PATH, CONF_PATH];
-
-/// Max consecutive judge failures before the brute loop bails out.
-const MAX_JUDGE_FAILURES: u32 = 3;
 
 fn run_brute_inner(dry_run: bool) -> BruteResult {
     // Load config
@@ -1831,12 +2048,23 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
         } else {
             log("Using plan runner as worker...");
             match run_plan_loop(config, plan_path, false, true) {
-                Ok(()) => log("Plan runner completed successfully"),
-                Err(130) => {
+                PlanLoopOutcome::JudgePass => {
+                    // Embedded judge already passed — skip standalone judge
+                    log("Plan runner completed with embedded judge PASS");
+                    return BruteResult::Pass;
+                }
+                PlanLoopOutcome::Done => {
+                    // No embedded judge — fall through to standalone judge
+                    log("Plan runner completed successfully");
+                }
+                PlanLoopOutcome::JudgeBailout => {
+                    return BruteResult::Bailout;
+                }
+                PlanLoopOutcome::Interrupt => {
                     log("Interrupted \u{2014} shutting down");
                     return BruteResult::Interrupt;
                 }
-                Err(_) => {
+                PlanLoopOutcome::Error => {
                     log_error("Plan runner failed — aborting brute loop");
                     return BruteResult::Error;
                 }
@@ -1895,12 +2123,13 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
         }
 
         consecutive_failures += 1;
+        let max_failures = config.max_judge_failures;
         log(&format!(
             "{}Judge says FAIL ({}/{}) \u{2014} {}{}",
             ORANGE,
             consecutive_failures,
-            MAX_JUDGE_FAILURES,
-            if consecutive_failures >= MAX_JUDGE_FAILURES {
+            max_failures,
+            if consecutive_failures >= max_failures {
                 "bailing out"
             } else {
                 "worker will see verdict next iteration"
@@ -1908,11 +2137,11 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
             RESET
         ));
 
-        if consecutive_failures >= MAX_JUDGE_FAILURES {
+        if consecutive_failures >= max_failures {
             eprintln!();
             eprintln!(
                 "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
-                RED, BOLD, MAX_JUDGE_FAILURES, RESET
+                RED, BOLD, max_failures, RESET
             );
             eprintln!();
             return BruteResult::Bailout;

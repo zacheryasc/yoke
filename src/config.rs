@@ -20,6 +20,14 @@ pub struct ScopeRule {
     pub prefix: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Periodic {
+    pub path: String,        // e.g., ".loop/cleaner.md"
+    pub name: String,        // derived from filename stem: "cleaner"
+    pub cadence: u32,
+    pub guards: Vec<String>, // from guard-after directives
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub max_tail: usize,
@@ -28,6 +36,9 @@ pub struct Config {
     pub model: Option<String>,
     pub scope_rules: Vec<ScopeRule>,
     pub guards: Vec<String>,
+    pub judge_every: Option<u32>,
+    pub max_judge_failures: u32,
+    pub periodics: Vec<Periodic>,
 }
 
 impl Config {
@@ -42,6 +53,10 @@ impl Config {
         let mut model: Option<String> = None;
         let mut scope_rules = Vec::new();
         let mut guards = Vec::new();
+        let mut judge_every: Option<u32> = None;
+        let mut max_judge_failures: u32 = 3;
+        let mut periodics = Vec::new();
+        let mut pending_guard_afters: Vec<(String, String, usize)> = Vec::new(); // (periodic_name, command, line_num)
         for (line_num, raw_line) in content.lines().enumerate() {
             // Strip comments
             let line = match raw_line.find('#') {
@@ -99,12 +114,125 @@ impl Config {
                     prefix: value.to_string(),
                 }),
                 "guard" => guards.push(value.to_string()),
+                "judge-every" => {
+                    let n = value.parse::<u32>().map_err(|_| {
+                        format!(
+                            "{}:{}: invalid judge-every value '{}'",
+                            path.display(),
+                            line_num + 1,
+                            value
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(format!(
+                            "{}:{}: judge-every must be > 0",
+                            path.display(),
+                            line_num + 1
+                        ));
+                    }
+                    judge_every = Some(n);
+                }
+                "max-judge-failures" => {
+                    let n = value.parse::<u32>().map_err(|_| {
+                        format!(
+                            "{}:{}: invalid max-judge-failures value '{}'",
+                            path.display(),
+                            line_num + 1,
+                            value
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(format!(
+                            "{}:{}: max-judge-failures must be > 0",
+                            path.display(),
+                            line_num + 1
+                        ));
+                    }
+                    max_judge_failures = n;
+                }
+                "periodic" => {
+                    // Split value at last whitespace → path + cadence
+                    let trimmed = value.trim();
+                    let split_pos = trimmed.rfind(char::is_whitespace).ok_or_else(|| {
+                        format!(
+                            "{}:{}: periodic requires '<path> <cadence>'",
+                            path.display(),
+                            line_num + 1
+                        )
+                    })?;
+                    let ppath = trimmed[..split_pos].trim();
+                    let cadence_str = trimmed[split_pos..].trim();
+                    let cadence = cadence_str.parse::<u32>().map_err(|_| {
+                        format!(
+                            "{}:{}: invalid periodic cadence '{}'",
+                            path.display(),
+                            line_num + 1,
+                            cadence_str
+                        )
+                    })?;
+                    if cadence == 0 {
+                        return Err(format!(
+                            "{}:{}: periodic cadence must be > 0",
+                            path.display(),
+                            line_num + 1
+                        ));
+                    }
+                    // Derive name from filename stem
+                    let name = Path::new(ppath)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| {
+                            format!(
+                                "{}:{}: cannot derive name from periodic path '{}'",
+                                path.display(),
+                                line_num + 1,
+                                ppath
+                            )
+                        })?
+                        .to_string();
+                    periodics.push(Periodic {
+                        path: ppath.to_string(),
+                        name,
+                        cadence,
+                        guards: Vec::new(),
+                    });
+                }
+                "guard-after" => {
+                    // Split at first whitespace → periodic name + command
+                    let trimmed = value.trim();
+                    let split_pos = trimmed.find(char::is_whitespace).ok_or_else(|| {
+                        format!(
+                            "{}:{}: guard-after requires '<periodic-name> <command>'",
+                            path.display(),
+                            line_num + 1
+                        )
+                    })?;
+                    let pname = trimmed[..split_pos].trim().to_string();
+                    let cmd = trimmed[split_pos..].trim().to_string();
+                    pending_guard_afters.push((pname, cmd, line_num + 1));
+                }
                 other => {
                     return Err(format!(
                         "{}:{}: unknown directive '{}'",
                         path.display(),
                         line_num + 1,
                         other
+                    ));
+                }
+            }
+        }
+
+        // Attach guard-after commands to their matching periodics
+        for (pname, cmd, ln) in pending_guard_afters {
+            let found = periodics.iter_mut().find(|p| p.name == pname);
+            match found {
+                Some(p) => p.guards.push(cmd),
+                None => {
+                    return Err(format!(
+                        "{}:{}: guard-after references unknown periodic '{}'",
+                        path.display(),
+                        ln,
+                        pname
                     ));
                 }
             }
@@ -117,6 +245,9 @@ impl Config {
             model,
             scope_rules,
             guards,
+            judge_every,
+            max_judge_failures,
+            periodics,
         })
     }
 
