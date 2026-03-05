@@ -222,7 +222,7 @@ fn print_usage() {
         BOLD, RESET
     );
     eprintln!(
-        "  {}stash pop{}        Restore files auto-stashed by clean",
+        "  {}stash{}            Snapshot .loop/ state (stash log, stash checkout <hash>)",
         BOLD, RESET
     );
     eprintln!(
@@ -943,7 +943,7 @@ fn print_clean_help() {
     eprintln!("Mode snapshots in .loop/.modes/ are preserved by clean.");
     eprintln!();
     eprintln!("Non-empty working files are auto-stashed to .loop/.stash/ before wiping.");
-    eprintln!("Recover with: {}yoke stash pop{}", BOLD, RESET);
+    eprintln!("Browse with: {}yoke stash log{}   Recover with: {}yoke stash pop{}", BOLD, RESET, BOLD, RESET);
 }
 
 fn clean() -> i32 {
@@ -988,145 +988,353 @@ fn clean() -> i32 {
     log("Clean complete");
     if stashed > 0 {
         log(&format!(
-            "stashed {} file(s) — recover with: yoke stash pop",
+            "stashed {} file(s) — browse with: yoke stash log",
             stashed
         ));
     }
     0
 }
 
-/// Files that are candidates for stashing during `yoke clean`.
-const STASH_CANDIDATES: &[&str] = &[
-    PLAN_PATH,
-    NOTES_PATH,
-    VERDICT_PATH,
-    GUARD_RESULTS_PATH,
-    SAGA_NOTES_PATH,
-    DECISIONS_PATH,
-    SUB_PLAN_PATH,
-    JUDGE_PATH,
-];
+// ── Stash helpers ──────────────────────────────────────────────────────
 
-/// Copy non-empty working files to `.loop/.stash/`, removing any prior stash first.
-/// Returns the count of files stashed.
-fn stash_working_files() -> usize {
-    let stash = Path::new(STASH_DIR);
+/// Format Unix epoch seconds as `YYYY-MM-DDThh:mm:ss` using Hinnant's algorithm.
+fn format_unix_timestamp(secs: u64) -> String {
+    let z = (secs / 86400) as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
 
-    // Remove prior stash (single-slot semantics)
-    if stash.exists() {
-        if let Err(e) = fs::remove_dir_all(stash) {
-            log_error(&format!("failed to remove prior stash: {}", e));
-            return 0;
-        }
-    }
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let min = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
 
-    // Collect non-empty candidates
-    let to_stash: Vec<&str> = STASH_CANDIDATES
-        .iter()
-        .copied()
-        .filter(|path| {
-            Path::new(path).exists()
-                && fs::read_to_string(path)
-                    .map(|c| !c.trim().is_empty())
-                    .unwrap_or(false)
-        })
-        .collect();
-
-    if to_stash.is_empty() {
-        return 0;
-    }
-
-    if let Err(e) = fs::create_dir_all(stash) {
-        log_error(&format!("failed to create {}: {}", STASH_DIR, e));
-        return 0;
-    }
-
-    let mut count = 0;
-    for path in &to_stash {
-        let file_name = Path::new(path).file_name().unwrap();
-        let dest = stash.join(file_name);
-        if let Err(e) = fs::copy(path, &dest) {
-            log_error(&format!("failed to stash {}: {}", path, e));
-        } else {
-            count += 1;
-        }
-    }
-
-    count
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, h, min, s)
 }
 
-/// Restore stashed files back to their canonical paths and remove the stash.
-fn stash_pop() -> i32 {
-    let stash = Path::new(STASH_DIR);
-    if !stash.exists() {
-        log_error("no stash found — nothing to restore");
+/// SipHash timestamp + file names/contents → lower 28 bits → 7-char hex.
+fn generate_stash_hash(timestamp: &str, files: &[(String, Vec<u8>)]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    timestamp.hash(&mut hasher);
+    for (name, contents) in files {
+        name.hash(&mut hasher);
+        contents.hash(&mut hasher);
+    }
+    format!("{:07x}", hasher.finish() & 0x0FFF_FFFF)
+}
+
+/// Collect all regular files in `.loop/` excluding dotfile/dotdir entries.
+/// Returns sorted `(filename, contents)` pairs for deterministic hashing.
+fn collect_stashable_files() -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(".loop") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(contents) = fs::read(&path) {
+                    files.push((name, contents));
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+struct StashEntry {
+    hash: String,
+    timestamp: String,
+    mode: String,
+    files: Vec<String>,
+}
+
+/// Parse `.loop/.stash/index` into a list of stash entries (oldest first).
+fn parse_stash_index() -> Vec<StashEntry> {
+    let index_path = format!("{}/index", STASH_DIR);
+    let content = match fs::read_to_string(&index_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            if parts.len() < 4 {
+                return None;
+            }
+            Some(StashEntry {
+                hash: parts[0].to_string(),
+                timestamp: parts[1].to_string(),
+                mode: parts[2].to_string(),
+                files: parts[3].split(',').map(|s| s.to_string()).collect(),
+            })
+        })
+        .collect()
+}
+
+// ── Stash core ─────────────────────────────────────────────────────────
+
+/// Snapshot all stashable files in `.loop/` to a new log entry.
+/// Returns `Ok(hash)` on success.
+fn stash_snapshot() -> Result<String, String> {
+    let files = collect_stashable_files();
+    if files.is_empty() {
+        return Err("no files to stash in .loop/".to_string());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let timestamp = format_unix_timestamp(now);
+    let mode = detect_mode().unwrap_or("unknown").to_string();
+
+    let mut hash = generate_stash_hash(&timestamp, &files);
+
+    // Collision handling: rehash with counter suffix
+    let stash_base = Path::new(STASH_DIR);
+    for attempt in 0..100u32 {
+        if !stash_base.join(&hash).exists() {
+            break;
+        }
+        if attempt == 99 {
+            return Err("hash collision after 100 attempts".to_string());
+        }
+        hash = generate_stash_hash(&format!("{}{}", timestamp, attempt + 1), &files);
+    }
+
+    let entry_dir = stash_base.join(&hash);
+    fs::create_dir_all(&entry_dir)
+        .map_err(|e| format!("failed to create {}: {}", entry_dir.display(), e))?;
+
+    let file_names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+
+    for (name, contents) in &files {
+        let dest = entry_dir.join(name);
+        fs::write(&dest, contents)
+            .map_err(|e| format!("failed to write {}: {}", dest.display(), e))?;
+    }
+
+    // Append to index
+    let index_path = format!("{}/index", STASH_DIR);
+    let line = format!(
+        "{}|{}|{}|{}\n",
+        hash,
+        timestamp,
+        mode,
+        file_names.join(",")
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index_path)
+        .map_err(|e| format!("failed to open index: {}", e))?;
+    std::io::Write::write_all(&mut f, line.as_bytes())
+        .map_err(|e| format!("failed to write index: {}", e))?;
+
+    Ok(hash)
+}
+
+// ── Stash commands ─────────────────────────────────────────────────────
+
+/// Snapshot `.loop/` to a new stash log entry. Returns file count for `clean()`.
+fn stash_working_files() -> usize {
+    let files = collect_stashable_files();
+    if files.is_empty() {
+        return 0;
+    }
+    let count = files.len();
+    match stash_snapshot() {
+        Ok(_) => count,
+        Err(_) => 0,
+    }
+}
+
+/// `yoke stash` — create a new stash entry and print the hash.
+fn stash_create() -> i32 {
+    if !Path::new(".loop").exists() {
+        log_error(".loop/ directory not found");
+        return 1;
+    }
+    match stash_snapshot() {
+        Ok(hash) => {
+            log(&format!("stashed → {}{}{}", BLUE, hash, RESET));
+            0
+        }
+        Err(msg) => {
+            log_error(&msg);
+            1
+        }
+    }
+}
+
+/// `yoke stash log` — list all stash entries (newest first).
+fn stash_log_cmd() -> i32 {
+    if !Path::new(".loop").exists() {
+        log_error(".loop/ directory not found");
+        return 1;
+    }
+    let entries = parse_stash_index();
+    if entries.is_empty() {
+        log("no stash entries");
+        return 0;
+    }
+    for entry in entries.iter().rev() {
+        eprintln!(
+            "{}{}{}{}  {}  mode={}",
+            BOLD, BLUE, entry.hash, RESET, entry.timestamp, entry.mode
+        );
+        for file in &entry.files {
+            eprintln!("    {}", file);
+        }
+    }
+    0
+}
+
+/// `yoke stash checkout <hash>` — auto-stash current state, clear `.loop/` files,
+/// restore target entry. Supports prefix matching.
+fn stash_checkout(target_hash: &str) -> i32 {
+    if !Path::new(".loop").exists() {
+        log_error(".loop/ directory not found");
+        return 1;
+    }
+    let entries = parse_stash_index();
+    if entries.is_empty() {
+        log_error("no stash entries");
         return 1;
     }
 
-    let entries = match fs::read_dir(stash) {
-        Ok(e) => e,
-        Err(e) => {
-            log_error(&format!("failed to read {}: {}", STASH_DIR, e));
-            return 1;
-        }
-    };
-
-    // Build a map from filename → canonical path
-    let canonical: std::collections::HashMap<&str, &str> = STASH_CANDIDATES
+    // Find matching entries (exact or prefix)
+    let matches: Vec<&StashEntry> = entries
         .iter()
-        .filter_map(|p| {
-            Path::new(p)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .map(|f| (f, *p))
-        })
+        .filter(|e| e.hash == target_hash || e.hash.starts_with(target_hash))
         .collect();
 
-    let mut restored = 0;
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if let Some(&dest_path) = canonical.get(name_str.as_ref()) {
-            if let Err(e) = fs::copy(entry.path(), dest_path) {
-                log_error(&format!("failed to restore {}: {}", dest_path, e));
-            } else {
-                log(&format!("restored: {}", dest_path));
-                restored += 1;
+    match matches.len() {
+        0 => {
+            log_error(&format!("no stash entry matching '{}'", target_hash));
+            1
+        }
+        1 => {
+            let target = matches[0];
+            let entry_dir = Path::new(STASH_DIR).join(&target.hash);
+            if !entry_dir.exists() {
+                log_error("stash entry directory missing — index is corrupt");
+                return 1;
             }
-        } else {
-            log(&format!("skip (unknown): {}", name_str));
+
+            // Auto-stash current state (skip if .loop/ has no stashable files)
+            let current_files = collect_stashable_files();
+            if !current_files.is_empty() {
+                match stash_snapshot() {
+                    Ok(hash) => {
+                        log(&format!(
+                            "auto-stashed current state → {}{}{}",
+                            BLUE, hash, RESET
+                        ));
+                    }
+                    Err(msg) => {
+                        log_error(&format!("failed to auto-stash: {}", msg));
+                        return 1;
+                    }
+                }
+            }
+
+            // Remove all stashable files from .loop/
+            for (name, _) in &collect_stashable_files() {
+                let path = Path::new(".loop").join(name);
+                let _ = fs::remove_file(&path);
+            }
+
+            // Restore files from the target entry
+            if let Ok(dir_entries) = fs::read_dir(&entry_dir) {
+                for entry in dir_entries.flatten() {
+                    let name = entry.file_name();
+                    let dest = Path::new(".loop").join(&name);
+                    if let Err(e) = fs::copy(entry.path(), &dest) {
+                        log_error(&format!(
+                            "failed to restore {}: {}",
+                            name.to_string_lossy(),
+                            e
+                        ));
+                        return 1;
+                    }
+                }
+            }
+
+            log(&format!("checked out {}{}{}", BLUE, target.hash, RESET));
+            0
+        }
+        n => {
+            log_error(&format!(
+                "ambiguous hash '{}' — matches {} entries",
+                target_hash, n
+            ));
+            1
         }
     }
+}
 
-    if let Err(e) = fs::remove_dir_all(stash) {
-        log_error(&format!("failed to remove stash: {}", e));
+/// `yoke stash pop` — checkout the most recent stash entry.
+fn stash_pop() -> i32 {
+    let entries = parse_stash_index();
+    match entries.last() {
+        Some(entry) => stash_checkout(&entry.hash),
+        None => {
+            log_error("no stash found — nothing to restore");
+            1
+        }
     }
-
-    log(&format!("restored {} file(s)", restored));
-    0
 }
 
 fn print_stash_help() {
     eprintln!(
-        "{}{}[yoke stash]{} recover auto-stashed working files",
+        "{}{}[yoke stash]{} snapshot and restore .loop/ state",
         ORANGE, BOLD, RESET
     );
     eprintln!();
     eprintln!(
-        "{}USAGE:{} yoke stash pop",
+        "{}USAGE:{} yoke stash [subcommand]",
         BOLD, RESET
     );
     eprintln!();
-    eprintln!("Every 'yoke clean' automatically stashes non-empty working files");
-    eprintln!("into .loop/.stash/ before wiping. Use 'yoke stash pop' to restore");
-    eprintln!("them. Only one stash slot is kept — each clean overwrites the prior stash.");
-    eprintln!();
     eprintln!("{}SUBCOMMANDS:{}", BOLD, RESET);
-    eprintln!("  {}pop{}   Restore stashed files and remove the stash", BOLD, RESET);
+    eprintln!(
+        "  {}(none){}           Snapshot all .loop/ files to a new stash entry",
+        BOLD, RESET
+    );
+    eprintln!(
+        "  {}log{}              List all stash entries (hash, timestamp, mode, files)",
+        BOLD, RESET
+    );
+    eprintln!(
+        "  {}checkout <hash>{}  Auto-stash current state, then restore target entry",
+        BOLD, RESET
+    );
+    eprintln!(
+        "  {}pop{}              Alias for checkout of the most recent entry",
+        BOLD, RESET
+    );
+    eprintln!();
+    eprintln!("{}EXAMPLES:{}", BOLD, RESET);
+    eprintln!("  yoke stash                   # snapshot current .loop/ files");
+    eprintln!("  yoke stash log               # show all stash entries");
+    eprintln!("  yoke stash checkout a1b2c3d  # restore a specific snapshot");
+    eprintln!("  yoke stash pop               # restore the most recent snapshot");
 }
 
 /// Return the list of (path, default_content) pairs for a given mode.
@@ -2000,21 +2208,24 @@ fn main() {
                 return;
             }
             match args.get(2).map(|a| a.as_str()) {
-                Some("pop") => {
-                    if args.len() > 3 {
-                        log_error(&format!("unexpected argument '{}'", args[3]));
-                        print_stash_help();
+                None => {
+                    process::exit(stash_create());
+                }
+                Some("log") => {
+                    process::exit(stash_log_cmd());
+                }
+                Some("checkout") => match args.get(3) {
+                    Some(hash) => process::exit(stash_checkout(hash)),
+                    None => {
+                        log_error("missing hash — usage: yoke stash checkout <hash>");
                         process::exit(2);
                     }
+                },
+                Some("pop") => {
                     process::exit(stash_pop());
                 }
                 Some(other) => {
                     log_error(&format!("unknown subcommand '{}'", other));
-                    print_stash_help();
-                    process::exit(2);
-                }
-                None => {
-                    log_error("missing subcommand — try 'yoke stash pop'");
                     print_stash_help();
                     process::exit(2);
                 }
