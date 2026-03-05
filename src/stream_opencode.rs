@@ -3,24 +3,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::ChildStdout;
 
+use crate::ansi::{BLUE, BOLD, CYAN, DIM, GRAY, GREEN, MAGENTA, ORANGE, RED, RESET, YELLOW};
 use crate::json::{extract_num, extract_str, unescape_json};
-
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[38;5;46m";
-const ORANGE: &str = "\x1b[38;5;208m";
-const BLUE: &str = "\x1b[38;5;75m";
-const CYAN: &str = "\x1b[38;5;80m";
-const YELLOW: &str = "\x1b[38;5;222m";
-const MAGENTA: &str = "\x1b[38;5;183m";
-const RED: &str = "\x1b[38;5;196m";
-const GRAY: &str = "\x1b[38;5;245m";
 
 struct StreamState {
     turn_num: u32,
     iteration_cost: f64,
-    iteration_duration_ms: f64,
     tool_counts: HashMap<String, u32>,
     total_tokens: u64,
 }
@@ -30,7 +18,6 @@ impl StreamState {
         Self {
             turn_num: 0,
             iteration_cost: 0.0,
-            iteration_duration_ms: 0.0,
             tool_counts: HashMap::new(),
             total_tokens: 0,
         }

@@ -4,23 +4,11 @@ use std::path::Path;
 use std::process::ChildStdout;
 use std::time::Instant;
 
+use crate::ansi::{BLUE, BOLD, CYAN, DIM, GRAY, GREEN, MAGENTA, ORANGE, RED, RESET, YELLOW};
 use crate::json::{extract_num, extract_str, unescape_json};
 
-// ANSI escape codes
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[38;5;46m";
-const ORANGE: &str = "\x1b[38;5;208m";
-const BLUE: &str = "\x1b[38;5;75m";
-const CYAN: &str = "\x1b[38;5;80m";
-const YELLOW: &str = "\x1b[38;5;222m";
-const MAGENTA: &str = "\x1b[38;5;183m";
-const RED: &str = "\x1b[38;5;196m";
-const GRAY: &str = "\x1b[38;5;245m";
-// VS Code-style diff background colors
-const BG_RED: &str = "\x1b[48;2;80;30;30m";    // dark red/pink background for removed lines
-const BG_GREEN: &str = "\x1b[48;2;30;60;30m";  // dark green background for added lines
+const BG_RED: &str = "\x1b[48;2;80;30;30m";
+const BG_GREEN: &str = "\x1b[48;2;30;60;30m";
 
 struct StreamState {
     turn_num: u32,

@@ -1,12 +1,12 @@
 #![warn(clippy::string_slice)]
 
+mod ansi;
 mod boundary;
 mod config;
 mod guard;
-mod heartbeat;
 mod json;
-mod registry;
 mod signal;
+mod stash;
 mod stream;
 mod stream_opencode;
 
@@ -43,7 +43,7 @@ const SPECIFICATION_PATH: &str = ".loop/specification.md";
 const SAGA_NOTES_PATH: &str = ".loop/saga-notes.md";
 const DECISIONS_PATH: &str = ".loop/decisions.md";
 const SUB_PLAN_PATH: &str = ".loop/sub-plan.md";
-const STASH_DIR: &str = ".loop/.stash";
+pub(crate) const STASH_DIR: &str = ".loop/.stash";
 
 /// Parse the plan file and notes.md to determine stage progress.
 /// Returns `Some((completed, total))` if the plan has parseable `## Stage` headers.
@@ -83,14 +83,7 @@ fn format_progress_bar(completed: usize, total: usize) -> String {
     )
 }
 
-// ANSI helpers
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[38;5;46m";
-const ORANGE: &str = "\x1b[38;5;208m";
-const RED: &str = "\x1b[38;5;196m";
-const BLUE: &str = "\x1b[38;5;75m";
+use ansi::{BLUE, BOLD, DIM, GREEN, ORANGE, RED, RESET};
 const MAGENTA: &str = "\x1b[38;5;207m";
 
 fn capitalize_first(s: &str) -> String {
@@ -101,11 +94,11 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     eprintln!("{}{}[yoke]{} {}", ORANGE, BOLD, RESET, msg);
 }
 
-fn log_error(msg: &str) {
+pub(crate) fn log_error(msg: &str) {
     eprintln!("{}{}[yoke]{} {}{}ERROR:{} {}", ORANGE, BOLD, RESET, BOLD, RED, RESET, msg);
 }
 
@@ -441,9 +434,9 @@ fn restore_files(backup_dir: &Path, files: &[&str]) {
     }
 }
 
-/// Check the first line of notes.md for STATUS: DONE.
-fn is_done() -> bool {
-    match fs::read_to_string(NOTES_PATH) {
+/// Check the first line of a notes file for STATUS: DONE.
+fn is_status_done(path: &str) -> bool {
+    match fs::read_to_string(path) {
         Ok(content) => content.starts_with("STATUS: DONE"),
         Err(_) => false,
     }
@@ -677,6 +670,63 @@ fn invoke_periodic(runner: &mut LoopRunner, config: &Config, periodic: &Periodic
     status
 }
 
+/// Render a box-drawn iteration banner to stderr.
+/// Uses double borders (╔/║/╚) at top level, single borders (┌/│/└) when nested.
+fn render_iteration_banner(label: &str, iteration: u32, nested: bool) {
+    let content = format!("{} {:>4}", label, iteration);
+    // Pad content to fill inner width of 38 characters
+    let inner = format!("{:^38}", content);
+    if nested {
+        eprintln!("{}{}┌──────────────────────────────────────┐{}", BOLD, ORANGE, RESET);
+        eprintln!("{}{}│{}│{}", BOLD, ORANGE, inner, RESET);
+        eprintln!("{}{}└──────────────────────────────────────┘{}", BOLD, ORANGE, RESET);
+    } else {
+        eprintln!("{}{}╔══════════════════════════════════════╗{}", BOLD, ORANGE, RESET);
+        eprintln!("{}{}║{}║{}", BOLD, ORANGE, inner, RESET);
+        eprintln!("{}{}╚══════════════════════════════════════╝{}", BOLD, ORANGE, RESET);
+    }
+}
+
+/// Render a named section banner to stderr (for judge, periodic, etc.).
+fn render_section_banner(title: &str, subtitle: &str, color: &str) {
+    let fill_len = 40usize.saturating_sub(title.len() + 4); // "┌─ Title ──...──┐"
+    eprintln!("{}{}┌─ {} {}┐{}", BOLD, color, title, "─".repeat(fill_len), RESET);
+    let inner = format!("  {:<38}", subtitle);
+    eprintln!("{}{}│{}│{}", BOLD, color, inner, RESET);
+    eprintln!("{}{}└────────────────────────────────────────┘{}", BOLD, color, RESET);
+}
+
+/// Render a box-drawn table of guard results to stderr.
+fn render_guard_table(results: &[guard::GuardResult]) {
+    if results.is_empty() {
+        return;
+    }
+    let cmd_w = results.iter().map(|r| r.name.len()).max().unwrap_or(10).max(10);
+    let stat_w = 8;
+    let time_w = 6;
+    let top    = format!("  ┌{}┬{}┬{}┐", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
+    let bottom = format!("  └{}┴{}┴{}┘", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
+    eprintln!("{}", top);
+    for r in results {
+        let cmd_padded = format!("{:<w$}", r.name, w = cmd_w);
+        let status_cell = if r.skipped {
+            format!("{}SKIPPED {}", ORANGE, RESET)
+        } else if r.passed {
+            format!(" {} PASS {}  ", GREEN, RESET)
+        } else {
+            format!(" {} FAIL {}  ", RED, RESET)
+        };
+        let time_cell = if r.skipped {
+            format!("  -  ")
+        } else {
+            let secs = r.elapsed_secs.round() as u64;
+            format!("{:>3}s ", secs)
+        };
+        eprintln!("  │ {} │{}│ {} │", cmd_padded, status_cell, time_cell);
+    }
+    eprintln!("{}", bottom);
+}
+
 /// Run guard-after commands for a periodic agent.
 /// Results are written to a separate file so the worker isn't confused.
 fn run_periodic_guards(periodic: &Periodic, max_tail: usize) {
@@ -686,40 +736,14 @@ fn run_periodic_guards(periodic: &Periodic, max_tail: usize) {
     let results_path = PathBuf::from(format!(".loop/periodic-{}-results.md", periodic.name));
     let results = guard::run_guards(&periodic.guards, max_tail, &results_path);
 
-    // Render a compact table for periodic guard results
-    if !results.is_empty() {
-        let cmd_w = results.iter().map(|r| r.name.len()).max().unwrap_or(10).max(10);
-        let stat_w = 8;
-        let time_w = 6;
-        let top    = format!("  ┌{}┬{}┬{}┐", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
-        let bottom = format!("  └{}┴{}┴{}┘", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
-        eprintln!("{}", top);
-        for r in &results {
-            let cmd_padded = format!("{:<w$}", r.name, w = cmd_w);
-            let status_cell = if r.skipped {
-                format!("{}SKIPPED {}", ORANGE, RESET)
-            } else if r.passed {
-                format!(" {} PASS {}  ", GREEN, RESET)
-            } else {
-                format!(" {} FAIL {}  ", RED, RESET)
-            };
-            let time_cell = if r.skipped {
-                format!("  -  ")
-            } else {
-                let secs = r.elapsed_secs.round() as u64;
-                format!("{:>3}s ", secs)
-            };
-            eprintln!("  │ {} │{}│ {} │", cmd_padded, status_cell, time_cell);
-        }
-        eprintln!("{}", bottom);
+    render_guard_table(&results);
 
-        let all_passed = results.iter().all(|r| r.passed);
-        if !all_passed {
-            log(&format!(
-                "{}WARNING: periodic '{}' guard(s) failed — results in {}{}",
-                ORANGE, periodic.name, format!(".loop/periodic-{}-results.md", periodic.name), RESET
-            ));
-        }
+    let all_passed = results.iter().all(|r| r.passed);
+    if !all_passed {
+        log(&format!(
+            "{}WARNING: periodic '{}' guard(s) failed — results in {}{}",
+            ORANGE, periodic.name, format!(".loop/periodic-{}-results.md", periodic.name), RESET
+        ));
     }
 }
 
@@ -947,42 +971,7 @@ fn run_all_guards(config: &Config) -> bool {
 
     let all_passed = guard_results.iter().all(|r| r.passed);
 
-    // Render guard results as a box-drawn table with timing
-    if !guard_results.is_empty() {
-        // Column widths (visual characters, not bytes)
-        let cmd_w = guard_results.iter().map(|r| r.name.len()).max().unwrap_or(10).max(10);
-        let stat_w = 8; // enough for "SKIPPED" + padding
-        let time_w = 6; // e.g. "  12s "
-
-        let top    = format!("  ┌{}┬{}┬{}┐", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
-        let bottom = format!("  └{}┴{}┴{}┘", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
-
-        eprintln!("{}", top);
-        for r in &guard_results {
-            // Command column: left-aligned, padded to cmd_w
-            let cmd_padded = format!("{:<w$}", r.name, w = cmd_w);
-
-            // Status column: colored, centered in stat_w characters
-            let status_cell = if r.skipped {
-                format!("{}SKIPPED {}", ORANGE, RESET)
-            } else if r.passed {
-                format!(" {} PASS {}  ", GREEN, RESET)
-            } else {
-                format!(" {} FAIL {}  ", RED, RESET)
-            };
-
-            // Time column
-            let time_cell = if r.skipped {
-                format!("  -  ")
-            } else {
-                let secs = r.elapsed_secs.round() as u64;
-                format!("{:>3}s ", secs)
-            };
-
-            eprintln!("  │ {} │{}│ {} │", cmd_padded, status_cell, time_cell);
-        }
-        eprintln!("{}", bottom);
-    }
+    render_guard_table(&guard_results);
 
     all_passed
 }
@@ -1020,7 +1009,8 @@ fn clean() -> i32 {
     }
 
     // Stash non-empty working files before wiping
-    let stashed = stash_working_files();
+    let mode = detect_mode().unwrap_or("unknown");
+    let stashed = stash::stash_working_files(mode);
 
     log("Cleaning .loop/ working files...");
 
@@ -1061,347 +1051,6 @@ fn clean() -> i32 {
     0
 }
 
-// ── Stash helpers ──────────────────────────────────────────────────────
-
-/// Format Unix epoch seconds as `YYYY-MM-DDThh:mm:ss` using Hinnant's algorithm.
-fn format_unix_timestamp(secs: u64) -> String {
-    let z = (secs / 86400) as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    let time_of_day = secs % 86400;
-    let h = time_of_day / 3600;
-    let min = (time_of_day % 3600) / 60;
-    let s = time_of_day % 60;
-
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, h, min, s)
-}
-
-/// SipHash timestamp + file names/contents → lower 28 bits → 7-char hex.
-fn generate_stash_hash(timestamp: &str, files: &[(String, Vec<u8>)]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    timestamp.hash(&mut hasher);
-    for (name, contents) in files {
-        name.hash(&mut hasher);
-        contents.hash(&mut hasher);
-    }
-    format!("{:07x}", hasher.finish() & 0x0FFF_FFFF)
-}
-
-/// Collect all regular files in `.loop/` excluding dotfile/dotdir entries.
-/// Returns sorted `(filename, contents)` pairs for deterministic hashing.
-fn collect_stashable_files() -> Vec<(String, Vec<u8>)> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(".loop") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(contents) = fs::read(&path) {
-                    files.push((name, contents));
-                }
-            }
-        }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-}
-
-struct StashEntry {
-    hash: String,
-    timestamp: String,
-    mode: String,
-    files: Vec<String>,
-}
-
-/// Parse `.loop/.stash/index` into a list of stash entries (oldest first).
-fn parse_stash_index() -> Vec<StashEntry> {
-    let index_path = format!("{}/index", STASH_DIR);
-    let content = match fs::read_to_string(&index_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() < 4 {
-                return None;
-            }
-            Some(StashEntry {
-                hash: parts[0].to_string(),
-                timestamp: parts[1].to_string(),
-                mode: parts[2].to_string(),
-                files: parts[3].split(',').map(|s| s.to_string()).collect(),
-            })
-        })
-        .collect()
-}
-
-// ── Stash core ─────────────────────────────────────────────────────────
-
-/// Snapshot all stashable files in `.loop/` to a new log entry.
-/// Returns `Ok(hash)` on success.
-fn stash_snapshot() -> Result<String, String> {
-    let files = collect_stashable_files();
-    if files.is_empty() {
-        return Err("no files to stash in .loop/".to_string());
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let timestamp = format_unix_timestamp(now);
-    let mode = detect_mode().unwrap_or("unknown").to_string();
-
-    let mut hash = generate_stash_hash(&timestamp, &files);
-
-    // Collision handling: rehash with counter suffix
-    let stash_base = Path::new(STASH_DIR);
-    for attempt in 0..100u32 {
-        if !stash_base.join(&hash).exists() {
-            break;
-        }
-        if attempt == 99 {
-            return Err("hash collision after 100 attempts".to_string());
-        }
-        hash = generate_stash_hash(&format!("{}{}", timestamp, attempt + 1), &files);
-    }
-
-    let entry_dir = stash_base.join(&hash);
-    fs::create_dir_all(&entry_dir)
-        .map_err(|e| format!("failed to create {}: {}", entry_dir.display(), e))?;
-
-    let file_names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
-
-    for (name, contents) in &files {
-        let dest = entry_dir.join(name);
-        fs::write(&dest, contents)
-            .map_err(|e| format!("failed to write {}: {}", dest.display(), e))?;
-    }
-
-    // Append to index
-    let index_path = format!("{}/index", STASH_DIR);
-    let line = format!(
-        "{}|{}|{}|{}\n",
-        hash,
-        timestamp,
-        mode,
-        file_names.join(",")
-    );
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&index_path)
-        .map_err(|e| format!("failed to open index: {}", e))?;
-    std::io::Write::write_all(&mut f, line.as_bytes())
-        .map_err(|e| format!("failed to write index: {}", e))?;
-
-    Ok(hash)
-}
-
-// ── Stash commands ─────────────────────────────────────────────────────
-
-/// Snapshot `.loop/` to a new stash log entry. Returns file count for `clean()`.
-fn stash_working_files() -> usize {
-    let files = collect_stashable_files();
-    if files.is_empty() {
-        return 0;
-    }
-    let count = files.len();
-    match stash_snapshot() {
-        Ok(_) => count,
-        Err(_) => 0,
-    }
-}
-
-/// `yoke stash` — create a new stash entry and print the hash.
-fn stash_create() -> i32 {
-    if !Path::new(".loop").exists() {
-        log_error(".loop/ directory not found");
-        return 1;
-    }
-    match stash_snapshot() {
-        Ok(hash) => {
-            log(&format!("stashed → {}{}{}", BLUE, hash, RESET));
-            0
-        }
-        Err(msg) => {
-            log_error(&msg);
-            1
-        }
-    }
-}
-
-/// `yoke stash log` — list all stash entries (newest first).
-fn stash_log_cmd() -> i32 {
-    if !Path::new(".loop").exists() {
-        log_error(".loop/ directory not found");
-        return 1;
-    }
-    let entries = parse_stash_index();
-    if entries.is_empty() {
-        log("no stash entries");
-        return 0;
-    }
-    for entry in entries.iter().rev() {
-        eprintln!(
-            "{}{}{}{}  {}  mode={}",
-            BOLD, BLUE, entry.hash, RESET, entry.timestamp, entry.mode
-        );
-        for file in &entry.files {
-            eprintln!("    {}", file);
-        }
-    }
-    0
-}
-
-/// `yoke stash checkout <hash>` — auto-stash current state, clear `.loop/` files,
-/// restore target entry. Supports prefix matching.
-fn stash_checkout(target_hash: &str) -> i32 {
-    if !Path::new(".loop").exists() {
-        log_error(".loop/ directory not found");
-        return 1;
-    }
-    let entries = parse_stash_index();
-    if entries.is_empty() {
-        log_error("no stash entries");
-        return 1;
-    }
-
-    // Find matching entries (exact or prefix)
-    let matches: Vec<&StashEntry> = entries
-        .iter()
-        .filter(|e| e.hash == target_hash || e.hash.starts_with(target_hash))
-        .collect();
-
-    match matches.len() {
-        0 => {
-            log_error(&format!("no stash entry matching '{}'", target_hash));
-            1
-        }
-        1 => {
-            let target = matches[0];
-            let entry_dir = Path::new(STASH_DIR).join(&target.hash);
-            if !entry_dir.exists() {
-                log_error("stash entry directory missing — index is corrupt");
-                return 1;
-            }
-
-            // Auto-stash current state (skip if .loop/ has no stashable files)
-            let current_files = collect_stashable_files();
-            if !current_files.is_empty() {
-                match stash_snapshot() {
-                    Ok(hash) => {
-                        log(&format!(
-                            "auto-stashed current state → {}{}{}",
-                            BLUE, hash, RESET
-                        ));
-                    }
-                    Err(msg) => {
-                        log_error(&format!("failed to auto-stash: {}", msg));
-                        return 1;
-                    }
-                }
-            }
-
-            // Remove all stashable files from .loop/
-            for (name, _) in &collect_stashable_files() {
-                let path = Path::new(".loop").join(name);
-                let _ = fs::remove_file(&path);
-            }
-
-            // Restore files from the target entry
-            if let Ok(dir_entries) = fs::read_dir(&entry_dir) {
-                for entry in dir_entries.flatten() {
-                    let name = entry.file_name();
-                    let dest = Path::new(".loop").join(&name);
-                    if let Err(e) = fs::copy(entry.path(), &dest) {
-                        log_error(&format!(
-                            "failed to restore {}: {}",
-                            name.to_string_lossy(),
-                            e
-                        ));
-                        return 1;
-                    }
-                }
-            }
-
-            log(&format!("checked out {}{}{}", BLUE, target.hash, RESET));
-            0
-        }
-        n => {
-            log_error(&format!(
-                "ambiguous hash '{}' — matches {} entries",
-                target_hash, n
-            ));
-            1
-        }
-    }
-}
-
-/// `yoke stash pop` — checkout the most recent stash entry.
-fn stash_pop() -> i32 {
-    let entries = parse_stash_index();
-    match entries.last() {
-        Some(entry) => stash_checkout(&entry.hash),
-        None => {
-            log_error("no stash found — nothing to restore");
-            1
-        }
-    }
-}
-
-fn print_stash_help() {
-    eprintln!(
-        "{}{}[yoke stash]{} snapshot and restore .loop/ state",
-        ORANGE, BOLD, RESET
-    );
-    eprintln!();
-    eprintln!(
-        "{}USAGE:{} yoke stash [subcommand]",
-        BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}SUBCOMMANDS:{}", BOLD, RESET);
-    eprintln!(
-        "  {}(none){}           Snapshot all .loop/ files to a new stash entry",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}log{}              List all stash entries (hash, timestamp, mode, files)",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}checkout <hash>{}  Auto-stash current state, then restore target entry",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}pop{}              Alias for checkout of the most recent entry",
-        BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}EXAMPLES:{}", BOLD, RESET);
-    eprintln!("  yoke stash                   # snapshot current .loop/ files");
-    eprintln!("  yoke stash log               # show all stash entries");
-    eprintln!("  yoke stash checkout a1b2c3d  # restore a specific snapshot");
-    eprintln!("  yoke stash pop               # restore the most recent snapshot");
-}
 
 /// Return the list of (path, default_content) pairs for a given mode.
 fn mode_files(mode: &str) -> Option<Vec<(&'static str, &'static str)>> {
@@ -1620,6 +1269,80 @@ enum PlanLoopOutcome {
     Error,
 }
 
+/// Check if consecutive judge failures have hit the bail threshold.
+/// Returns true if the loop should bail out.
+fn is_judge_bailout(consecutive: u32, max: u32) -> bool {
+    if consecutive >= max {
+        eprintln!();
+        eprintln!(
+            "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
+            RED, BOLD, max, RESET
+        );
+        eprintln!();
+        true
+    } else {
+        false
+    }
+}
+
+/// Result of evaluating judge-every logic within a plan loop iteration.
+enum JudgeEveryAction {
+    /// Judge passed on DONE — exit loop.
+    Pass,
+    /// Consecutive failures hit threshold — bail out.
+    Bailout,
+    /// Continue to next iteration (judge failed on DONE, or mid-loop check done).
+    Continue,
+}
+
+/// Evaluate judge-every logic: fire judge when worker signals DONE or at cadence checkpoints.
+fn evaluate_judge_every(
+    runner: &mut LoopRunner,
+    config: &Config,
+    iteration: u32,
+    guards_passed: bool,
+    consecutive_judge_failures: &mut u32,
+    judge_every: u32,
+) -> JudgeEveryAction {
+    if guards_passed && is_status_done(NOTES_PATH) {
+        // Always fire judge when worker signals DONE
+        eprintln!();
+        render_section_banner("Judge (DONE)", "Worker DONE — invoking judge", BLUE);
+        let pass = invoke_judge(runner, config, iteration);
+        if pass {
+            return JudgeEveryAction::Pass;
+        }
+        *consecutive_judge_failures += 1;
+        if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
+            return JudgeEveryAction::Bailout;
+        }
+        log(&format!(
+            "{}Judge FAIL ({}/{}) \u{2014} resetting STATUS for retry{}",
+            ORANGE, *consecutive_judge_failures, config.max_judge_failures, RESET
+        ));
+        reset_notes_status();
+    } else if guards_passed && iteration % judge_every == 0 {
+        // Mid-loop quality checkpoint
+        eprintln!();
+        render_section_banner(
+            "Mid-loop Judge",
+            &format!("Quality checkpoint (iteration {:>4})", iteration),
+            BLUE,
+        );
+        let pass = invoke_judge(runner, config, iteration);
+        if pass {
+            *consecutive_judge_failures = 0;
+        } else {
+            *consecutive_judge_failures += 1;
+            if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
+                return JudgeEveryAction::Bailout;
+            }
+        }
+        // Either way, worker continues — verdict.md has feedback
+    }
+    JudgeEveryAction::Continue
+}
+
 /// Core plan-loop runner that can be called standalone or nested inside brute.
 ///
 /// - `config`: already-loaded Config
@@ -1685,33 +1408,8 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
         }
         iteration += 1;
         eprintln!();
-        if nested {
-            eprintln!(
-                "{}{}┌──────────────────────────────────────┐{}",
-                BOLD, ORANGE, RESET
-            );
-            eprintln!(
-                "{}{}│      Plan Iteration {:>4}             │{}",
-                BOLD, ORANGE, iteration, RESET
-            );
-            eprintln!(
-                "{}{}└──────────────────────────────────────┘{}",
-                BOLD, ORANGE, RESET
-            );
-        } else {
-            eprintln!(
-                "{}{}╔══════════════════════════════════════╗{}",
-                BOLD, ORANGE, RESET
-            );
-            eprintln!(
-                "{}{}║         Iteration {:>4}              ║{}",
-                BOLD, ORANGE, iteration, RESET
-            );
-            eprintln!(
-                "{}{}╚══════════════════════════════════════╝{}",
-                BOLD, ORANGE, RESET
-            );
-        }
+        let label = if nested { "Plan Iteration" } else { "Iteration" };
+        render_iteration_banner(label, iteration, nested);
 
         // Show stage progress bar if plan has parseable stages
         if let Some((completed, total)) = stage_progress(plan_path) {
@@ -1778,20 +1476,10 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             if iteration % periodic.cadence == 0 {
                 eprintln!();
                 let upper_name = capitalize_first(&periodic.name);
-                eprintln!(
-                    "{}{}┌─ {} {}┐{}",
-                    BOLD, MAGENTA,
-                    upper_name,
-                    "─".repeat(37usize.saturating_sub(upper_name.len() + 2)),
-                    RESET
-                );
-                eprintln!(
-                    "{}{}│  Periodic agent (iteration {:>4})     │{}",
-                    BOLD, MAGENTA, iteration, RESET
-                );
-                eprintln!(
-                    "{}{}└────────────────────────────────────────┘{}",
-                    BOLD, MAGENTA, RESET
+                render_section_banner(
+                    &upper_name,
+                    &format!("Periodic agent (iteration {:>4})", iteration),
+                    MAGENTA,
                 );
                 let ok = invoke_periodic(&mut runner, config, periodic, iteration);
                 if !ok {
@@ -1806,80 +1494,18 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
 
         // Judge-every logic: embedded judge checks at configured cadence
         if let Some(judge_every) = config.judge_every {
-            if guards_passed && is_done() {
-                // Always fire judge when worker signals DONE
-                eprintln!();
-                eprintln!(
-                    "{}{}┌─ Judge (DONE) ─────────────────────────┐{}",
-                    BOLD, BLUE, RESET
-                );
-                eprintln!(
-                    "{}{}│  Worker DONE — invoking judge           │{}",
-                    BOLD, BLUE, RESET
-                );
-                eprintln!(
-                    "{}{}└────────────────────────────────────────┘{}",
-                    BOLD, BLUE, RESET
-                );
-                let pass = invoke_judge(&mut runner, config, iteration);
-                if pass {
-                    return PlanLoopOutcome::JudgePass;
-                }
-                consecutive_judge_failures += 1;
-                if consecutive_judge_failures >= config.max_judge_failures {
-                    eprintln!();
-                    eprintln!(
-                        "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
-                        RED, BOLD, config.max_judge_failures, RESET
-                    );
-                    eprintln!();
-                    return PlanLoopOutcome::JudgeBailout;
-                }
-                log(&format!(
-                    "{}Judge FAIL ({}/{}) \u{2014} resetting STATUS for retry{}",
-                    ORANGE, consecutive_judge_failures, config.max_judge_failures, RESET
-                ));
-                reset_notes_status();
-                continue;
-            } else if guards_passed && iteration % judge_every == 0 {
-                // Mid-loop quality checkpoint
-                eprintln!();
-                eprintln!(
-                    "{}{}┌─ Mid-loop Judge ───────────────────────┐{}",
-                    BOLD, BLUE, RESET
-                );
-                eprintln!(
-                    "{}{}│  Quality checkpoint (iteration {:>4})   │{}",
-                    BOLD, BLUE, iteration, RESET
-                );
-                eprintln!(
-                    "{}{}└────────────────────────────────────────┘{}",
-                    BOLD, BLUE, RESET
-                );
-                let pass = invoke_judge(&mut runner, config, iteration);
-                if pass {
-                    consecutive_judge_failures = 0;
-                } else {
-                    consecutive_judge_failures += 1;
-                    if consecutive_judge_failures >= config.max_judge_failures {
-                        eprintln!();
-                        eprintln!(
-                            "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
-                            RED, BOLD, config.max_judge_failures, RESET
-                        );
-                        eprintln!();
-                        return PlanLoopOutcome::JudgeBailout;
-                    }
-                }
-                // Either way, worker continues — verdict.md has feedback
+            match evaluate_judge_every(
+                &mut runner, config, iteration, guards_passed,
+                &mut consecutive_judge_failures, judge_every,
+            ) {
+                JudgeEveryAction::Pass => return PlanLoopOutcome::JudgePass,
+                JudgeEveryAction::Bailout => return PlanLoopOutcome::JudgeBailout,
+                JudgeEveryAction::Continue => continue,
             }
-            // When judge-every is set, the judge handles the DONE check above.
-            // If we reach here without DONE, just continue the loop.
-            continue;
         }
 
         // Original exit check (only reached when judge-every is NOT set)
-        if guards_passed && is_done() {
+        if guards_passed && is_status_done(NOTES_PATH) {
             eprintln!();
             eprintln!(
                 "{}{}  STATUS: DONE and all guards pass \u{2014} loop complete  {}",
@@ -2021,18 +1647,7 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
         }
         iteration += 1;
         eprintln!();
-        eprintln!(
-            "{}{}╔══════════════════════════════════════╗{}",
-            BOLD, ORANGE, RESET
-        );
-        eprintln!(
-            "{}{}║     Brute Iteration {:>4}             ║{}",
-            BOLD, ORANGE, iteration, RESET
-        );
-        eprintln!(
-            "{}{}╚══════════════════════════════════════╝{}",
-            BOLD, ORANGE, RESET
-        );
+        render_iteration_banner("Brute Iteration", iteration, false);
 
         // Restore protected files
         restore_files(&runner.backup_dir, BRUTE_PROTECTED_FILES);
@@ -2093,17 +1708,10 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
 
         // Guards passed — invoke judge
         eprintln!();
-        eprintln!(
-            "{}{}┌─ Judge ────────────────────────────────┐{}",
-            BOLD, BLUE, RESET
-        );
-        eprintln!(
-            "{}{}│  Invoking judge (attempt {:>4})          │{}",
-            BOLD, BLUE, iteration, RESET
-        );
-        eprintln!(
-            "{}{}└────────────────────────────────────────┘{}",
-            BOLD, BLUE, RESET
+        render_section_banner(
+            "Judge",
+            &format!("Invoking judge (attempt {:>4})", iteration),
+            BLUE,
         );
         let pass = invoke_judge(&mut runner, config, iteration);
 
@@ -2137,13 +1745,7 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
             RESET
         ));
 
-        if consecutive_failures >= max_failures {
-            eprintln!();
-            eprintln!(
-                "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
-                RED, BOLD, max_failures, RESET
-            );
-            eprintln!();
+        if is_judge_bailout(consecutive_failures, max_failures) {
             return BruteResult::Bailout;
         }
 
@@ -2163,13 +1765,6 @@ fn run_brute(dry_run: bool) -> i32 {
     }
 }
 
-/// Check the first line of saga-notes.md for STATUS: DONE.
-fn is_saga_done() -> bool {
-    match fs::read_to_string(SAGA_NOTES_PATH) {
-        Ok(content) => content.starts_with("STATUS: DONE"),
-        Err(_) => false,
-    }
-}
 
 /// Invoke the scoper (Agent 1) — a fresh LLM session that reads the spec,
 /// writes sub-plan.md, and updates saga-notes.md.
@@ -2275,18 +1870,7 @@ fn run_saga(dry_run: bool) -> i32 {
         }
         cycle += 1;
         eprintln!();
-        eprintln!(
-            "{}{}╔══════════════════════════════════════╗{}",
-            BOLD, ORANGE, RESET
-        );
-        eprintln!(
-            "{}{}║       Saga Cycle {:>4}                ║{}",
-            BOLD, ORANGE, cycle, RESET
-        );
-        eprintln!(
-            "{}{}╚══════════════════════════════════════╝{}",
-            BOLD, ORANGE, RESET
-        );
+        render_iteration_banner("Saga Cycle", cycle, false);
 
         // Restore protected files
         restore_files(&runner.backup_dir, &saga_protected);
@@ -2296,17 +1880,10 @@ fn run_saga(dry_run: bool) -> i32 {
         } else {
             // Invoke Agent 1 (scoper)
             eprintln!();
-            eprintln!(
-                "{}{}┌\u{2500} Scoper \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}┐{}",
-                BOLD, BLUE, RESET
-            );
-            eprintln!(
-                "{}{}│  Invoking scoper (cycle {:>4})         │{}",
-                BOLD, BLUE, cycle, RESET
-            );
-            eprintln!(
-                "{}{}└\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}┘{}",
-                BOLD, BLUE, RESET
+            render_section_banner(
+                "Scoper",
+                &format!("Invoking scoper (cycle {:>4})", cycle),
+                BLUE,
             );
 
             let scoper_ok = invoke_scoper(&mut runner, &config, cycle);
@@ -2322,7 +1899,7 @@ fn run_saga(dry_run: bool) -> i32 {
         }
 
         // Check if scoper signaled DONE
-        if is_saga_done() {
+        if is_status_done(SAGA_NOTES_PATH) {
             eprintln!();
             eprintln!(
                 "{}{}  Scoper signals DONE \u{2014} saga complete  {}",
@@ -2433,29 +2010,30 @@ fn main() {
         }
         "stash" => {
             if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-                print_stash_help();
+                stash::print_stash_help();
                 return;
             }
+            let mode = detect_mode().unwrap_or("unknown");
             match args.get(2).map(|a| a.as_str()) {
                 None => {
-                    process::exit(stash_create());
+                    process::exit(stash::stash_create(mode));
                 }
                 Some("log") => {
-                    process::exit(stash_log_cmd());
+                    process::exit(stash::stash_log_cmd());
                 }
                 Some("checkout") => match args.get(3) {
-                    Some(hash) => process::exit(stash_checkout(hash)),
+                    Some(hash) => process::exit(stash::stash_checkout(hash, mode)),
                     None => {
                         log_error("missing hash — usage: yoke stash checkout <hash>");
                         process::exit(2);
                     }
                 },
                 Some("pop") => {
-                    process::exit(stash_pop());
+                    process::exit(stash::stash_pop(mode));
                 }
                 Some(other) => {
                     log_error(&format!("unknown subcommand '{}'", other));
-                    print_stash_help();
+                    stash::print_stash_help();
                     process::exit(2);
                 }
             }

@@ -14,7 +14,6 @@ use std::time::Instant;
 pub struct GuardResult {
     pub name: String,
     pub passed: bool,
-    pub output: String,
     pub skipped: bool,
     pub elapsed_secs: f64,
 }
@@ -115,7 +114,6 @@ pub fn run_guards(guards: &[String], max_tail: usize, results_path: &Path) -> Ve
         results.push(GuardResult {
             name,
             passed,
-            output: truncated,
             skipped,
             elapsed_secs,
         });
