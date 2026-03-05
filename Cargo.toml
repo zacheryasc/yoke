@@ -7,3 +7,6 @@ description = "LLM automation loop harness"
 [[bin]]
 name = "yoke"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
