@@ -249,135 +249,113 @@ fn format_tool_call(line: &str) -> String {
     }
 }
 
+/// Handle "assistant" events: render tool_use summaries and track tool counts.
+fn handle_assistant(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamState) -> io::Result<()> {
+    if !line.contains("\"tool_use\"") {
+        return Ok(());
+    }
+    if let (Some(id), Some(name)) = (extract_str(line, "id"), extract_str(line, "name")) {
+        state.tool_use_names.insert(id.to_string(), name.to_string());
+        *state.tool_counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+    let desc = format_tool_call(line);
+    writeln!(out, "  {}>>{} {}", GRAY, RESET, desc)
+}
+
+/// Handle "stream_event" events: render thinking timer, text deltas, and block boundaries.
+fn handle_stream_event(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamState) -> io::Result<()> {
+    if line.contains("\"content_block_delta\"") {
+        if line.contains("\"thinking_delta\"") {
+            if let Some(start) = state.thinking_start {
+                let elapsed = start.elapsed().as_secs_f64();
+                write!(out, "\r{}{}thinking {:.1}s{}", DIM, BLUE, elapsed, RESET)?;
+                out.flush()?;
+            }
+        } else if line.contains("\"text_delta\"")
+            && let Some(text) = extract_str(line, "text")
+        {
+            let text = unescape_json(text);
+            write!(out, "{}{}{}", DIM, text, RESET)?;
+            out.flush()?;
+        }
+    } else if line.contains("\"content_block_start\"") {
+        if line.contains("\"thinking\"") {
+            state.thinking_start = Some(Instant::now());
+            write!(out, "{}{}thinking 0.0s{}", DIM, BLUE, RESET)?;
+            out.flush()?;
+            state.in_thinking = true;
+        } else if !line.contains("\"tool_use\"") {
+            writeln!(out)?;
+        }
+    } else if line.contains("\"content_block_stop\"") {
+        if state.in_thinking {
+            if let Some(start) = state.thinking_start {
+                let elapsed = start.elapsed().as_secs_f64();
+                write!(out, "\r{}{}thinking {:.1}s{}", DIM, BLUE, elapsed, RESET)?;
+            }
+            state.in_thinking = false;
+            state.thinking_start = None;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+/// Handle "user" events: render tool_result success/error badges.
+fn handle_tool_result(out: &mut (impl Write + ?Sized), line: &str, state: &StreamState) -> io::Result<()> {
+    if !line.contains("\"tool_result\"") {
+        return Ok(());
+    }
+    let is_error = line.contains("\"is_error\":true") || line.contains("\"is_error\": true");
+    if is_error {
+        writeln!(out, "  {}← {}{}✗{}", GRAY, RESET, RED, RESET)?;
+        let tail = format_bash_error_tail(line);
+        if !tail.is_empty() {
+            writeln!(out, "{}", tail)?;
+        }
+        return Ok(());
+    }
+    let tool_name = extract_str(line, "tool_use_id")
+        .and_then(|id| state.tool_use_names.get(id))
+        .map(|s| s.as_str());
+    let badge = match tool_name {
+        Some(name @ ("Grep" | "Glob")) => format_grep_glob_badge(name, line),
+        _ => String::new(),
+    };
+    if badge.is_empty() {
+        writeln!(out, "  {}← {}✓{}", GRAY, GREEN, RESET)
+    } else {
+        writeln!(out, "  {}← {}✓{} {}", GRAY, GREEN, RESET, badge)
+    }
+}
+
 /// Process a single NDJSON line, writing formatted output to `out`.
 /// `prior_total` is the accumulated cost from previous iterations, used to display a running total.
 /// Returns `Err` on write failure (e.g. broken pipe) so the caller can stop.
-fn process_line(out: &mut impl Write, line: &str, state: &mut StreamState, prior_total: f64) -> io::Result<()> {
+fn process_line(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamState, prior_total: f64) -> io::Result<()> {
     // Check for turn boundary (message_id change)
     if let Some(msg_id) = extract_str(line, "message_id") {
-        let changed = match &state.current_msg_id {
-            Some(prev) => prev != msg_id,
-            None => true,
-        };
-        if changed {
+        let is_new = state.current_msg_id.as_deref() != Some(msg_id);
+        if is_new {
             state.current_msg_id = Some(msg_id.to_string());
             state.turn_num += 1;
-            writeln!(
-                out,
-                "{}{}━━━ Turn {} ━━━{}",
-                BOLD, ORANGE, state.turn_num, RESET
-            )?;
+            writeln!(out, "{}{}━━━ Turn {} ━━━{}", BOLD, ORANGE, state.turn_num, RESET)?;
         }
     }
 
-    let ev_type = extract_str(line, "type");
-
-    match ev_type {
-        // system → check subtype for init
+    match extract_str(line, "type") {
         Some("system") => {
-            let ev_subtype = extract_str(line, "subtype");
-            if ev_subtype == Some("init") && !state.seen_init {
+            if extract_str(line, "subtype") == Some("init") && !state.seen_init {
                 state.seen_init = true;
                 let sid = extract_str(line, "session_id").unwrap_or("?");
                 let sid_short: String = sid.chars().take(12).collect();
-                let sid_short = sid_short.as_str();
                 let model = extract_str(line, "model").unwrap_or("?");
-                writeln!(
-                    out,
-                    "{}{}[stream]{} session {}… model={}",
-                    ORANGE, BOLD, RESET, sid_short, model
-                )?;
+                writeln!(out, "{}{}[stream]{} session {}… model={}", ORANGE, BOLD, RESET, sid_short, model)?;
             }
         }
-        // assistant → only tool_use summaries (text already shown via stream_event deltas)
-        Some("assistant") => {
-            if line.contains("\"tool_use\"") {
-                // Track tool_use id → name for badge display on tool_result
-                if let (Some(id), Some(name)) = (extract_str(line, "id"), extract_str(line, "name")) {
-                    state.tool_use_names.insert(id.to_string(), name.to_string());
-                    // Increment tool-use counter for iteration summary
-                    *state.tool_counts.entry(name.to_string()).or_insert(0) += 1;
-                }
-                let desc = format_tool_call(line);
-                writeln!(out, "  {}>>{} {}", GRAY, RESET, desc)?;
-            }
-        }
-        // stream_event → streaming deltas
-        Some("stream_event") => {
-            if line.contains("\"content_block_delta\"") {
-                if line.contains("\"thinking_delta\"") {
-                    // Show elapsed timer during extended thinking, rewriting in-place
-                    if let Some(start) = state.thinking_start {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        write!(out, "\r{}{}thinking {:.1}s{}", DIM, BLUE, elapsed, RESET)?;
-                        out.flush()?;
-                    }
-                } else if line.contains("\"text_delta\"")
-                    && let Some(text) = extract_str(line, "text")
-                {
-                    let text = unescape_json(text);
-                    write!(out, "{}{}{}", DIM, text, RESET)?;
-                    out.flush()?;
-                }
-                // input_json_delta → skip silently
-            } else if line.contains("\"content_block_start\"") {
-                if line.contains("\"thinking\"") {
-                    state.thinking_start = Some(Instant::now());
-                    write!(out, "{}{}thinking 0.0s{}", DIM, BLUE, RESET)?;
-                    out.flush()?;
-                    state.in_thinking = true;
-                } else if !line.contains("\"tool_use\"") {
-                    writeln!(out)?;
-                }
-            } else if line.contains("\"content_block_stop\"") {
-                if state.in_thinking {
-                    // Print final elapsed time and end the line
-                    if let Some(start) = state.thinking_start {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        write!(out, "\r{}{}thinking {:.1}s{}", DIM, BLUE, elapsed, RESET)?;
-                    }
-                    state.in_thinking = false;
-                    state.thinking_start = None;
-                }
-                writeln!(out)?;
-            }
-            // message_start, message_delta, message_stop → skip
-        }
-        // user → tool result summaries
-        Some("user") => {
-            if line.contains("\"tool_result\"") {
-                let is_error = line.contains("\"is_error\":true")
-                    || line.contains("\"is_error\": true");
-                if is_error {
-                    let tail = format_bash_error_tail(line);
-                    if tail.is_empty() {
-                        writeln!(out, "  {}← {}{}✗{}", GRAY, RESET, RED, RESET)?;
-                    } else {
-                        writeln!(out, "  {}← {}{}✗{}", GRAY, RESET, RED, RESET)?;
-                        writeln!(out, "{}", tail)?;
-                    }
-                } else {
-                    // Check if this is a Grep or Glob result for badge display
-                    let tool_name = extract_str(line, "tool_use_id")
-                        .and_then(|id| state.tool_use_names.get(id))
-                        .map(|s| s.as_str());
-                    match tool_name {
-                        Some("Grep") | Some("Glob") => {
-                            let badge = format_grep_glob_badge(tool_name.unwrap(), line);
-                            if badge.is_empty() {
-                                writeln!(out, "  {}← {}✓{}", GRAY, GREEN, RESET)?;
-                            } else {
-                                writeln!(out, "  {}← {}✓{} {}", GRAY, GREEN, RESET, badge)?;
-                            }
-                        }
-                        _ => {
-                            writeln!(out, "  {}← {}✓{}", GRAY, GREEN, RESET)?;
-                        }
-                    }
-                }
-            }
-        }
-        // result → green bold summary with running total
+        Some("assistant") => handle_assistant(out, line, state)?,
+        Some("stream_event") => handle_stream_event(out, line, state)?,
+        Some("user") => handle_tool_result(out, line, state)?,
         Some("result") => {
             let cost = extract_num(line, "cost_usd").unwrap_or(0.0);
             state.iteration_cost = cost;
@@ -392,12 +370,10 @@ fn process_line(out: &mut impl Write, line: &str, state: &mut StreamState, prior
                 ORANGE, BOLD, RESET, cost, total, turns, dur_secs
             )?;
         }
-        // Non-JSON or unrecognized — dim passthrough
-        _ => {
-            if ev_type.is_none() && !line.trim().is_empty() {
-                writeln!(out, "{}  {}{}", DIM, line.trim(), RESET)?;
-            }
+        None if !line.trim().is_empty() => {
+            writeln!(out, "{}  {}{}", DIM, line.trim(), RESET)?;
         }
+        _ => {}
     }
     Ok(())
 }
@@ -434,13 +410,20 @@ fn format_summary_strip(state: &StreamState) -> String {
     format!("{}  ⟪ {} ⟫{}", DIM, parts.join(" │ "), RESET)
 }
 
-/// Filter NDJSON stream from Claude and format as rich ANSI output on stdout.
-/// Consumes the stream entirely — raw NDJSON is not written to disk.
-/// `prior_total` is the accumulated cost from previous iterations.
-/// Returns the cost of this iteration (from the `result` event).
-pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, prior_total: f64) -> f64 {
+/// Shared stream loop: reads lines from stdout, tees to log, calls processor per line,
+/// prints a summary strip, and returns the iteration cost.
+///
+/// Used by both Claude and OpenCode stream filters to avoid duplicating the
+/// BufReader/signal-check/log-tee boilerplate.
+pub fn run_stream_loop<S>(
+    stdout: ChildStdout,
+    log_path: Option<&Path>,
+    state: &mut S,
+    mut process: impl FnMut(&mut dyn Write, &str, &mut S) -> io::Result<()>,
+    summarize: impl FnOnce(&S) -> Option<String>,
+    get_cost: impl FnOnce(&S) -> f64,
+) -> f64 {
     let reader = BufReader::new(stdout);
-    let mut state = StreamState::new();
     let mut log_file = log_path.and_then(|p| {
         std::fs::create_dir_all(p.parent().unwrap_or(Path::new("."))).ok();
         std::fs::File::create(p).ok()
@@ -462,22 +445,34 @@ pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, prior_total: 
             continue;
         }
 
-        // Tee raw NDJSON to log file
         if let Some(ref mut f) = log_file {
             let _ = writeln!(f, "{}", line);
         }
 
-        if process_line(&mut out, &line, &mut state, prior_total).is_err() {
-            break; // stdout broken (e.g. pipe closed) — stop gracefully
+        if process(&mut out, &line, state).is_err() {
+            break;
         }
     }
 
-    // Print iteration summary strip after streaming ends (before guards)
-    if state.turn_num > 0 {
-        let strip = format_summary_strip(&state);
+    if let Some(strip) = summarize(state) {
         let _ = writeln!(out, "{}", strip);
     }
 
     let _ = out.flush();
-    state.iteration_cost
+    get_cost(state)
+}
+
+/// Filter NDJSON stream from Claude and format as rich ANSI output on stdout.
+/// `prior_total` is the accumulated cost from previous iterations.
+/// Returns the cost of this iteration (from the `result` event).
+pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, prior_total: f64) -> f64 {
+    let mut state = StreamState::new();
+    run_stream_loop(
+        stdout,
+        log_path,
+        &mut state,
+        |out, line, st| process_line(out, line, st, prior_total),
+        |st| if st.turn_num > 0 { Some(format_summary_strip(st)) } else { None },
+        |st| st.iteration_cost,
+    )
 }

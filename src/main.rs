@@ -41,6 +41,7 @@ const BRIEFING_PATH: &str = ".loop/briefing.md";
 const SAGA_PROTOCOL_PATH: &str = ".loop/saga-protocol.md";
 const SPECIFICATION_PATH: &str = ".loop/specification.md";
 const SAGA_NOTES_PATH: &str = ".loop/saga-notes.md";
+const SAGA_LOG_PATH: &str = ".loop/saga-log.md";
 const DECISIONS_PATH: &str = ".loop/decisions.md";
 const SUB_PLAN_PATH: &str = ".loop/sub-plan.md";
 pub(crate) const STASH_DIR: &str = ".loop/.stash";
@@ -333,9 +334,8 @@ fn print_init_help() {
     eprintln!("Existing files are never overwritten.");
     eprintln!();
     eprintln!("{}MODE SWITCHING:{}", BOLD, RESET);
-    eprintln!("  Switching modes automatically snapshots the current mode's files");
-    eprintln!("  into .loop/.modes/<mode>/ and restores any prior snapshot of the");
-    eprintln!("  target mode. This lets you bounce between modes without losing work.");
+    eprintln!("  Switching modes stashes the current .loop/ state and creates fresh");
+    eprintln!("  target mode files. Restore a previous session with: yoke stash checkout");
 }
 
 /// Holds loop state and cleans up on drop.
@@ -466,9 +466,56 @@ fn reset_notes_status() {
     }
 }
 
+/// Build a docker command that runs the claude CLI inside a container.
+fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
+    let workdir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+
+    let mut c = Command::new("docker");
+    c.args([
+        "run",
+        "-i",
+        "--rm",
+        "--network=host",
+        "--cap-add=NET_ADMIN",
+        "--cap-add=NET_RAW",
+    ]);
+    c.args(["--entrypoint", "claude"]);
+    c.arg("-v").arg(format!("{}:/workspace", workdir));
+    c.arg("-w").arg("/workspace");
+
+    for (key, val) in std::env::vars() {
+        if key.starts_with("CLAUDE_") || key.starts_with("ANTHROPIC_") {
+            c.arg("-e").arg(format!("{}={}", key, val));
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_path = PathBuf::from(&home);
+        let claude_dir = home_path.join(".claude");
+        if claude_dir.exists() {
+            c.arg("-v").arg(format!(
+                "{}:/home/node/.claude",
+                claude_dir.display()
+            ));
+        }
+        let claude_json = home_path.join(".claude.json");
+        if claude_json.exists() {
+            c.arg("-v").arg(format!(
+                "{}:/home/node/.claude.json",
+                claude_json.display()
+            ));
+        }
+    }
+
+    c.arg(image);
+    c.args(claude_args);
+    c
+}
+
 /// Build a Command for invoking the agent backend.
-/// For Claude backend: uses `claude` CLI, optionally via docker.
-/// For OpenCode backend: uses `opencode run --format json --model <model>`.
 fn build_command(config: &Config, prompt: &str) -> Command {
     match config.backend() {
         Backend::Claude => {
@@ -481,56 +528,13 @@ fn build_command(config: &Config, prompt: &str) -> Command {
                 "-p",
                 prompt,
             ];
-            if let Some(ref image) = config.image {
-                let workdir = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .to_string_lossy()
-                    .to_string();
-
-                let mut c = Command::new("docker");
-                c.args([
-                    "run",
-                    "-i",
-                    "--rm",
-                    "--network=host",
-                    "--cap-add=NET_ADMIN",
-                    "--cap-add=NET_RAW",
-                ]);
-                c.args(["--entrypoint", "claude"]);
-                c.arg("-v").arg(format!("{}:/workspace", workdir));
-                c.arg("-w").arg("/workspace");
-
-                for (key, val) in std::env::vars() {
-                    if key.starts_with("CLAUDE_") || key.starts_with("ANTHROPIC_") {
-                        c.arg("-e").arg(format!("{}={}", key, val));
-                    }
+            match config.image {
+                Some(ref image) => build_docker_claude_command(image, &claude_args),
+                None => {
+                    let mut c = Command::new("claude");
+                    c.args(claude_args);
+                    c
                 }
-
-                if let Some(home) = std::env::var_os("HOME") {
-                    let home_path = PathBuf::from(&home);
-                    let claude_dir = home_path.join(".claude");
-                    if claude_dir.exists() {
-                        c.arg("-v").arg(format!(
-                            "{}:/home/node/.claude",
-                            claude_dir.display()
-                        ));
-                    }
-                    let claude_json = home_path.join(".claude.json");
-                    if claude_json.exists() {
-                        c.arg("-v").arg(format!(
-                            "{}:/home/node/.claude.json",
-                            claude_json.display()
-                        ));
-                    }
-                }
-
-                c.arg(image.as_str());
-                c.args(claude_args);
-                c
-            } else {
-                let mut c = Command::new("claude");
-                c.args(claude_args);
-                c
             }
         }
         Backend::OpenCode => {
@@ -995,8 +999,6 @@ fn print_clean_help() {
     eprintln!("Structural files are left untouched:");
     eprintln!("  protocol.md, saga-protocol.md, yoke.conf, briefing.md, specification.md");
     eprintln!();
-    eprintln!("Mode snapshots in .loop/.modes/ are preserved by clean.");
-    eprintln!();
     eprintln!("Non-empty working files are auto-stashed to .loop/.stash/ before wiping.");
     eprintln!("Browse with: {}yoke stash log{}   Recover with: {}yoke stash pop{}", BOLD, RESET, BOLD, RESET);
 }
@@ -1080,6 +1082,7 @@ fn mode_files(mode: &str) -> Option<Vec<(&'static str, &'static str)>> {
             (JUDGE_PATH, DEFAULT_SAGA_JUDGE),
             (SPECIFICATION_PATH, ""),
             (SAGA_NOTES_PATH, ""),
+            (SAGA_LOG_PATH, ""),
             (DECISIONS_PATH, ""),
             (SUB_PLAN_PATH, ""),
             (NOTES_PATH, ""),
@@ -1106,104 +1109,36 @@ fn detect_mode() -> Option<&'static str> {
     }
 }
 
-/// Backup current mode's files into `.loop/.modes/<current>/`, then either
-/// restore from a prior snapshot of the target mode or do a fresh init.
+/// Stash current mode's files, clear `.loop/`, and fresh-init the target mode.
 fn switch_mode(current: &str, target: &str) -> i32 {
-    use std::collections::HashSet;
-
-    let current_files = mode_files(current).unwrap();
-    let target_files = mode_files(target).unwrap();
-
-    let current_paths: HashSet<&str> = current_files.iter().map(|(p, _)| *p).collect();
-    let target_paths: HashSet<&str> = target_files.iter().map(|(p, _)| *p).collect();
-
-    // 1. Snapshot current mode's files into .loop/.modes/<current>/
-    let snapshot_dir = PathBuf::from(format!(".loop/.modes/{}", current));
-    if let Err(e) = fs::create_dir_all(&snapshot_dir) {
-        log_error(&format!("failed to create {}: {}", snapshot_dir.display(), e));
-        return 1;
-    }
-
-    for path in &current_paths {
-        let src = Path::new(path);
-        if src.exists() {
-            let dest = snapshot_dir.join(src.file_name().unwrap());
-            if let Err(e) = fs::copy(src, &dest) {
-                log_error(&format!("failed to snapshot {}: {}", path, e));
-                return 1;
-            }
-            log(&format!("snapshot: {} → {}", path, dest.display()));
+    // 1. Stash current state
+    match stash::stash_snapshot(current) {
+        Ok(hash) => {
+            log(&format!(
+                "stashed {} state \u{2192} {}{}{}",
+                current, BLUE, hash, RESET
+            ));
         }
-    }
-
-    // 2. Delete files exclusive to current mode (not in target)
-    for path in current_paths.difference(&target_paths) {
-        let p = Path::new(path);
-        if p.exists() {
-            if let Err(e) = fs::remove_file(p) {
-                log_error(&format!("failed to remove {}: {}", path, e));
-                return 1;
-            }
-            log(&format!("removed: {}", path));
-        }
-    }
-
-    // 3. Check for a prior snapshot of the target mode
-    let restore_dir = PathBuf::from(format!(".loop/.modes/{}", target));
-    if restore_dir.exists() {
-        log(&format!("Restoring '{}' mode from snapshot...", target));
-        for (path, _) in &target_files {
-            let file_name = Path::new(path).file_name().unwrap();
-            let src = restore_dir.join(file_name);
-            if src.exists() {
-                if let Err(e) = fs::copy(&src, path) {
-                    log_error(&format!("failed to restore {}: {}", path, e));
-                    return 1;
-                }
-                log(&format!("restored: {}", path));
-            } else {
-                // File wasn't in the snapshot — create from template if missing
-                let p = Path::new(path);
-                if !p.exists() {
-                    let (_, content) = target_files.iter().find(|(tp, _)| tp == path).unwrap();
-                    if let Err(e) = fs::write(p, content) {
-                        log_error(&format!("failed to write {}: {}", path, e));
-                        return 1;
-                    }
-                    log(&format!("created: {}", path));
-                }
-            }
-        }
-        // Remove the restored snapshot directory
-        if let Err(e) = fs::remove_dir_all(&restore_dir) {
-            log_error(&format!("failed to remove {}: {}", restore_dir.display(), e));
+        Err(msg) => {
+            log_error(&format!("failed to stash current state: {}", msg));
             return 1;
         }
-    } else {
-        // 4. Fresh init for the target mode
-        log(&format!("Fresh init for '{}' mode...", target));
-        for (path, content) in &target_files {
-            let p = Path::new(path);
-            if p.exists() {
-                // Shared file that wasn't deleted — overwrite with target template
-                // (e.g. protocol.md, yoke.conf have different content per mode)
-                if current_paths.contains(path) {
-                    if let Err(e) = fs::write(p, content) {
-                        log_error(&format!("failed to write {}: {}", path, e));
-                        return 1;
-                    }
-                    log(&format!("overwritten: {} (new mode template)", path));
-                } else {
-                    log(&format!("skip (exists): {}", path));
-                }
-            } else {
-                if let Err(e) = fs::write(p, content) {
-                    log_error(&format!("failed to write {}: {}", path, e));
-                    return 1;
-                }
-                log(&format!("created: {}", path));
-            }
+    }
+
+    // 2. Remove all non-dot files from .loop/
+    let current_files = stash::collect_stashable_files();
+    for (name, _) in &current_files {
+        let _ = fs::remove_file(Path::new(".loop").join(name));
+    }
+
+    // 3. Fresh-init target mode
+    let target_files = mode_files(target).unwrap();
+    for (path, content) in &target_files {
+        if let Err(e) = fs::write(path, content) {
+            log_error(&format!("failed to write {}: {}", path, e));
+            return 1;
         }
+        log(&format!("created: {}", path));
     }
 
     log(&format!("Switched from '{}' to '{}' mode", current, target));
@@ -1343,23 +1278,13 @@ fn evaluate_judge_every(
     JudgeEveryAction::Continue
 }
 
-/// Core plan-loop runner that can be called standalone or nested inside brute.
-///
-/// - `config`: already-loaded Config
-/// - `plan_path`: path to the plan file (e.g. PLAN_PATH or SUB_PLAN_PATH)
-/// - `dry_run`: if true, skip Claude invocation (one iteration only)
-/// - `nested`: if true, running inside brute (adjusts output banners)
-fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) -> PlanLoopOutcome {
-    // Preflight — skip guard-results clear when nested (brute handles it)
-    preflight(plan_path, !nested);
-
-    // Validate judge-every requires judge.md
+/// Validate config preconditions for the plan loop. Exits on failure.
+fn validate_loop_config(config: &Config) {
     if config.judge_every.is_some() && !Path::new(JUDGE_PATH).exists() {
         log_error("judge-every is set but .loop/judge.md not found");
         process::exit(1);
     }
 
-    // Validate periodic protocol paths exist and are non-empty
     for periodic in &config.periodics {
         let p = Path::new(&periodic.path);
         if !p.exists() {
@@ -1380,25 +1305,121 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             _ => {}
         }
     }
+}
 
+/// Fire any periodic agents whose cadence matches this iteration.
+fn fire_periodic_agents(
+    runner: &mut LoopRunner,
+    config: &Config,
+    iteration: u32,
+) {
+    for periodic in &config.periodics {
+        if iteration % periodic.cadence == 0 {
+            eprintln!();
+            let upper_name = capitalize_first(&periodic.name);
+            render_section_banner(
+                &upper_name,
+                &format!("Periodic agent (iteration {:>4})", iteration),
+                MAGENTA,
+            );
+            let ok = invoke_periodic(runner, config, periodic, iteration);
+            if !ok {
+                log(&format!(
+                    "{}WARNING: periodic '{}' invocation failed — continuing{}",
+                    ORANGE, periodic.name, RESET
+                ));
+            }
+            run_periodic_guards(periodic, config.max_tail);
+        }
+    }
+}
+
+/// Result of running the worker + guards for a single plan-loop iteration.
+enum IterationStepResult {
+    /// Worker + guards succeeded, loop should continue.
+    Continue { guards_passed: bool, cost: f64 },
+    /// Terminal outcome — return immediately from the loop.
+    Terminal(PlanLoopOutcome),
+}
+
+/// Run the worker invocation, interrupt check, and guard evaluation for one iteration.
+/// Returns `Continue` with guard results when the loop should proceed, or `Terminal`
+/// when an early exit is needed.
+fn run_iteration_step(
+    runner: &mut LoopRunner,
+    config: &Config,
+    iteration: u32,
+    prior_total: f64,
+    dry_run: bool,
+) -> IterationStepResult {
+    if dry_run {
+        log(&format!(
+            "(dry-run) Skipping {} invocation",
+            match config.backend() {
+                Backend::Claude => "Claude",
+                Backend::OpenCode => "OpenCode",
+            }
+        ));
+    } else {
+        let (success, iter_cost) = invoke_agent(runner, config, iteration, prior_total);
+        if !success {
+            log_error("Claude invocation failed — aborting loop");
+            return IterationStepResult::Terminal(PlanLoopOutcome::Error);
+        }
+        if signal::interrupted() {
+            log("Interrupted \u{2014} shutting down");
+            return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
+        }
+        let guards_passed = run_all_guards(config);
+        if guards_passed {
+            log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
+        } else {
+            log(&format!(
+                "{}Some guards failed \u{2014} Claude will see results next iteration{}",
+                ORANGE, RESET
+            ));
+        }
+        return IterationStepResult::Continue { guards_passed, cost: iter_cost };
+    }
+
+    // Dry-run path: run guards and exit after one iteration.
+    let guards_passed = run_all_guards(config);
+    if guards_passed {
+        log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
+        log("(dry-run) Guards passed \u{2014} exiting after one iteration");
+        IterationStepResult::Terminal(PlanLoopOutcome::Done)
+    } else {
+        log(&format!(
+            "{}Some guards failed{}", ORANGE, RESET
+        ));
+        log("(dry-run) Exiting after one iteration");
+        IterationStepResult::Terminal(PlanLoopOutcome::Error)
+    }
+}
+
+/// Core plan-loop runner that can be called standalone or nested inside brute.
+///
+/// - `config`: already-loaded Config
+/// - `plan_path`: path to the plan file (e.g. PLAN_PATH or SUB_PLAN_PATH)
+/// - `dry_run`: if true, skip Claude invocation (one iteration only)
+/// - `nested`: if true, running inside brute (adjusts output banners)
+fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) -> PlanLoopOutcome {
+    preflight(plan_path, !nested);
+    validate_loop_config(config);
     log("Preflight OK");
 
-    // Build protected files list dynamically based on the plan path
     let mut protected: Vec<&str> = vec![PROTOCOL_PATH, plan_path, CONF_PATH];
-    // Include periodic protocol paths in the protected set
     let periodic_paths: Vec<String> = config.periodics.iter().map(|p| p.path.clone()).collect();
     for pp in &periodic_paths {
         protected.push(pp.as_str());
     }
 
-    // Backup protected files and create the runner (Drop handles cleanup)
     let backup_dir = backup_files(&protected);
     log(&format!("Backups in {}", backup_dir.display()));
 
     let mut runner = LoopRunner::new(backup_dir);
     let mut iteration: u32 = 0;
     let mut total_cost: f64 = 0.0;
-
     let mut consecutive_judge_failures: u32 = 0;
 
     loop {
@@ -1411,88 +1432,22 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
         let label = if nested { "Plan Iteration" } else { "Iteration" };
         render_iteration_banner(label, iteration, nested);
 
-        // Show stage progress bar if plan has parseable stages
         if let Some((completed, total)) = stage_progress(plan_path) {
             eprintln!("{}", format_progress_bar(completed, total));
         }
 
-        // Restore protected files
         restore_files(&runner.backup_dir, &protected);
 
-        // NOTE: Do NOT clear guard-results.md here. The previous iteration's
-        // guard results must persist so Claude can read them and fix failures.
-        // The file is initialized to empty in preflight() (first iteration)
-        // and overwritten by run_all_guards() after Claude finishes.
-
-        if dry_run {
-            log(&format!(
-                "(dry-run) Skipping {} invocation",
-                match config.backend() {
-                    Backend::Claude => "Claude",
-                    Backend::OpenCode => "OpenCode",
-                }
-            ));
-        } else {
-            let (success, iter_cost) = invoke_agent(&mut runner, config, iteration, total_cost);
-            total_cost += iter_cost;
-            if !success {
-                log_error("Claude invocation failed — aborting loop");
-                return PlanLoopOutcome::Error;
+        let guards_passed = match run_iteration_step(&mut runner, config, iteration, total_cost, dry_run) {
+            IterationStepResult::Continue { guards_passed, cost } => {
+                total_cost += cost;
+                guards_passed
             }
-        }
+            IterationStepResult::Terminal(outcome) => return outcome,
+        };
 
-        if signal::interrupted() {
-            log("Interrupted \u{2014} shutting down");
-            return PlanLoopOutcome::Interrupt;
-        }
+        fire_periodic_agents(&mut runner, config, iteration);
 
-        // Run worker guards
-        let guards_passed = run_all_guards(config);
-
-        if guards_passed {
-            log(&format!(
-                "{}{}All guards passed{}",
-                GREEN, BOLD, RESET
-            ));
-        } else {
-            log(&format!(
-                "{}Some guards failed \u{2014} Claude will see results next iteration{}",
-                ORANGE, RESET
-            ));
-        }
-
-        if dry_run {
-            if guards_passed {
-                log("(dry-run) Guards passed \u{2014} exiting after one iteration");
-                return PlanLoopOutcome::Done;
-            } else {
-                log("(dry-run) Exiting after one iteration");
-                return PlanLoopOutcome::Error;
-            }
-        }
-
-        // Fire periodic agents (if at cadence)
-        for periodic in &config.periodics {
-            if iteration % periodic.cadence == 0 {
-                eprintln!();
-                let upper_name = capitalize_first(&periodic.name);
-                render_section_banner(
-                    &upper_name,
-                    &format!("Periodic agent (iteration {:>4})", iteration),
-                    MAGENTA,
-                );
-                let ok = invoke_periodic(&mut runner, config, periodic, iteration);
-                if !ok {
-                    log(&format!(
-                        "{}WARNING: periodic '{}' invocation failed — continuing{}",
-                        ORANGE, periodic.name, RESET
-                    ));
-                }
-                run_periodic_guards(periodic, config.max_tail);
-            }
-        }
-
-        // Judge-every logic: embedded judge checks at configured cadence
         if let Some(judge_every) = config.judge_every {
             match evaluate_judge_every(
                 &mut runner, config, iteration, guards_passed,
@@ -1504,7 +1459,6 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             }
         }
 
-        // Original exit check (only reached when judge-every is NOT set)
         if guards_passed && is_status_done(NOTES_PATH) {
             eprintln!();
             eprintln!(
@@ -1514,7 +1468,6 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             eprintln!();
             return PlanLoopOutcome::Done;
         }
-        // Guards failed or not done — continue iterating
     }
 }
 
@@ -1779,8 +1732,168 @@ fn invoke_scoper(runner: &mut LoopRunner, config: &Config, cycle: u32) -> bool {
 
 /// Run the saga loop: scoper (Agent 1) decomposes the spec into sub-plans,
 /// each sub-plan is run through the brute loop (Agent 2 + Agent 3).
+/// Preflight checks for saga mode: verify required files exist, critical files
+/// are non-empty, and create working files if missing.
+fn saga_preflight() {
+    for path in &[
+        SPECIFICATION_PATH,
+        SAGA_PROTOCOL_PATH,
+        PROTOCOL_PATH,
+        JUDGE_PATH,
+        CONF_PATH,
+    ] {
+        if !Path::new(path).exists() {
+            log_error(&format!("required file not found: {}", path));
+            process::exit(1);
+        }
+    }
+
+    match fs::read_to_string(SPECIFICATION_PATH) {
+        Ok(content) if content.trim().is_empty() => {
+            log_error(&format!(
+                "{} is empty — fill it in before running",
+                SPECIFICATION_PATH
+            ));
+            process::exit(1);
+        }
+        Err(e) => {
+            log_error(&format!("cannot read {}: {}", SPECIFICATION_PATH, e));
+            process::exit(1);
+        }
+        _ => {}
+    }
+
+    for path in &[
+        SAGA_NOTES_PATH,
+        DECISIONS_PATH,
+        SUB_PLAN_PATH,
+        NOTES_PATH,
+        VERDICT_PATH,
+        GUARD_RESULTS_PATH,
+    ] {
+        if !Path::new(path).exists() {
+            if let Err(e) = fs::write(path, "") {
+                log_error(&format!("cannot create {}: {}", path, e));
+                process::exit(1);
+            }
+        }
+    }
+
+    log("Preflight OK");
+}
+
+/// Run one saga cycle: invoke the scoper, check for DONE, then run brute on the sub-plan.
+/// Returns Some(exit_code) if the saga should terminate, None to continue looping.
+fn run_saga_cycle(
+    runner: &mut LoopRunner,
+    config: &Config,
+    cycle: u32,
+    dry_run: bool,
+    saga_protected: &[&str],
+) -> Option<i32> {
+    restore_files(&runner.backup_dir, saga_protected);
+
+    if dry_run {
+        log("(dry-run) Skipping scoper invocation");
+    } else {
+        eprintln!();
+        render_section_banner(
+            "Scoper",
+            &format!("Invoking scoper (cycle {:>4})", cycle),
+            BLUE,
+        );
+
+        if !invoke_scoper(runner, config, cycle) {
+            log_error("Scoper invocation failed \u{2014} aborting saga");
+            return Some(1);
+        }
+
+        if signal::interrupted() {
+            log("Interrupted \u{2014} shutting down");
+            return Some(130);
+        }
+    }
+
+    if is_status_done(SAGA_NOTES_PATH) {
+        eprintln!();
+        eprintln!(
+            "{}{}  Scoper signals DONE \u{2014} saga complete  {}",
+            GREEN, BOLD, RESET
+        );
+        eprintln!();
+        return Some(0);
+    }
+
+    match fs::read_to_string(SUB_PLAN_PATH) {
+        Ok(content) if content.trim().is_empty() => {
+            log_error("Scoper produced an empty sub-plan.md \u{2014} aborting saga");
+            return Some(1);
+        }
+        Err(e) => {
+            log_error(&format!("cannot read {}: {}", SUB_PLAN_PATH, e));
+            return Some(1);
+        }
+        _ => {}
+    }
+
+    if dry_run {
+        log("(dry-run) Skipping brute loop on sub-plan.md");
+        log("(dry-run) Exiting after one cycle");
+        return Some(0);
+    }
+
+    log("Running brute loop on sub-plan.md...");
+
+    // Append worker notes to saga log before clearing
+    if let Ok(notes) = fs::read_to_string(NOTES_PATH) {
+        if !notes.trim().is_empty() {
+            let header = format!("\n## Chunk {}\n\n", cycle);
+            let _ = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(SAGA_LOG_PATH)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(header.as_bytes())?;
+                    f.write_all(notes.as_bytes())?;
+                    if !notes.ends_with('\n') {
+                        f.write_all(b"\n")?;
+                    }
+                    Ok(())
+                });
+        }
+    }
+
+    let _ = fs::write(NOTES_PATH, "");
+    let _ = fs::write(VERDICT_PATH, "");
+    let _ = fs::write(GUARD_RESULTS_PATH, "");
+
+    match run_brute_core(config, SUB_PLAN_PATH, false) {
+        BruteResult::Pass => {
+            log(&format!(
+                "{}Sub-plan passed \u{2014} looping back to scoper{}",
+                GREEN, RESET
+            ));
+        }
+        BruteResult::Bailout => {
+            log(&format!(
+                "{}Brute loop bailed out \u{2014} looping back to scoper for re-scoping{}",
+                ORANGE, RESET
+            ));
+        }
+        BruteResult::Interrupt => {
+            log("Interrupted \u{2014} shutting down");
+            return Some(130);
+        }
+        BruteResult::Error => {
+            log_error("Brute loop encountered a hard error \u{2014} aborting saga");
+            return Some(1);
+        }
+    }
+    None
+}
+
 fn run_saga(dry_run: bool) -> i32 {
-    // Load config
     let config = match Config::load(Path::new(CONF_PATH)) {
         Ok(c) => c,
         Err(e) => {
@@ -1800,56 +1913,8 @@ fn run_saga(dry_run: bool) -> i32 {
         )
     ));
 
-    // Preflight: verify required saga files exist
-    for path in &[
-        SPECIFICATION_PATH,
-        SAGA_PROTOCOL_PATH,
-        PROTOCOL_PATH,
-        JUDGE_PATH,
-        CONF_PATH,
-    ] {
-        if !Path::new(path).exists() {
-            log_error(&format!("required file not found: {}", path));
-            process::exit(1);
-        }
-    }
+    saga_preflight();
 
-    // Fail fast if specification.md is empty
-    match fs::read_to_string(SPECIFICATION_PATH) {
-        Ok(content) if content.trim().is_empty() => {
-            log_error(&format!(
-                "{} is empty — fill it in before running",
-                SPECIFICATION_PATH
-            ));
-            process::exit(1);
-        }
-        Err(e) => {
-            log_error(&format!("cannot read {}: {}", SPECIFICATION_PATH, e));
-            process::exit(1);
-        }
-        _ => {}
-    }
-
-    // Ensure working files exist
-    for path in &[
-        SAGA_NOTES_PATH,
-        DECISIONS_PATH,
-        SUB_PLAN_PATH,
-        NOTES_PATH,
-        VERDICT_PATH,
-        GUARD_RESULTS_PATH,
-    ] {
-        if !Path::new(path).exists() {
-            if let Err(e) = fs::write(path, "") {
-                log_error(&format!("cannot create {}: {}", path, e));
-                process::exit(1);
-            }
-        }
-    }
-
-    log("Preflight OK");
-
-    // Protected files for the saga runner
     let saga_protected: Vec<&str> = vec![
         SAGA_PROTOCOL_PATH,
         PROTOCOL_PATH,
@@ -1872,94 +1937,141 @@ fn run_saga(dry_run: bool) -> i32 {
         eprintln!();
         render_iteration_banner("Saga Cycle", cycle, false);
 
-        // Restore protected files
-        restore_files(&runner.backup_dir, &saga_protected);
+        if let Some(exit_code) = run_saga_cycle(&mut runner, &config, cycle, dry_run, &saga_protected) {
+            return exit_code;
+        }
+    }
+}
 
-        if dry_run {
-            log("(dry-run) Skipping scoper invocation");
-        } else {
-            // Invoke Agent 1 (scoper)
-            eprintln!();
-            render_section_banner(
-                "Scoper",
-                &format!("Invoking scoper (cycle {:>4})", cycle),
-                BLUE,
-            );
+fn cmd_init(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        print_init_help();
+        process::exit(0);
+    }
+    let mode = match args.get(2).map(|a| a.as_str()) {
+        None => "loop",
+        Some("brute") => "brute",
+        Some("saga") => "saga",
+        Some(other) => {
+            log_error(&format!("unknown argument '{}'", other));
+            print_init_help();
+            process::exit(2);
+        }
+    };
+    if args.len() > 3 {
+        log_error(&format!("unexpected argument '{}'", args[3]));
+        print_init_help();
+        process::exit(2);
+    }
+    process::exit(init(mode));
+}
 
-            let scoper_ok = invoke_scoper(&mut runner, &config, cycle);
-            if !scoper_ok {
-                log_error("Scoper invocation failed \u{2014} aborting saga");
-                return 1;
+fn cmd_clean(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        print_clean_help();
+        process::exit(0);
+    }
+    if args.len() > 2 {
+        log_error(&format!("unexpected argument '{}'", args[2]));
+        print_clean_help();
+        process::exit(2);
+    }
+    process::exit(clean());
+}
+
+fn cmd_stash(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        stash::print_stash_help();
+        process::exit(0);
+    }
+    let mode = detect_mode().unwrap_or("unknown");
+    match args.get(2).map(|a| a.as_str()) {
+        None => {
+            process::exit(stash::stash_create(mode));
+        }
+        Some("log") => {
+            process::exit(stash::stash_log_cmd());
+        }
+        Some("checkout") => match args.get(3) {
+            Some(hash) => process::exit(stash::stash_checkout(hash, mode)),
+            None => {
+                log_error("missing hash — usage: yoke stash checkout <hash>");
+                process::exit(2);
             }
+        },
+        Some("pop") => {
+            process::exit(stash::stash_pop(mode));
+        }
+        Some(other) => {
+            log_error(&format!("unknown subcommand '{}'", other));
+            stash::print_stash_help();
+            process::exit(2);
+        }
+    }
+}
 
-            if signal::interrupted() {
-                log("Interrupted \u{2014} shutting down");
-                return 130;
+fn cmd_layer(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        print_layer_help();
+        process::exit(0);
+    }
+    if args.get(2).is_some_and(|a| a == "--list") {
+        for name in list_layers() {
+            println!("  {}", name);
+        }
+        process::exit(0);
+    }
+    let names_arg = match args.get(2) {
+        Some(a) => a.clone(),
+        None => {
+            log_error("missing layer name");
+            print_layer_help();
+            process::exit(2);
+        }
+    };
+    process::exit(apply_layers(&names_arg));
+}
+
+fn cmd_run(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        print_run_help();
+        process::exit(0);
+    }
+    let mut dry_run = false;
+    let mut no_sandbox = false;
+    for arg in &args[2..] {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--no-sandbox" => no_sandbox = true,
+            other => {
+                log_error(&format!("unknown flag '{}'", other));
+                print_run_help();
+                process::exit(2);
             }
         }
-
-        // Check if scoper signaled DONE
-        if is_status_done(SAGA_NOTES_PATH) {
-            eprintln!();
-            eprintln!(
-                "{}{}  Scoper signals DONE \u{2014} saga complete  {}",
-                GREEN, BOLD, RESET
-            );
-            eprintln!();
-            return 0;
+    }
+    let config = match Config::load(Path::new(CONF_PATH)) {
+        Ok(c) => c,
+        Err(e) => {
+            log_error(&e);
+            process::exit(1);
         }
-
-        // Verify sub-plan.md is non-empty
-        match fs::read_to_string(SUB_PLAN_PATH) {
-            Ok(content) if content.trim().is_empty() => {
-                log_error("Scoper produced an empty sub-plan.md \u{2014} aborting saga");
-                return 1;
-            }
-            Err(e) => {
-                log_error(&format!("cannot read {}: {}", SUB_PLAN_PATH, e));
-                return 1;
-            }
-            _ => {}
+    };
+    if config.image.is_none() && !no_sandbox {
+        log_error("no 'image' directive in config — refusing to run without sandbox");
+        eprintln!("  Add 'image <name>' to {} or pass --no-sandbox to override.", CONF_PATH);
+        process::exit(2);
+    }
+    match detect_mode() {
+        Some("saga") => {
+            log("Detected saga mode");
+            process::exit(run_saga(dry_run))
         }
-
-        if dry_run {
-            log("(dry-run) Skipping brute loop on sub-plan.md");
-            log("(dry-run) Exiting after one cycle");
-            return 0;
+        Some("brute") => {
+            process::exit(run_brute(dry_run))
         }
-
-        // Run the brute loop on sub-plan.md
-        log("Running brute loop on sub-plan.md...");
-
-        // Clear notes.md, verdict.md, and guard-results.md for the inner brute cycle
-        let _ = fs::write(NOTES_PATH, "");
-        let _ = fs::write(VERDICT_PATH, "");
-        let _ = fs::write(GUARD_RESULTS_PATH, "");
-
-        let brute_result = run_brute_core(&config, SUB_PLAN_PATH, false);
-
-        match brute_result {
-            BruteResult::Pass => {
-                log(&format!(
-                    "{}Sub-plan passed \u{2014} looping back to scoper{}",
-                    GREEN, RESET
-                ));
-            }
-            BruteResult::Bailout => {
-                log(&format!(
-                    "{}Brute loop bailed out \u{2014} looping back to scoper for re-scoping{}",
-                    ORANGE, RESET
-                ));
-                // verdict.md and notes.md are preserved — scoper will read them
-            }
-            BruteResult::Interrupt => {
-                log("Interrupted \u{2014} shutting down");
-                return 130;
-            }
-            BruteResult::Error => {
-                log_error("Brute loop encountered a hard error \u{2014} aborting saga");
-                return 1;
-            }
+        _ => {
+            process::exit(run_loop(dry_run))
         }
     }
 }
@@ -1974,136 +2086,11 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "init" => {
-            if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-                print_init_help();
-                return;
-            }
-            let mode = match args.get(2).map(|a| a.as_str()) {
-                None => "loop",
-                Some("brute") => "brute",
-                Some("saga") => "saga",
-                Some(other) => {
-                    log_error(&format!("unknown argument '{}'", other));
-                    print_init_help();
-                    process::exit(2);
-                }
-            };
-            if args.len() > 3 {
-                log_error(&format!("unexpected argument '{}'", args[3]));
-                print_init_help();
-                process::exit(2);
-            }
-            process::exit(init(mode));
-        }
-        "clean" => {
-            if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-                print_clean_help();
-                return;
-            }
-            if args.len() > 2 {
-                log_error(&format!("unexpected argument '{}'", args[2]));
-                print_clean_help();
-                process::exit(2);
-            }
-            process::exit(clean());
-        }
-        "stash" => {
-            if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-                stash::print_stash_help();
-                return;
-            }
-            let mode = detect_mode().unwrap_or("unknown");
-            match args.get(2).map(|a| a.as_str()) {
-                None => {
-                    process::exit(stash::stash_create(mode));
-                }
-                Some("log") => {
-                    process::exit(stash::stash_log_cmd());
-                }
-                Some("checkout") => match args.get(3) {
-                    Some(hash) => process::exit(stash::stash_checkout(hash, mode)),
-                    None => {
-                        log_error("missing hash — usage: yoke stash checkout <hash>");
-                        process::exit(2);
-                    }
-                },
-                Some("pop") => {
-                    process::exit(stash::stash_pop(mode));
-                }
-                Some(other) => {
-                    log_error(&format!("unknown subcommand '{}'", other));
-                    stash::print_stash_help();
-                    process::exit(2);
-                }
-            }
-        }
-        "layer" => {
-            if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-                print_layer_help();
-                return;
-            }
-            if args.get(2).is_some_and(|a| a == "--list") {
-                for name in list_layers() {
-                    println!("  {}", name);
-                }
-                return;
-            }
-            let names_arg = match args.get(2) {
-                Some(a) => a.clone(),
-                None => {
-                    log_error("missing layer name");
-                    print_layer_help();
-                    process::exit(2);
-                }
-            };
-            process::exit(apply_layers(&names_arg));
-        }
-        "run" => {
-            // Check for --help before other flags
-            if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-                print_run_help();
-                return;
-            }
-            let mut dry_run = false;
-            let mut no_sandbox = false;
-            for arg in &args[2..] {
-                match arg.as_str() {
-                    "--dry-run" => dry_run = true,
-                    "--no-sandbox" => no_sandbox = true,
-                    other => {
-                        log_error(&format!("unknown flag '{}'", other));
-                        print_run_help();
-                        process::exit(2);
-                    }
-                }
-            }
-            // Load config to determine runner type
-            let config = match Config::load(Path::new(CONF_PATH)) {
-                Ok(c) => c,
-                Err(e) => {
-                    log_error(&e);
-                    process::exit(1);
-                }
-            };
-            if config.image.is_none() && !no_sandbox {
-                log_error("no 'image' directive in config — refusing to run without sandbox");
-                eprintln!("  Add 'image <name>' to {} or pass --no-sandbox to override.", CONF_PATH);
-                process::exit(2);
-            }
-            match detect_mode() {
-                Some("saga") => {
-                    log("Detected saga mode");
-                    process::exit(run_saga(dry_run))
-                }
-                Some("brute") => {
-                    process::exit(run_brute(dry_run))
-                }
-                _ => {
-                    process::exit(run_loop(dry_run))
-                }
-            }
-        }
+        "init" => cmd_init(&args),
+        "clean" => cmd_clean(&args),
+        "stash" => cmd_stash(&args),
+        "layer" => cmd_layer(&args),
+        "run" => cmd_run(&args),
         "--help" | "-h" | "help" => {
             print_usage();
         }

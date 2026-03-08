@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ChildStdout;
 
@@ -65,7 +65,7 @@ fn format_tool_call(tool_name: &str, input: &str) -> String {
     }
 }
 
-fn process_line(out: &mut impl Write, line: &str, state: &mut StreamState) -> io::Result<()> {
+fn process_line(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamState) -> io::Result<()> {
     let ev_type = extract_str(line, "type");
 
     match ev_type {
@@ -167,43 +167,13 @@ fn format_summary_strip(state: &StreamState) -> String {
 }
 
 pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, _prior_total: f64) -> f64 {
-    let reader = BufReader::new(stdout);
     let mut state = StreamState::new();
-    let mut log_file = log_path.and_then(|p| {
-        std::fs::create_dir_all(p.parent().unwrap_or(Path::new("."))).ok();
-        std::fs::File::create(p).ok()
-    });
-
-    let mut out = io::stdout().lock();
-
-    for line_result in reader.lines() {
-        if crate::signal::interrupted() {
-            break;
-        }
-
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if let Some(ref mut f) = log_file {
-            let _ = writeln!(f, "{}", line);
-        }
-
-        if process_line(&mut out, &line, &mut state).is_err() {
-            break;
-        }
-    }
-
-    if state.turn_num > 0 {
-        let strip = format_summary_strip(&state);
-        let _ = writeln!(out, "{}", strip);
-    }
-
-    let _ = out.flush();
-    state.iteration_cost
+    crate::stream::run_stream_loop(
+        stdout,
+        log_path,
+        &mut state,
+        |out, line, st| process_line(out, line, st),
+        |st| if st.turn_num > 0 { Some(format_summary_strip(st)) } else { None },
+        |st| st.iteration_cost,
+    )
 }

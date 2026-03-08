@@ -213,6 +213,56 @@ pub(crate) fn stash_log_cmd() -> i32 {
     0
 }
 
+/// Resolve a hash prefix to a single stash entry. Returns the entry or logs an error.
+fn resolve_stash_entry<'a>(entries: &'a [StashEntry], target_hash: &str) -> Option<&'a StashEntry> {
+    let matches: Vec<&StashEntry> = entries
+        .iter()
+        .filter(|e| e.hash == target_hash || e.hash.starts_with(target_hash))
+        .collect();
+
+    match matches.len() {
+        0 => {
+            log_error(&format!("no stash entry matching '{}'", target_hash));
+            None
+        }
+        1 => Some(matches[0]),
+        n => {
+            log_error(&format!(
+                "ambiguous hash '{}' — matches {} entries",
+                target_hash, n
+            ));
+            None
+        }
+    }
+}
+
+/// Auto-stash current state, then replace `.loop/` files with those from `entry_dir`.
+fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
+    let current_files = collect_stashable_files();
+    if !current_files.is_empty() {
+        let hash = stash_snapshot(mode)?;
+        log(&format!(
+            "auto-stashed current state → {}{}{}",
+            BLUE, hash, RESET
+        ));
+    }
+
+    for (name, _) in &collect_stashable_files() {
+        let _ = fs::remove_file(Path::new(".loop").join(name));
+    }
+
+    if let Ok(dir_entries) = fs::read_dir(entry_dir) {
+        for entry in dir_entries.flatten() {
+            let name = entry.file_name();
+            let dest = Path::new(".loop").join(&name);
+            fs::copy(entry.path(), &dest).map_err(|e| {
+                format!("failed to restore {}: {}", name.to_string_lossy(), e)
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// `yoke stash checkout <hash>` — auto-stash current state, clear `.loop/` files,
 /// restore target entry. Supports prefix matching.
 pub(crate) fn stash_checkout(target_hash: &str, mode: &str) -> i32 {
@@ -226,75 +276,24 @@ pub(crate) fn stash_checkout(target_hash: &str, mode: &str) -> i32 {
         return 1;
     }
 
-    // Find matching entries (exact or prefix)
-    let matches: Vec<&StashEntry> = entries
-        .iter()
-        .filter(|e| e.hash == target_hash || e.hash.starts_with(target_hash))
-        .collect();
+    let target = match resolve_stash_entry(&entries, target_hash) {
+        Some(t) => t,
+        None => return 1,
+    };
 
-    match matches.len() {
-        0 => {
-            log_error(&format!("no stash entry matching '{}'", target_hash));
-            1
-        }
-        1 => {
-            let target = matches[0];
-            let entry_dir = Path::new(STASH_DIR).join(&target.hash);
-            if !entry_dir.exists() {
-                log_error("stash entry directory missing — index is corrupt");
-                return 1;
-            }
-
-            // Auto-stash current state (skip if .loop/ has no stashable files)
-            let current_files = collect_stashable_files();
-            if !current_files.is_empty() {
-                match stash_snapshot(mode) {
-                    Ok(hash) => {
-                        log(&format!(
-                            "auto-stashed current state → {}{}{}",
-                            BLUE, hash, RESET
-                        ));
-                    }
-                    Err(msg) => {
-                        log_error(&format!("failed to auto-stash: {}", msg));
-                        return 1;
-                    }
-                }
-            }
-
-            // Remove all stashable files from .loop/
-            for (name, _) in &collect_stashable_files() {
-                let path = Path::new(".loop").join(name);
-                let _ = fs::remove_file(&path);
-            }
-
-            // Restore files from the target entry
-            if let Ok(dir_entries) = fs::read_dir(&entry_dir) {
-                for entry in dir_entries.flatten() {
-                    let name = entry.file_name();
-                    let dest = Path::new(".loop").join(&name);
-                    if let Err(e) = fs::copy(entry.path(), &dest) {
-                        log_error(&format!(
-                            "failed to restore {}: {}",
-                            name.to_string_lossy(),
-                            e
-                        ));
-                        return 1;
-                    }
-                }
-            }
-
-            log(&format!("checked out {}{}{}", BLUE, target.hash, RESET));
-            0
-        }
-        n => {
-            log_error(&format!(
-                "ambiguous hash '{}' — matches {} entries",
-                target_hash, n
-            ));
-            1
-        }
+    let entry_dir = Path::new(STASH_DIR).join(&target.hash);
+    if !entry_dir.exists() {
+        log_error("stash entry directory missing — index is corrupt");
+        return 1;
     }
+
+    if let Err(msg) = swap_loop_files(&entry_dir, mode) {
+        log_error(&msg);
+        return 1;
+    }
+
+    log(&format!("checked out {}{}{}", BLUE, target.hash, RESET));
+    0
 }
 
 /// `yoke stash pop` — checkout the most recent stash entry.
