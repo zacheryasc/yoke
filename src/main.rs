@@ -5,6 +5,8 @@ mod boundary;
 mod config;
 mod guard;
 mod json;
+mod metrics;
+mod session_trim;
 mod signal;
 mod stash;
 mod stream;
@@ -240,6 +242,10 @@ fn print_usage() {
         "  {}run --dry-run{}    Single iteration: boundary check + guards only, no Claude",
         BOLD, RESET
     );
+    eprintln!(
+        "  {}stats{}            Inspect persisted run metrics (~/.yoke/metrics/)",
+        BOLD, RESET
+    );
     eprintln!();
     eprintln!("{}OPTIONS:{}", BOLD, RESET);
     eprintln!("  --help, -h       Show this help message");
@@ -347,6 +353,11 @@ fn print_init_help() {
 struct LoopRunner {
     backup_dir: PathBuf,
     child: Option<Child>,
+    /// Claude session id from the most recent agent invocation. When `Some`,
+    /// the next worker invocation will `--resume` it so the prompt cache and
+    /// the trimmed conversation prefix carry forward. Cleared on stash
+    /// checkout / mode switch / explicit reset.
+    last_session_id: Option<String>,
 }
 
 impl LoopRunner {
@@ -354,6 +365,7 @@ impl LoopRunner {
         Self {
             backup_dir,
             child: None,
+            last_session_id: None,
         }
     }
 }
@@ -466,12 +478,28 @@ fn reset_notes_status() {
     }
 }
 
+/// Detect the home directory of the default user inside a Docker image.
+fn container_home(image: &str) -> String {
+    let output = Command::new("docker")
+        .args(["run", "--rm", "--entrypoint", "sh", image, "-c", "echo $HOME"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if h.is_empty() { "/home/sandbox".to_string() } else { h }
+        }
+        _ => "/home/sandbox".to_string(),
+    }
+}
+
 /// Build a docker command that runs the claude CLI inside a container.
 fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
     let workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
         .to_string();
+
+    let container_home = container_home(image);
 
     let mut c = Command::new("docker");
     c.args([
@@ -486,6 +514,16 @@ fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
     c.arg("-v").arg(format!("{}:/workspace", workdir));
     c.arg("-w").arg("/workspace");
 
+    // Mount Docker socket for Docker-outside-of-Docker
+    let docker_sock = "/var/run/docker.sock";
+    if std::path::Path::new(docker_sock).exists() {
+        c.arg("-v").arg(format!("{0}:{0}", docker_sock));
+        if let Ok(meta) = std::fs::metadata(docker_sock) {
+            use std::os::unix::fs::MetadataExt;
+            c.arg("--group-add").arg(meta.gid().to_string());
+        }
+    }
+
     for (key, val) in std::env::vars() {
         if key.starts_with("CLAUDE_") || key.starts_with("ANTHROPIC_") {
             c.arg("-e").arg(format!("{}={}", key, val));
@@ -497,15 +535,17 @@ fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
         let claude_dir = home_path.join(".claude");
         if claude_dir.exists() {
             c.arg("-v").arg(format!(
-                "{}:/home/node/.claude",
-                claude_dir.display()
+                "{}:{}/.claude",
+                claude_dir.display(),
+                container_home
             ));
         }
         let claude_json = home_path.join(".claude.json");
         if claude_json.exists() {
             c.arg("-v").arg(format!(
-                "{}:/home/node/.claude.json",
-                claude_json.display()
+                "{}:{}/.claude.json",
+                claude_json.display(),
+                container_home
             ));
         }
     }
@@ -516,23 +556,31 @@ fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
 }
 
 /// Build a Command for invoking the agent backend.
-fn build_command(config: &Config, prompt: &str) -> Command {
+///
+/// `resume` carries a Claude session id when the harness wants to continue
+/// the previous round's conversation (preserves prompt cache + the trimmed
+/// JSONL prefix). `None` produces a fresh session. OpenCode ignores it.
+fn build_command(config: &Config, prompt: &str, resume: Option<&str>) -> Command {
     match config.backend() {
         Backend::Claude => {
-            let claude_args = [
+            let mut claude_args: Vec<&str> = vec![
                 "--verbose",
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
                 "--dangerously-skip-permissions",
-                "-p",
-                prompt,
             ];
+            if let Some(sid) = resume {
+                claude_args.push("--resume");
+                claude_args.push(sid);
+            }
+            claude_args.push("-p");
+            claude_args.push(prompt);
             match config.image {
                 Some(ref image) => build_docker_claude_command(image, &claude_args),
                 None => {
                     let mut c = Command::new("claude");
-                    c.args(claude_args);
+                    c.args(&claude_args);
                     c
                 }
             }
@@ -553,8 +601,17 @@ fn build_command(config: &Config, prompt: &str) -> Command {
     }
 }
 
+/// Wall-clock + stream summary for one agent invocation.
+pub(crate) struct AgentRunStats {
+    pub success: bool,
+    pub wall_secs: f64,
+    pub stream: stream::StreamSummary,
+}
+
 /// Spawn an agent process, stream its output, kill it when streaming ends,
-/// and wait for exit.  Returns `(success, iteration_cost)`.
+/// and wait for exit.  Returns an `AgentRunStats` carrying success, the
+/// yoke-measured wall clock around the whole spawn+stream+wait, and the
+/// stream-derived summary (cost, thinking, per-tool durations).
 ///
 /// The child is stored in `runner` for cleanup-on-drop safety.
 /// After `filter_stream` returns (normally, broken pipe, or interrupt)
@@ -568,18 +625,24 @@ fn invoke_process(
     log_prefix: &str,
     iteration: u32,
     prior_total: f64,
-) -> (bool, f64) {
+    resume: Option<&str>,
+) -> AgentRunStats {
     let backend = config.backend();
     let in_container = config.image.is_some() && backend == Backend::Claude;
-    
+    let wall_start = std::time::Instant::now();
+
     log(&format!(
-        "Launching {} {}(iteration {})...",
+        "Launching {} {}(iteration {}){}...",
         label,
         if in_container { "in container " } else { "" },
-        iteration
+        iteration,
+        match resume {
+            Some(sid) => format!(" [resume {}…]", sid.chars().take(8).collect::<String>()),
+            None => String::new(),
+        }
     ));
 
-    let mut cmd = build_command(config, prompt);
+    let mut cmd = build_command(config, prompt, resume);
 
     let mut child = match cmd
         .stdin(Stdio::null())
@@ -595,7 +658,11 @@ fn invoke_process(
                 Backend::OpenCode => "opencode",
             };
             log_error(&format!("failed to spawn '{}': {}", bin, e));
-            return (false, 0.0);
+            return AgentRunStats {
+                success: false,
+                wall_secs: wall_start.elapsed().as_secs_f64(),
+                stream: stream::StreamSummary::default(),
+            };
         }
     };
 
@@ -605,10 +672,10 @@ fn invoke_process(
         PathBuf::from(dir).join(format!("{}-{}.jsonl", log_prefix, iteration))
     });
 
-    let mut iter_cost = 0.0;
+    let mut summary = stream::StreamSummary::default();
     if let Some(stdout) = child.stdout.take() {
         runner.child = Some(child);
-        iter_cost = match backend {
+        summary = match backend {
             Backend::Claude => stream::filter_stream(stdout, log_path.as_deref(), prior_total),
             Backend::OpenCode => stream_opencode::filter_stream(stdout, log_path.as_deref(), prior_total),
         };
@@ -618,7 +685,11 @@ fn invoke_process(
             let _ = ch.kill();
         }
         if signal::interrupted() {
-            return (false, iter_cost);
+            return AgentRunStats {
+                success: false,
+                wall_secs: wall_start.elapsed().as_secs_f64(),
+                stream: summary,
+            };
         }
     } else {
         runner.child = Some(child);
@@ -628,7 +699,11 @@ fn invoke_process(
         match child.wait() {
             Ok(s) => {
                 if signal::interrupted() {
-                    return (false, iter_cost);
+                    return AgentRunStats {
+                        success: false,
+                        wall_secs: wall_start.elapsed().as_secs_f64(),
+                        stream: summary,
+                    };
                 }
                 s.success()
             }
@@ -649,29 +724,86 @@ fn invoke_process(
         label,
         if status { "success" } else { "failure" }
     ));
-    (status, iter_cost)
+    AgentRunStats {
+        success: status,
+        wall_secs: wall_start.elapsed().as_secs_f64(),
+        stream: summary,
+    }
 }
 
 /// Invoke the agent, piping stdout through the stream filter.
-/// Returns `(success, iteration_cost)`.
-fn invoke_agent(runner: &mut LoopRunner, config: &Config, iteration: u32, prior_total: f64) -> (bool, f64) {
+fn invoke_agent(runner: &mut LoopRunner, config: &Config, iteration: u32, prior_total: f64) -> AgentRunStats {
     let prompt = "Read .loop/protocol.md and follow its instructions.";
     let label = match config.backend() {
         Backend::Claude => "Claude",
         Backend::OpenCode => "OpenCode",
     };
-    invoke_process(runner, config, prompt, label, "iteration", iteration, prior_total)
+    let resume = runner.last_session_id.clone();
+    let stats = invoke_process(
+        runner, config, prompt, label, "iteration", iteration, prior_total,
+        resume.as_deref(),
+    );
+    if let Some(sid) = stats.stream.session_id.clone() {
+        runner.last_session_id = Some(sid);
+    }
+    stats
 }
 
 /// Invoke a periodic agent with its protocol file.
 /// Returns true if the invocation succeeded.
+///
+/// Periodic agents always run in a fresh session: they have a different
+/// protocol than the main worker and conflating their conversation prefix
+/// with the worker's would poison the worker's prompt cache. Periodics
+/// don't update `runner.last_session_id`.
 fn invoke_periodic(runner: &mut LoopRunner, config: &Config, periodic: &Periodic, iteration: u32) -> bool {
     let prompt = format!("Read {} and follow its instructions.", periodic.path);
-    let (status, _) = invoke_process(
+    let stats = invoke_process(
         runner, config, &prompt, &periodic.name,
         &format!("periodic-{}", periodic.name), iteration, 0.0,
+        None,
     );
-    status
+    stats.success
+}
+
+/// Trim the worker's resumed Claude session in place. No-op on first
+/// iteration (no prior session), on docker/sandboxed runs (session file is
+/// inside the container — out of reach), or if the agent didn't declare a
+/// KEEP list. Any failure is logged and swallowed: better to over-pay
+/// than to break the resume.
+fn trim_worker_session(runner: &LoopRunner) {
+    let Some(sid) = runner.last_session_id.as_deref() else { return };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Ok(cwd) = std::env::current_dir() else { return };
+    let session_path = session_trim::session_file_path(&home, &cwd, sid);
+    if !session_path.exists() {
+        // Sandboxed (in-container) sessions live in the container's HOME, not the host's.
+        return;
+    }
+    let notes_text = match std::fs::read_to_string(NOTES_PATH) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let keep = session_trim::parse_keep_list(&notes_text, &cwd);
+    match session_trim::trim_session(&session_path, &keep) {
+        Ok(stats) if stats.skipped => {}
+        Ok(stats) => {
+            log(&format!(
+                "Session trim: kept {}/{} records ({} dropped); KEEP={}",
+                stats.records_kept,
+                stats.records_total,
+                stats.records_dropped,
+                if stats.keep_paths.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    stats.keep_paths.join(" ")
+                }
+            ));
+        }
+        Err(e) => {
+            log_error(&format!("Session trim failed (resuming anyway): {}", e));
+        }
+    }
 }
 
 /// Render a box-drawn iteration banner to stderr.
@@ -846,8 +978,9 @@ VERDICT: FAIL
 
 <what you tested, what went wrong, and what the correct behavior should be>";
 
-    let (status, _) = invoke_process(runner, config, judge_prompt, "judge", "judge", iteration, 0.0);
-    if !status {
+    // Judge is always a fresh session — independence per behavioral-specification §2.1.
+    let stats = invoke_process(runner, config, judge_prompt, "judge", "judge", iteration, 0.0, None);
+    if !stats.success {
         return false;
     }
 
@@ -926,9 +1059,17 @@ fn render_violation_tree(violations: &[String]) {
     }
 }
 
+/// Outcome of one boundary-check + guard-run pass.
+struct GuardOutcome {
+    /// True when boundary passed AND every guard passed.
+    passed: bool,
+    /// Per-guard results (empty when the boundary check failed and the
+    /// guards were therefore skipped).
+    guard_results: Vec<guard::GuardResult>,
+}
+
 /// Run boundary check and all configured guards.
-/// Returns true if everything passed.
-fn run_all_guards(config: &Config) -> bool {
+fn run_all_guards(config: &Config) -> GuardOutcome {
     // Boundary check first
     log("Running diff boundary check...");
     let boundary = boundary::check(config);
@@ -957,7 +1098,7 @@ fn run_all_guards(config: &Config) -> bool {
             md.push_str("```\nSkipped due to diff boundary violation.\n```\n\n");
         }
         let _ = fs::write(GUARD_RESULTS_PATH, &md);
-        return false;
+        return GuardOutcome { passed: false, guard_results: Vec::new() };
     }
 
     // Boundary passed — write that to results then run configured guards
@@ -977,7 +1118,7 @@ fn run_all_guards(config: &Config) -> bool {
 
     render_guard_table(&guard_results);
 
-    all_passed
+    GuardOutcome { passed: all_passed, guard_results }
 }
 
 fn print_clean_help() {
@@ -1231,6 +1372,7 @@ enum JudgeEveryAction {
 }
 
 /// Evaluate judge-every logic: fire judge when worker signals DONE or at cadence checkpoints.
+/// On firing, records wall time into `judge_secs_out` for the metrics row.
 fn evaluate_judge_every(
     runner: &mut LoopRunner,
     config: &Config,
@@ -1238,12 +1380,15 @@ fn evaluate_judge_every(
     guards_passed: bool,
     consecutive_judge_failures: &mut u32,
     judge_every: u32,
+    judge_secs_out: &mut Option<f64>,
 ) -> JudgeEveryAction {
     if guards_passed && is_status_done(NOTES_PATH) {
         // Always fire judge when worker signals DONE
         eprintln!();
         render_section_banner("Judge (DONE)", "Worker DONE — invoking judge", BLUE);
+        let judge_start = std::time::Instant::now();
         let pass = invoke_judge(runner, config, iteration);
+        *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
         if pass {
             return JudgeEveryAction::Pass;
         }
@@ -1264,7 +1409,9 @@ fn evaluate_judge_every(
             &format!("Quality checkpoint (iteration {:>4})", iteration),
             BLUE,
         );
+        let judge_start = std::time::Instant::now();
         let pass = invoke_judge(runner, config, iteration);
+        *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
         if pass {
             *consecutive_judge_failures = 0;
         } else {
@@ -1334,10 +1481,52 @@ fn fire_periodic_agents(
     }
 }
 
+/// Run fire-and-forget hook commands. Non-zero exits warn but never stop the loop.
+fn run_hooks(config: &Config, iteration: u32) {
+    for cmd in &config.hooks {
+        let result = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .env("YOKE_ITERATION", iteration.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+
+        match result {
+            Ok(status) if !status.success() => {
+                log(&format!(
+                    "{}WARNING: hook exited with {}: {}{}",
+                    ORANGE,
+                    status.code().map_or("signal".to_string(), |c| c.to_string()),
+                    cmd,
+                    RESET
+                ));
+            }
+            Err(e) => {
+                log(&format!(
+                    "{}WARNING: hook failed to execute: {} — {}{}",
+                    ORANGE, cmd, e, RESET
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Per-iteration data captured by `run_iteration_step` for metrics use.
+struct IterationStepStats {
+    guards_passed: bool,
+    agent_secs: f64,
+    stream: stream::StreamSummary,
+    guards_secs: f64,
+    guard_results: Vec<guard::GuardResult>,
+}
+
 /// Result of running the worker + guards for a single plan-loop iteration.
 enum IterationStepResult {
     /// Worker + guards succeeded, loop should continue.
-    Continue { guards_passed: bool, cost: f64 },
+    Continue(IterationStepStats),
     /// Terminal outcome — return immediately from the loop.
     Terminal(PlanLoopOutcome),
 }
@@ -1361,8 +1550,8 @@ fn run_iteration_step(
             }
         ));
     } else {
-        let (success, iter_cost) = invoke_agent(runner, config, iteration, prior_total);
-        if !success {
+        let stats = invoke_agent(runner, config, iteration, prior_total);
+        if !stats.success {
             log_error("Claude invocation failed — aborting loop");
             return IterationStepResult::Terminal(PlanLoopOutcome::Error);
         }
@@ -1370,8 +1559,10 @@ fn run_iteration_step(
             log("Interrupted \u{2014} shutting down");
             return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
         }
-        let guards_passed = run_all_guards(config);
-        if guards_passed {
+        let guards_start = std::time::Instant::now();
+        let guard_outcome = run_all_guards(config);
+        let guards_secs = guards_start.elapsed().as_secs_f64();
+        if guard_outcome.passed {
             log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
         } else {
             log(&format!(
@@ -1379,12 +1570,18 @@ fn run_iteration_step(
                 ORANGE, RESET
             ));
         }
-        return IterationStepResult::Continue { guards_passed, cost: iter_cost };
+        return IterationStepResult::Continue(IterationStepStats {
+            guards_passed: guard_outcome.passed,
+            agent_secs: stats.wall_secs,
+            stream: stats.stream,
+            guards_secs,
+            guard_results: guard_outcome.guard_results,
+        });
     }
 
     // Dry-run path: run guards and exit after one iteration.
-    let guards_passed = run_all_guards(config);
-    if guards_passed {
+    let guard_outcome = run_all_guards(config);
+    if guard_outcome.passed {
         log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
         log("(dry-run) Guards passed \u{2014} exiting after one iteration");
         IterationStepResult::Terminal(PlanLoopOutcome::Done)
@@ -1403,7 +1600,14 @@ fn run_iteration_step(
 /// - `plan_path`: path to the plan file (e.g. PLAN_PATH or SUB_PLAN_PATH)
 /// - `dry_run`: if true, skip Claude invocation (one iteration only)
 /// - `nested`: if true, running inside brute (adjusts output banners)
-fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) -> PlanLoopOutcome {
+/// - `mctx`: metrics context carrying run_id + project + output dir
+fn run_plan_loop(
+    config: &Config,
+    plan_path: &str,
+    dry_run: bool,
+    nested: bool,
+    recorder: &mut metrics::RunRecorder,
+) -> PlanLoopOutcome {
     preflight(plan_path, !nested);
     validate_loop_config(config);
     log("Preflight OK");
@@ -1428,6 +1632,9 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             return PlanLoopOutcome::Interrupt;
         }
         iteration += 1;
+        let iter_started_at = metrics::unix_now();
+        let iter_wall_start = std::time::Instant::now();
+
         eprintln!();
         let label = if nested { "Plan Iteration" } else { "Iteration" };
         render_iteration_banner(label, iteration, nested);
@@ -1436,30 +1643,81 @@ fn run_plan_loop(config: &Config, plan_path: &str, dry_run: bool, nested: bool) 
             eprintln!("{}", format_progress_bar(completed, total));
         }
 
+        let restore_start = std::time::Instant::now();
         restore_files(&runner.backup_dir, &protected);
+        let restore_ms = restore_start.elapsed().as_millis() as u64;
 
-        let guards_passed = match run_iteration_step(&mut runner, config, iteration, total_cost, dry_run) {
-            IterationStepResult::Continue { guards_passed, cost } => {
-                total_cost += cost;
-                guards_passed
-            }
+        // Trim the worker's resumed session, if any — drops bash output,
+        // thinking, and Reads not on the agent's KEEP list, so the prefix
+        // we re-send to Claude stays compact.
+        trim_worker_session(&runner);
+
+        let step_stats = match run_iteration_step(&mut runner, config, iteration, total_cost, dry_run) {
+            IterationStepResult::Continue(s) => s,
             IterationStepResult::Terminal(outcome) => return outcome,
         };
+        total_cost += step_stats.stream.cost_usd;
 
+        let periodics_start = std::time::Instant::now();
         fire_periodic_agents(&mut runner, config, iteration);
+        let periodics_secs = periodics_start.elapsed().as_secs_f64();
 
+        let hooks_start = std::time::Instant::now();
+        run_hooks(config, iteration);
+        let hooks_secs = hooks_start.elapsed().as_secs_f64();
+
+        let mut judge_secs: Option<f64> = None;
+        let mut early_return: Option<PlanLoopOutcome> = None;
         if let Some(judge_every) = config.judge_every {
             match evaluate_judge_every(
-                &mut runner, config, iteration, guards_passed,
-                &mut consecutive_judge_failures, judge_every,
+                &mut runner, config, iteration, step_stats.guards_passed,
+                &mut consecutive_judge_failures, judge_every, &mut judge_secs,
             ) {
-                JudgeEveryAction::Pass => return PlanLoopOutcome::JudgePass,
-                JudgeEveryAction::Bailout => return PlanLoopOutcome::JudgeBailout,
-                JudgeEveryAction::Continue => continue,
+                JudgeEveryAction::Pass => early_return = Some(PlanLoopOutcome::JudgePass),
+                JudgeEveryAction::Bailout => early_return = Some(PlanLoopOutcome::JudgeBailout),
+                JudgeEveryAction::Continue => {}
             }
         }
 
-        if guards_passed && is_status_done(NOTES_PATH) {
+        let status_done = step_stats.guards_passed && is_status_done(NOTES_PATH);
+
+        // Build & flush iteration metrics row before any return path so
+        // every completed iteration is recorded.
+        let iter_metrics = metrics::IterationMetrics {
+            run_id: recorder.ctx.run_id.clone(),
+            project_slug: recorder.ctx.project_slug.clone(),
+            mode: recorder.ctx.mode,
+            iteration,
+            started_at: iter_started_at,
+            wall_secs: iter_wall_start.elapsed().as_secs_f64(),
+            restore_ms,
+            agent_secs: step_stats.agent_secs,
+            guards_secs: step_stats.guards_secs,
+            periodics_secs,
+            hooks_secs,
+            judge_secs,
+            agent_reported_secs: step_stats.stream.agent_reported_secs,
+            cost_usd: step_stats.stream.cost_usd,
+            num_turns: step_stats.stream.num_turns,
+            thinking_secs: step_stats.stream.thinking_secs,
+            tool_counts: step_stats.stream.tool_counts.clone(),
+            tool_durations_secs: step_stats.stream.tool_durations_secs.clone(),
+            guards: step_stats.guard_results.iter().map(|g| metrics::GuardRow {
+                name: g.name.clone(),
+                passed: g.passed,
+                skipped: g.skipped,
+                elapsed_secs: g.elapsed_secs,
+            }).collect(),
+            guards_passed: step_stats.guards_passed,
+            status_done,
+        };
+        recorder.record_iteration(&iter_metrics);
+
+        if let Some(outcome) = early_return {
+            return outcome;
+        }
+
+        if status_done {
             eprintln!();
             eprintln!(
                 "{}{}  STATUS: DONE and all guards pass \u{2014} loop complete  {}",
@@ -1482,10 +1740,11 @@ fn run_loop(dry_run: bool) -> i32 {
     };
 
     log(&format!(
-        "Config loaded: max_tail={}, {} scope rules, {} guards, backend={}{}",
+        "Config loaded: max_tail={}, {} scope rules, {} guards, {} hooks, backend={}{}",
         config.max_tail,
         config.scope_rules.len(),
         config.guards.len(),
+        config.hooks.len(),
         match config.backend() {
             Backend::Claude => "claude",
             Backend::OpenCode => config.model.as_ref().map_or("opencode", |m| m.as_str()),
@@ -1496,11 +1755,69 @@ fn run_loop(dry_run: bool) -> i32 {
         )
     ));
 
-    match run_plan_loop(&config, PLAN_PATH, dry_run, false) {
+    let mctx = metrics::MetricsContext::new(
+        config.metrics_dir.clone(),
+        "loop",
+        config.metrics_enabled,
+    );
+    if mctx.enabled {
+        log(&format!(
+            "Metrics: run_id={}, file={}",
+            mctx.run_id,
+            mctx.iteration_path().display()
+        ));
+    }
+    let mut recorder = metrics::RunRecorder::new(mctx);
+    recorder.on_finalize(|r| render_run_summary(r));
+
+    let outcome = run_plan_loop(&config, PLAN_PATH, dry_run, false, &mut recorder);
+    recorder.set_outcome(plan_outcome_label(&outcome));
+    drop(recorder);
+    match outcome {
         PlanLoopOutcome::Done | PlanLoopOutcome::JudgePass => 0,
         PlanLoopOutcome::JudgeBailout | PlanLoopOutcome::Error => 1,
         PlanLoopOutcome::Interrupt => 130,
     }
+}
+
+fn plan_outcome_label(o: &PlanLoopOutcome) -> &'static str {
+    match o {
+        PlanLoopOutcome::Done => "done",
+        PlanLoopOutcome::JudgePass => "judge_pass",
+        PlanLoopOutcome::JudgeBailout => "bailout",
+        PlanLoopOutcome::Error => "error",
+        PlanLoopOutcome::Interrupt => "interrupt",
+    }
+}
+
+fn brute_outcome_label(o: &BruteResult) -> &'static str {
+    match o {
+        BruteResult::Pass => "judge_pass",
+        BruteResult::Bailout => "bailout",
+        BruteResult::Interrupt => "interrupt",
+        BruteResult::Error => "error",
+    }
+}
+
+/// Render the end-of-run metrics table to stderr.
+fn render_run_summary(r: &metrics::RunMetrics) {
+    eprintln!();
+    eprintln!("{}{}╔══════════════════════════════════════════════════════════════════╗{}", BOLD, ORANGE, RESET);
+    eprintln!("{}{}║  Run summary                                                     ║{}", BOLD, ORANGE, RESET);
+    eprintln!("{}{}╚══════════════════════════════════════════════════════════════════╝{}", BOLD, ORANGE, RESET);
+    let dim = DIM;
+    let reset = RESET;
+    eprintln!("  {}mode:{}       {}", dim, reset, r.mode);
+    eprintln!("  {}run_id:{}     {}", dim, reset, r.run_id);
+    eprintln!("  {}project:{}    {}", dim, reset, r.project_slug);
+    eprintln!("  {}outcome:{}    {}", dim, reset, r.outcome);
+    eprintln!("  {}iterations:{} {}", dim, reset, r.iterations);
+    eprintln!("  {}wall:{}       {:.1}s", dim, reset, r.total_wall_secs);
+    eprintln!("  {}agent:{}      {:.1}s", dim, reset, r.total_agent_secs);
+    eprintln!("  {}thinking:{}   {:.1}s", dim, reset, r.total_thinking_secs);
+    eprintln!("  {}guards:{}     {:.1}s", dim, reset, r.total_guards_secs);
+    eprintln!("  {}cost:{}       ${:.2}", dim, reset, r.total_cost_usd);
+    eprintln!();
 }
 
 /// Result of a brute loop run.
@@ -1516,7 +1833,7 @@ enum BruteResult {
 }
 
 /// Protected files for the brute runner.
-const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, JUDGE_PATH, CONF_PATH];
+const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, PLAN_PATH, JUDGE_PATH, CONF_PATH];
 
 fn run_brute_inner(dry_run: bool) -> BruteResult {
     // Load config
@@ -1568,14 +1885,25 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
         }
     }
 
-    // Clear verdict and guard results for the first brute attempt.
-    // Subsequent retries preserve these so the worker can read feedback.
-    let _ = fs::write(VERDICT_PATH, "");
-    let _ = fs::write(GUARD_RESULTS_PATH, "");
-
     log("Preflight OK");
 
-    run_brute_core(&config, PLAN_PATH, dry_run)
+    let mctx = metrics::MetricsContext::new(
+        config.metrics_dir.clone(),
+        "brute",
+        config.metrics_enabled,
+    );
+    if mctx.enabled {
+        log(&format!(
+            "Metrics: run_id={}, file={}",
+            mctx.run_id,
+            mctx.iteration_path().display()
+        ));
+    }
+    let mut recorder = metrics::RunRecorder::new(mctx);
+    recorder.on_finalize(|r| render_run_summary(r));
+    let result = run_brute_core(&config, PLAN_PATH, dry_run, &mut recorder);
+    recorder.set_outcome(brute_outcome_label(&result));
+    result
 }
 
 /// Core brute loop logic, parameterized by plan path. Used by both standalone
@@ -1584,7 +1912,13 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
 /// - `config`: already-loaded Config
 /// - `plan_path`: path to the plan file
 /// - `dry_run_inner`: if true, skip Claude invocation (one iteration only)
-fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResult {
+/// - `mctx`: metrics context (shared with nested plan loop)
+fn run_brute_core(
+    config: &Config,
+    plan_path: &str,
+    dry_run: bool,
+    recorder: &mut metrics::RunRecorder,
+) -> BruteResult {
     // Backup protected files
     let backup_dir = backup_files(BRUTE_PROTECTED_FILES);
     log(&format!("Backups in {}", backup_dir.display()));
@@ -1615,7 +1949,7 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
             log("(dry-run) Skipping worker invocation");
         } else {
             log("Using plan runner as worker...");
-            match run_plan_loop(config, plan_path, false, true) {
+            match run_plan_loop(config, plan_path, false, true, recorder) {
                 PlanLoopOutcome::JudgePass => {
                     // Embedded judge already passed — skip standalone judge
                     log("Plan runner completed with embedded judge PASS");
@@ -1646,8 +1980,8 @@ fn run_brute_core(config: &Config, plan_path: &str, dry_run: bool) -> BruteResul
 
         // Run guards (skip when not dry-run — the plan loop already ran them)
         if dry_run {
-            let passed = run_all_guards(config);
-            if !passed {
+            let outcome = run_all_guards(config);
+            if !outcome.passed {
                 log(&format!(
                     "{}Guards failed{}", ORANGE, RESET
                 ));
@@ -1724,10 +2058,11 @@ fn run_brute(dry_run: bool) -> i32 {
 /// Returns true if the invocation succeeded.
 fn invoke_scoper(runner: &mut LoopRunner, config: &Config, cycle: u32) -> bool {
     let scoper_prompt = "Read .loop/saga-protocol.md and follow its instructions.";
-    let (status, _) = invoke_process(
-        runner, config, scoper_prompt, "scoper", "scoper", cycle, 0.0,
+    // Scoper is always a fresh session — saga cycles are independent by design.
+    let stats = invoke_process(
+        runner, config, scoper_prompt, "scoper", "scoper", cycle, 0.0, None,
     );
-    status
+    stats.success
 }
 
 /// Run the saga loop: scoper (Agent 1) decomposes the spec into sub-plans,
@@ -1790,6 +2125,7 @@ fn run_saga_cycle(
     cycle: u32,
     dry_run: bool,
     saga_protected: &[&str],
+    recorder: &mut metrics::RunRecorder,
 ) -> Option<i32> {
     restore_files(&runner.backup_dir, saga_protected);
 
@@ -1864,11 +2200,11 @@ fn run_saga_cycle(
         }
     }
 
-    let _ = fs::write(NOTES_PATH, "");
-    let _ = fs::write(VERDICT_PATH, "");
-    let _ = fs::write(GUARD_RESULTS_PATH, "");
+    // Preserve notes, verdict, and guard-results between cycles so the
+    // scoper (and the user) can read why the previous chunk failed or
+    // succeeded.  Use `yoke clean` or `yoke stash` for a full reset.
 
-    match run_brute_core(config, SUB_PLAN_PATH, false) {
+    match run_brute_core(config, SUB_PLAN_PATH, false, recorder) {
         BruteResult::Pass => {
             log(&format!(
                 "{}Sub-plan passed \u{2014} looping back to scoper{}",
@@ -1925,19 +2261,40 @@ fn run_saga(dry_run: bool) -> i32 {
     let backup_dir = backup_files(&saga_protected);
     log(&format!("Backups in {}", backup_dir.display()));
 
+    let mctx = metrics::MetricsContext::new(
+        config.metrics_dir.clone(),
+        "saga",
+        config.metrics_enabled,
+    );
+    if mctx.enabled {
+        log(&format!(
+            "Metrics: run_id={}, file={}",
+            mctx.run_id,
+            mctx.iteration_path().display()
+        ));
+    }
+    let mut recorder = metrics::RunRecorder::new(mctx);
+    recorder.on_finalize(|r| render_run_summary(r));
+
     let mut runner = LoopRunner::new(backup_dir);
     let mut cycle: u32 = 0;
 
     loop {
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
+            // outcome defaults to "interrupt" on Drop
             return 130;
         }
         cycle += 1;
         eprintln!();
         render_iteration_banner("Saga Cycle", cycle, false);
 
-        if let Some(exit_code) = run_saga_cycle(&mut runner, &config, cycle, dry_run, &saga_protected) {
+        if let Some(exit_code) = run_saga_cycle(&mut runner, &config, cycle, dry_run, &saga_protected, &mut recorder) {
+            recorder.set_outcome(match exit_code {
+                0 => "done",
+                130 => "interrupt",
+                _ => "error",
+            });
             return exit_code;
         }
     }
@@ -2032,6 +2389,185 @@ fn cmd_layer(args: &[String]) -> ! {
     process::exit(apply_layers(&names_arg));
 }
 
+fn print_stats_help() {
+    eprintln!(
+        "{}{}[yoke stats]{} inspect persisted run metrics",
+        ORANGE, BOLD, RESET
+    );
+    eprintln!();
+    eprintln!("{}USAGE:{}", BOLD, RESET);
+    eprintln!("  yoke stats                       List recent runs for the current project");
+    eprintln!("  yoke stats --last N              Limit to last N runs");
+    eprintln!("  yoke stats --project <slug>      Target a different project");
+    eprintln!("  yoke stats --run <run-id>        Show per-iteration rows for one run");
+    eprintln!();
+    eprintln!(
+        "Reads NDJSON from {}~/.yoke/metrics/<project-slug>/{} (or `metrics-dir` from yoke.conf).",
+        DIM, RESET
+    );
+}
+
+/// Resolve the metrics root directory, preferring an existing yoke.conf
+/// (so `metrics-dir` overrides apply) and falling back to the default
+/// `~/.yoke/metrics/` when no config is present.
+fn resolve_metrics_dir() -> PathBuf {
+    if Path::new(CONF_PATH).exists() {
+        if let Ok(c) = Config::load(Path::new(CONF_PATH)) {
+            return c.metrics_dir;
+        }
+    }
+    metrics::default_metrics_dir()
+}
+
+fn cmd_stats(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        print_stats_help();
+        process::exit(0);
+    }
+
+    let mut last: Option<usize> = None;
+    let mut project: Option<String> = None;
+    let mut run_id: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--last" => {
+                let v = match args.get(i + 1) {
+                    Some(v) => v,
+                    None => {
+                        log_error("--last requires a value");
+                        process::exit(2);
+                    }
+                };
+                last = Some(match v.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        log_error(&format!("--last expects an integer, got '{}'", v));
+                        process::exit(2);
+                    }
+                });
+                i += 2;
+            }
+            "--project" => {
+                project = Some(match args.get(i + 1) {
+                    Some(v) => v.clone(),
+                    None => {
+                        log_error("--project requires a slug");
+                        process::exit(2);
+                    }
+                });
+                i += 2;
+            }
+            "--run" => {
+                run_id = Some(match args.get(i + 1) {
+                    Some(v) => v.clone(),
+                    None => {
+                        log_error("--run requires a run-id");
+                        process::exit(2);
+                    }
+                });
+                i += 2;
+            }
+            other => {
+                log_error(&format!("unknown flag '{}'", other));
+                print_stats_help();
+                process::exit(2);
+            }
+        }
+    }
+
+    let metrics_dir = resolve_metrics_dir();
+    let slug = project.unwrap_or_else(metrics::project_slug);
+    let slug_dir = metrics_dir.join(&slug);
+
+    if let Some(rid) = run_id {
+        process::exit(stats_show_run(&slug_dir, &rid, &slug));
+    } else {
+        process::exit(stats_list_runs(&slug_dir, &slug, last));
+    }
+}
+
+fn stats_list_runs(slug_dir: &Path, slug: &str, last: Option<usize>) -> i32 {
+    let mut runs = metrics::read_runs(slug_dir);
+    if runs.is_empty() {
+        log(&format!(
+            "No runs recorded for project '{}' at {}",
+            slug,
+            slug_dir.display()
+        ));
+        log("Run `yoke run` to populate metrics.");
+        return 0;
+    }
+    // run_id format is lex-sortable → desc gives most-recent first
+    runs.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+    if let Some(n) = last {
+        runs.truncate(n);
+    }
+
+    log(&format!(
+        "Runs for project '{}' ({} shown, source: {})",
+        slug,
+        runs.len(),
+        slug_dir.display()
+    ));
+    println!();
+    println!(
+        "  {}{:<22}  {:<6}  {:<11}  {:>4}  {:>8}  {:>8}{}",
+        BOLD, "RUN_ID", "MODE", "OUTCOME", "ITER", "WALL", "COST", RESET
+    );
+    for r in &runs {
+        println!(
+            "  {:<22}  {:<6}  {:<11}  {:>4}  {:>7.1}s  {:>7.2}",
+            r.run_id, r.mode, r.outcome, r.iterations, r.total_wall_secs, r.total_cost_usd
+        );
+    }
+    0
+}
+
+fn stats_show_run(slug_dir: &Path, run_id: &str, slug: &str) -> i32 {
+    let path = slug_dir.join(format!("{}.ndjson", run_id));
+    if !path.exists() {
+        log_error(&format!("no metrics file at {}", path.display()));
+        return 1;
+    }
+    let iters = metrics::read_iterations(&path);
+    if iters.is_empty() {
+        log(&format!(
+            "Run {} has no iteration rows ({})",
+            run_id,
+            path.display()
+        ));
+        return 0;
+    }
+    log(&format!(
+        "Run {} (project '{}', {} iteration{})",
+        run_id,
+        slug,
+        iters.len(),
+        if iters.len() == 1 { "" } else { "s" }
+    ));
+    println!();
+    println!(
+        "  {}{:>4}  {:>7}  {:>7}  {:>7}  {:>7}  {:>5}  {:>7}  {:>6}  {:>4}{}",
+        BOLD, "ITER", "WALL", "AGENT", "THINK", "GUARDS", "TURNS", "COST", "GUARDS", "DONE", RESET
+    );
+    for r in &iters {
+        println!(
+            "  {:>4}  {:>6.1}s  {:>6.1}s  {:>6.1}s  {:>6.1}s  {:>5}  $ {:>5.2}  {:>6}  {:>4}",
+            r.iteration,
+            r.wall_secs,
+            r.agent_secs,
+            r.thinking_secs,
+            r.guards_secs,
+            r.num_turns,
+            r.cost_usd,
+            if r.guards_passed { "pass" } else { "fail" },
+            if r.status_done { "yes" } else { "no" }
+        );
+    }
+    0
+}
+
 fn cmd_run(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
         print_run_help();
@@ -2091,6 +2627,7 @@ fn main() {
         "stash" => cmd_stash(&args),
         "layer" => cmd_layer(&args),
         "run" => cmd_run(&args),
+        "stats" => cmd_stats(&args),
         "--help" | "-h" | "help" => {
             print_usage();
         }

@@ -97,26 +97,22 @@ fn stash_roundtrip_after_extraction() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("mode=brute"), "stash log should show mode=brute, got:\n{}", stderr);
 
-    // Clean — this should auto-stash then wipe
-    let out = Command::new(&yoke)
-        .args(["clean"])
-        .current_dir(project)
-        .output()
-        .expect("yoke clean");
-    assert!(out.status.success(), "yoke clean failed: {}", String::from_utf8_lossy(&out.stderr));
+    // Verify stash cleared .loop/ working files
+    assert!(!loop_dir.join("plan.md").exists(), "plan.md should be gone after stash");
+    assert!(!loop_dir.join("notes.md").exists(), "notes.md should be gone after stash");
+    assert!(loop_dir.join(".stash").exists(), ".stash/ should survive stash clear");
 
-    // Verify plan.md was emptied by clean
-    let plan = fs::read_to_string(loop_dir.join("plan.md")).unwrap();
-    assert!(plan.is_empty(), "plan.md should be empty after clean, got: {:?}", plan);
-
-    // Pop — should restore the auto-stashed state (which is the post-clean state,
-    // but let's verify we can pop without error, meaning the index is intact)
+    // Pop — should restore the stashed state with our distinctive content
     let out = Command::new(&yoke)
         .args(["stash", "pop"])
         .current_dir(project)
         .output()
         .expect("yoke stash pop");
     assert!(out.status.success(), "yoke stash pop failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Verify round-trip: files restored with original content
+    let plan = fs::read_to_string(loop_dir.join("plan.md")).unwrap();
+    assert!(plan.contains("Build the widget"), "plan.md should be restored after pop, got: {:?}", plan);
 }
 
 // ── Test 2: plan loop exits on STATUS: DONE with generalized is_status_done ──

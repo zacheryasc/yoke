@@ -5,6 +5,7 @@ use std::process::ChildStdout;
 
 use crate::ansi::{BLUE, BOLD, CYAN, DIM, GRAY, GREEN, MAGENTA, ORANGE, RED, RESET, YELLOW};
 use crate::json::{extract_num, extract_str, unescape_json};
+use crate::stream::StreamSummary;
 
 struct StreamState {
     turn_num: u32,
@@ -166,14 +167,22 @@ fn format_summary_strip(state: &StreamState) -> String {
     format!("{}  ⟪ {} ⟫{}", DIM, parts.join(" │ "), RESET)
 }
 
-pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, _prior_total: f64) -> f64 {
-    let mut state = StreamState::new();
+pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, _prior_total: f64) -> StreamSummary {
+    let state = StreamState::new();
     crate::stream::run_stream_loop(
         stdout,
         log_path,
-        &mut state,
+        state,
         |out, line, st| process_line(out, line, st),
         |st| if st.turn_num > 0 { Some(format_summary_strip(st)) } else { None },
-        |st| st.iteration_cost,
+        |st| StreamSummary {
+            cost_usd: st.iteration_cost,
+            agent_reported_secs: None,
+            num_turns: st.turn_num,
+            thinking_secs: 0.0,
+            tool_counts: st.tool_counts.into_iter().collect(),
+            tool_durations_secs: std::collections::BTreeMap::new(),
+            session_id: None,
+        },
     )
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::ChildStdout;
@@ -10,18 +10,44 @@ use crate::json::{extract_num, extract_str, unescape_json};
 const BG_RED: &str = "\x1b[48;2;80;30;30m";
 const BG_GREEN: &str = "\x1b[48;2;30;60;30m";
 
+/// Aggregated, persistable view of one agent invocation's stream.
+///
+/// Produced by `filter_stream` after the child's stdout closes.  Carries
+/// everything the metrics layer wants: cost, agent-reported wall time,
+/// thinking total, and per-tool durations + counts.
+#[derive(Debug, Clone, Default)]
+pub struct StreamSummary {
+    pub cost_usd: f64,
+    /// Wall clock as reported by the agent's `result` event (Claude only).
+    pub agent_reported_secs: Option<f64>,
+    pub num_turns: u32,
+    pub thinking_secs: f64,
+    pub tool_counts: BTreeMap<String, u32>,
+    pub tool_durations_secs: BTreeMap<String, f64>,
+    /// Claude session ID extracted from the init event. Used by the harness
+    /// to `--resume` the same session on the next iteration, preserving the
+    /// prompt cache. `None` for OpenCode or if the init event was missed.
+    pub session_id: Option<String>,
+}
+
 struct StreamState {
     turn_num: u32,
     current_msg_id: Option<String>,
     seen_init: bool,
     in_thinking: bool,
     thinking_start: Option<Instant>,
+    thinking_total_secs: f64,
     iteration_cost: f64,
     iteration_duration_secs: f64,
-    /// Maps tool_use id → tool name, so tool_result can look up its origin.
-    tool_use_names: HashMap<String, String>,
+    /// Maps tool_use id → (tool name, start instant), so tool_result can
+    /// look up its origin and elapsed time.
+    tool_use_starts: HashMap<String, (String, Instant)>,
     /// Counts of tool_use events by tool name (for iteration summary strip).
     tool_counts: HashMap<String, u32>,
+    /// Wall-clock duration accumulated per tool name across the iteration.
+    tool_durations: HashMap<String, f64>,
+    /// Captured from the `system`/`init` event so the harness can `--resume`.
+    session_id: Option<String>,
 }
 
 impl StreamState {
@@ -32,10 +58,30 @@ impl StreamState {
             seen_init: false,
             in_thinking: false,
             thinking_start: None,
+            thinking_total_secs: 0.0,
             iteration_cost: 0.0,
             iteration_duration_secs: 0.0,
-            tool_use_names: HashMap::new(),
+            tool_use_starts: HashMap::new(),
             tool_counts: HashMap::new(),
+            tool_durations: HashMap::new(),
+            session_id: None,
+        }
+    }
+
+    fn into_summary(self) -> StreamSummary {
+        let agent_reported_secs = if self.iteration_duration_secs > 0.0 {
+            Some(self.iteration_duration_secs)
+        } else {
+            None
+        };
+        StreamSummary {
+            cost_usd: self.iteration_cost,
+            agent_reported_secs,
+            num_turns: self.turn_num,
+            thinking_secs: self.thinking_total_secs,
+            tool_counts: self.tool_counts.into_iter().collect(),
+            tool_durations_secs: self.tool_durations.into_iter().collect(),
+            session_id: self.session_id,
         }
     }
 }
@@ -255,7 +301,7 @@ fn handle_assistant(out: &mut (impl Write + ?Sized), line: &str, state: &mut Str
         return Ok(());
     }
     if let (Some(id), Some(name)) = (extract_str(line, "id"), extract_str(line, "name")) {
-        state.tool_use_names.insert(id.to_string(), name.to_string());
+        state.tool_use_starts.insert(id.to_string(), (name.to_string(), Instant::now()));
         *state.tool_counts.entry(name.to_string()).or_insert(0) += 1;
     }
     let desc = format_tool_call(line);
@@ -291,6 +337,7 @@ fn handle_stream_event(out: &mut (impl Write + ?Sized), line: &str, state: &mut 
         if state.in_thinking {
             if let Some(start) = state.thinking_start {
                 let elapsed = start.elapsed().as_secs_f64();
+                state.thinking_total_secs += elapsed;
                 write!(out, "\r{}{}thinking {:.1}s{}", DIM, BLUE, elapsed, RESET)?;
             }
             state.in_thinking = false;
@@ -301,11 +348,24 @@ fn handle_stream_event(out: &mut (impl Write + ?Sized), line: &str, state: &mut 
     Ok(())
 }
 
-/// Handle "user" events: render tool_result success/error badges.
-fn handle_tool_result(out: &mut (impl Write + ?Sized), line: &str, state: &StreamState) -> io::Result<()> {
+/// Handle "user" events: render tool_result success/error badges and
+/// accumulate the wall-clock duration of each tool call by name.
+fn handle_tool_result(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamState) -> io::Result<()> {
     if !line.contains("\"tool_result\"") {
         return Ok(());
     }
+
+    // Pair this result with its tool_use; drop the entry and accumulate elapsed.
+    // Done for both success and error so failed tools still show up in metrics.
+    let tool_use_id = extract_str(line, "tool_use_id").map(|s| s.to_string());
+    let tool_name_owned: Option<String> = tool_use_id.and_then(|id| {
+        state.tool_use_starts.remove(&id).map(|(name, start)| {
+            let elapsed = start.elapsed().as_secs_f64();
+            *state.tool_durations.entry(name.clone()).or_insert(0.0) += elapsed;
+            name
+        })
+    });
+
     let is_error = line.contains("\"is_error\":true") || line.contains("\"is_error\": true");
     if is_error {
         writeln!(out, "  {}← {}{}✗{}", GRAY, RESET, RED, RESET)?;
@@ -315,10 +375,7 @@ fn handle_tool_result(out: &mut (impl Write + ?Sized), line: &str, state: &Strea
         }
         return Ok(());
     }
-    let tool_name = extract_str(line, "tool_use_id")
-        .and_then(|id| state.tool_use_names.get(id))
-        .map(|s| s.as_str());
-    let badge = match tool_name {
+    let badge = match tool_name_owned.as_deref() {
         Some(name @ ("Grep" | "Glob")) => format_grep_glob_badge(name, line),
         _ => String::new(),
     };
@@ -348,6 +405,9 @@ fn process_line(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamS
             if extract_str(line, "subtype") == Some("init") && !state.seen_init {
                 state.seen_init = true;
                 let sid = extract_str(line, "session_id").unwrap_or("?");
+                if sid != "?" {
+                    state.session_id = Some(sid.to_string());
+                }
                 let sid_short: String = sid.chars().take(12).collect();
                 let model = extract_str(line, "model").unwrap_or("?");
                 writeln!(out, "{}{}[stream]{} session {}… model={}", ORANGE, BOLD, RESET, sid_short, model)?;
@@ -379,26 +439,39 @@ fn process_line(out: &mut (impl Write + ?Sized), line: &str, state: &mut StreamS
 }
 
 /// Build a compact one-line iteration summary strip from accumulated state.
-/// Format: `⟪ 6 turns │ 3 edits │ 1 bash │ 42s │ $0.38 ⟫`
+/// Format: `⟪ 6 turns │ 3 edit 1.8s │ 1 bash 12.3s │ thinking 4.1s │ 42s │ $0.38 ⟫`
+///
+/// Tool entries show count + elapsed for the top-3 tools by wall time, then
+/// count-only for the rest (stops the strip overflowing 80 cols).
 fn format_summary_strip(state: &StreamState) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // Turns
     parts.push(format!("{} turn{}", state.turn_num, if state.turn_num == 1 { "" } else { "s" }));
 
-    // Tool counts — show the most interesting tools in a stable order
-    let tool_order = ["Edit", "Write", "Read", "Bash", "Grep", "Glob"];
-    for tool in &tool_order {
-        if let Some(&count) = state.tool_counts.get(*tool) {
-            let label = tool.to_lowercase();
+    // Rank tools by elapsed time; top-3 get the "Ns" suffix, the rest are
+    // count-only. Tools with no recorded duration (e.g. tool_result never
+    // arrived) sort to the end of the timed list.
+    let mut ranked: Vec<(&String, u32, f64)> = state
+        .tool_counts
+        .iter()
+        .map(|(name, &count)| {
+            let secs = state.tool_durations.get(name).copied().unwrap_or(0.0);
+            (name, count, secs)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (i, (name, count, secs)) in ranked.iter().enumerate() {
+        let label = name.to_lowercase();
+        if i < 3 && *secs > 0.0 {
+            parts.push(format!("{} {} {:.1}s", count, label, secs));
+        } else {
             parts.push(format!("{} {}", count, label));
         }
     }
-    // Any tools not in the predefined order
-    for (name, &count) in &state.tool_counts {
-        if !tool_order.contains(&name.as_str()) {
-            parts.push(format!("{} {}", count, name.to_lowercase()));
-        }
+
+    if state.thinking_total_secs > 0.0 {
+        parts.push(format!("thinking {:.1}s", state.thinking_total_secs));
     }
 
     // Duration
@@ -411,18 +484,19 @@ fn format_summary_strip(state: &StreamState) -> String {
 }
 
 /// Shared stream loop: reads lines from stdout, tees to log, calls processor per line,
-/// prints a summary strip, and returns the iteration cost.
+/// prints a summary strip, and finalizes state into a caller-defined return type.
 ///
 /// Used by both Claude and OpenCode stream filters to avoid duplicating the
-/// BufReader/signal-check/log-tee boilerplate.
-pub fn run_stream_loop<S>(
+/// BufReader/signal-check/log-tee boilerplate.  `finalize` consumes the state
+/// so the caller can move out of it (e.g. into a `StreamSummary`).
+pub fn run_stream_loop<S, R>(
     stdout: ChildStdout,
     log_path: Option<&Path>,
-    state: &mut S,
+    mut state: S,
     mut process: impl FnMut(&mut dyn Write, &str, &mut S) -> io::Result<()>,
     summarize: impl FnOnce(&S) -> Option<String>,
-    get_cost: impl FnOnce(&S) -> f64,
-) -> f64 {
+    finalize: impl FnOnce(S) -> R,
+) -> R {
     let reader = BufReader::new(stdout);
     let mut log_file = log_path.and_then(|p| {
         std::fs::create_dir_all(p.parent().unwrap_or(Path::new("."))).ok();
@@ -449,30 +523,30 @@ pub fn run_stream_loop<S>(
             let _ = writeln!(f, "{}", line);
         }
 
-        if process(&mut out, &line, state).is_err() {
+        if process(&mut out, &line, &mut state).is_err() {
             break;
         }
     }
 
-    if let Some(strip) = summarize(state) {
+    if let Some(strip) = summarize(&state) {
         let _ = writeln!(out, "{}", strip);
     }
 
     let _ = out.flush();
-    get_cost(state)
+    finalize(state)
 }
 
 /// Filter NDJSON stream from Claude and format as rich ANSI output on stdout.
 /// `prior_total` is the accumulated cost from previous iterations.
-/// Returns the cost of this iteration (from the `result` event).
-pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, prior_total: f64) -> f64 {
-    let mut state = StreamState::new();
+/// Returns a `StreamSummary` carrying cost, thinking time, tool durations, etc.
+pub fn filter_stream(stdout: ChildStdout, log_path: Option<&Path>, prior_total: f64) -> StreamSummary {
+    let state = StreamState::new();
     run_stream_loop(
         stdout,
         log_path,
-        &mut state,
+        state,
         |out, line, st| process_line(out, line, st, prior_total),
         |st| if st.turn_num > 0 { Some(format_summary_strip(st)) } else { None },
-        |st| st.iteration_cost,
+        |st| st.into_summary(),
     )
 }

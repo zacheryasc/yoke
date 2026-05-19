@@ -37,6 +37,37 @@ The first line of `.loop/notes.md` must be one of:
 
 The outer loop reads this line. It exits only when `STATUS: DONE` **and** all guards pass.
 
+## KEEP: Carrying File Context Across Iterations
+
+Your conversation history persists across iterations via `--resume`. To keep
+Claude's prompt cache warm without ballooning, the outer loop trims your
+session between rounds: it drops `Bash` output, thinking, and any file
+`Read` results that aren't on your KEEP list. Everything else (text turns,
+intermediate `Edit`/`Grep`/`Glob` results) is also dropped.
+
+After STATUS, on its own line in `.loop/notes.md`, list the file paths you
+want to keep cached for the next iteration:
+
+```
+STATUS: IN_PROGRESS
+KEEP: src/foo.rs src/bar.rs tests/baz.rs
+```
+
+Rules:
+
+- Space-separated repo-relative paths (or absolute — both work).
+- List files you read **this iteration** and will still need next iteration.
+- Don't list `.loop/notes.md`, `.loop/plan.md`, `.loop/protocol.md`,
+  `.loop/guard-results.md`, or `.loop/verdict.md` — those live on disk and
+  you re-read them fresh every iteration. Listing them is harmless but wastes
+  a slot.
+- Keep the list tight. Every kept file is paid for (at cache-read rates,
+  ~10% of fresh) every round it stays kept. Drop a file once you're confident
+  you won't need it again.
+- Omit the `KEEP:` line entirely (or `KEEP: *`) to keep nothing — your
+  conversation prefix shrinks to just the bootstrap. Use this after major
+  refactors or when you've moved to an unrelated area of the code.
+
 ## What the Guards Check
 
 After you exit, the outer loop runs guards defined in `.loop/yoke.conf`.

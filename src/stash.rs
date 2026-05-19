@@ -180,6 +180,9 @@ pub(crate) fn stash_create(mode: &str) -> i32 {
     }
     match stash_snapshot(mode) {
         Ok(hash) => {
+            for (name, _) in &collect_stashable_files() {
+                let _ = fs::remove_file(Path::new(".loop").join(name));
+            }
             log(&format!("stashed → {}{}{}", BLUE, hash, RESET));
             0
         }
@@ -321,7 +324,7 @@ pub(crate) fn print_stash_help() {
     eprintln!();
     eprintln!("{}SUBCOMMANDS:{}", BOLD, RESET);
     eprintln!(
-        "  {}(none){}           Snapshot all .loop/ files to a new stash entry",
+        "  {}(none){}           Snapshot .loop/ files to stash, then clear the directory",
         BOLD, RESET
     );
     eprintln!(

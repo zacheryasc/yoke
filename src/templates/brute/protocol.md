@@ -43,6 +43,34 @@ The first line of `.loop/notes.md` must be one of:
 - `STATUS: IN_PROGRESS` — You have more work to do (stages remain, or you expect guard failures).
 - `STATUS: DONE` — All stages are implemented and you believe guards will pass.
 
+## KEEP: Carrying File Context Across Iterations
+
+Your conversation history persists across worker iterations via `--resume`.
+To keep Claude's prompt cache warm without ballooning, the outer loop trims
+your session between rounds: it drops `Bash` output, thinking, and any file
+`Read` results that aren't on your KEEP list. Everything else (text turns,
+intermediate `Edit`/`Grep`/`Glob` results) is also dropped.
+
+After STATUS, on its own line in `.loop/notes.md`, list the file paths you
+want to keep cached for the next iteration:
+
+```
+STATUS: IN_PROGRESS
+KEEP: src/foo.rs src/bar.rs tests/baz.rs
+```
+
+Rules:
+
+- Space-separated repo-relative paths (or absolute).
+- List files you read **this iteration** and will still need next iteration.
+- Don't list `.loop/*` files — those live on disk and are re-read fresh.
+- Keep the list tight. Every kept file is paid for at cache-read rates
+  every round it stays. Drop a file once it's no longer relevant.
+- Omit `KEEP:` (or `KEEP: *`) to keep nothing.
+
+Note: the judge always runs in a fresh session — your KEEP list does not
+affect the judge.
+
 ## What Happens After You Exit
 
 1. Guards run (diff boundary check + configured guard commands).

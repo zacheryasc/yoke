@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Backend {
@@ -39,6 +39,11 @@ pub struct Config {
     pub judge_every: Option<u32>,
     pub max_judge_failures: u32,
     pub periodics: Vec<Periodic>,
+    pub hooks: Vec<String>,
+    /// Resolved absolute path where NDJSON metrics rows are written.
+    /// Defaults to `~/.yoke/metrics` so rows survive `yoke clean` / project resets.
+    pub metrics_dir: PathBuf,
+    pub metrics_enabled: bool,
 }
 
 struct ConfigBuilder {
@@ -52,6 +57,9 @@ struct ConfigBuilder {
     max_judge_failures: u32,
     periodics: Vec<Periodic>,
     pending_guard_afters: Vec<(String, String, usize)>,
+    hooks: Vec<String>,
+    metrics_dir: Option<String>,
+    metrics_enabled: bool,
 }
 
 fn cfg_err(path: &Path, line_num: usize, msg: &str) -> String {
@@ -105,6 +113,9 @@ impl ConfigBuilder {
             max_judge_failures: 3,
             periodics: Vec::new(),
             pending_guard_afters: Vec::new(),
+            hooks: Vec::new(),
+            metrics_dir: None,
+            metrics_enabled: true,
         }
     }
 
@@ -126,6 +137,19 @@ impl ConfigBuilder {
             "max-judge-failures" => self.max_judge_failures = parse_positive_u32(value, path, line_num, "max-judge-failures")?,
             "periodic" => self.periodics.push(parse_periodic(value, path, line_num)?),
             "guard-after" => self.pending_guard_afters.push(parse_guard_after(value, path, line_num)?),
+            "hook" => self.hooks.push(value.to_string()),
+            "metrics-dir" => self.metrics_dir = Some(value.to_string()),
+            "metrics" => match value.trim() {
+                "on" => self.metrics_enabled = true,
+                "off" => self.metrics_enabled = false,
+                other => {
+                    return Err(cfg_err(
+                        path,
+                        line_num,
+                        &format!("metrics must be 'on' or 'off', got '{}'", other),
+                    ));
+                }
+            },
             other => return Err(cfg_err(path, line_num, &format!("unknown directive '{}'", other))),
         }
         Ok(())
@@ -139,6 +163,10 @@ impl ConfigBuilder {
                 None => return Err(cfg_err(path, ln, &format!("guard-after references unknown periodic '{}'", pname))),
             }
         }
+        let metrics_dir = match self.metrics_dir {
+            Some(raw) => crate::metrics::expand_tilde(&raw),
+            None => crate::metrics::default_metrics_dir(),
+        };
         Ok(Config {
             max_tail: self.max_tail,
             log_dir: self.log_dir,
@@ -149,6 +177,9 @@ impl ConfigBuilder {
             judge_every: self.judge_every,
             max_judge_failures: self.max_judge_failures,
             periodics,
+            hooks: self.hooks,
+            metrics_dir,
+            metrics_enabled: self.metrics_enabled,
         })
     }
 }

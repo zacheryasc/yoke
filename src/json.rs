@@ -82,6 +82,32 @@ pub fn extract_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
+/// Extract a boolean value for a given key from a flat JSON line.
+/// Looks for `"key": true` or `"key": false`.
+#[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
+pub fn extract_bool(line: &str, key: &str) -> Option<bool> {
+    let needle = {
+        let mut pat = String::with_capacity(key.len() + 3);
+        pat.push('"');
+        pat.push_str(key);
+        pat.push('"');
+        pat
+    };
+
+    let key_start = line.find(&needle)?;
+    let after_key = key_start + needle.len();
+    let rest = line[after_key..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Extract a numeric value for a given key from a flat JSON line.
 /// Looks for `"key": 123.45` and returns the number.
 /// Returns `None` if the key is not found or the value is not a number.
@@ -140,5 +166,13 @@ mod tests {
         assert!((extract_num(line, "cost_usd").unwrap() - 0.42).abs() < 1e-10);
         assert!((extract_num(line, "num_turns").unwrap() - 5.0).abs() < 1e-10);
         assert_eq!(extract_num(line, "missing"), None);
+    }
+
+    #[test]
+    fn test_extract_bool() {
+        let line = r#"{"guards_passed":true,"status_done":false}"#;
+        assert_eq!(extract_bool(line, "guards_passed"), Some(true));
+        assert_eq!(extract_bool(line, "status_done"), Some(false));
+        assert_eq!(extract_bool(line, "missing"), None);
     }
 }

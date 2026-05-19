@@ -55,13 +55,16 @@ exits successfully. On FAIL, the worker retries.
 It is a fresh agent invocation with no shared context from the worker. Its only
 input is `judge.md` and the codebase state.
 
-**2.2 — Verdict survives retries.**
-On judge FAIL, `verdict.md` is NOT cleared. The worker sees the judge's
-feedback on its next iteration. This is how the worker knows what went wrong.
+**2.2 — Verdict survives retries and restarts.**
+`verdict.md` is never cleared automatically. On judge FAIL, the worker sees
+the judge's feedback on its next iteration. On bailout, the verdict remains
+on disk so the user (or agent on restart) can read why the loop failed.
+Use `yoke clean` or `yoke stash` to reset.
 
-**2.3 — Guard results survive retries.**
-Same as verdict — `guard-results.md` persists across brute retries so the
-worker sees what the guards reported.
+**2.3 — Guard results survive retries and restarts.**
+Same as verdict — `guard-results.md` is never cleared automatically. It
+persists across brute retries and restarts so the worker sees what the
+guards reported.
 
 **2.4 — Notes status reset on retry, nothing else.**
 On judge FAIL, only the first line of `notes.md` is overwritten to
@@ -89,9 +92,11 @@ specific snapshot. `yoke clean` auto-stashes before wiping.
 
 ### Invariants
 
-**3.1 — Stash is a lossless round-trip.**
-`stash` then `pop` produces identical `.loop/` contents. No file is lost,
-truncated, or corrupted.
+**3.1 — Stash clears the working directory.**
+`stash` snapshots all non-dotfile files in `.loop/`, then removes them.
+After stash, `.loop/` contains only dotfile entries (like `.stash/`).
+`stash` then `pop` (or `checkout`) restores the original contents — no
+file is lost, truncated, or corrupted.
 
 **3.2 — Auto-stash before destructive operations.**
 Both `clean` and `checkout` auto-stash current state before modifying it. You
@@ -135,10 +140,11 @@ abort on a single chunk failure.
 If the scoper produces an empty `sub-plan.md`, the saga aborts. This prevents
 a brute loop from running with no plan.
 
-**4.4 — Chunk state is isolated but logged.** `notes.md`, `verdict.md`, and
-`guard-results.md` are cleared between chunks. Each brute run starts fresh.
-Previous chunk state does not leak into the next chunk. Before clearing,
-the contents of `notes.md` are appended to `saga-log.md`.
+**4.4 — Chunk state persists and is logged.** `notes.md`, `verdict.md`, and
+`guard-results.md` are NOT cleared between chunks. The scoper can read why
+the previous chunk failed or succeeded. Before each chunk, the contents of
+`notes.md` are appended to `saga-log.md`. Use `yoke clean` or `yoke stash`
+for a full reset.
 
 **4.5 — Saga log is append-only.** `saga-log.md` accumulates the worker's
 notes from every completed chunk. It is never cleared or truncated during a
@@ -168,6 +174,11 @@ is protected and `src/other.rs` is allowed. Longer prefix wins.
 **5.4 — Guard-after requires its periodic.**
 A `guard-after` referencing a periodic that does not exist is a config error,
 not a silent no-op.
+
+**5.5 — Hooks are fire-and-forget.**
+A `hook` command that exits non-zero or fails to execute produces a warning on
+stderr but does not affect the loop's exit code, guard evaluation, or iteration
+flow. Hook output is never written to any file the agent reads.
 
 ---
 
