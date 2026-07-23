@@ -7,6 +7,26 @@ pub enum Backend {
     OpenCode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Thinking {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Thinking {
+    /// MAX_THINKING_TOKENS value to forward to the Claude CLI.
+    pub fn max_tokens(self) -> u32 {
+        match self {
+            Thinking::Off => 0,
+            Thinking::Low => 2000,
+            Thinking::Medium => 10000,
+            Thinking::High => 32000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScopeTag {
     Allow,
@@ -34,6 +54,8 @@ pub struct Config {
     pub log_dir: Option<String>,
     pub image: Option<String>,
     pub model: Option<String>,
+    pub claude_model: Option<String>,
+    pub thinking: Option<Thinking>,
     pub scope_rules: Vec<ScopeRule>,
     pub guards: Vec<String>,
     pub judge_every: Option<u32>,
@@ -51,6 +73,8 @@ struct ConfigBuilder {
     log_dir: Option<String>,
     image: Option<String>,
     model: Option<String>,
+    claude_model: Option<String>,
+    thinking: Option<Thinking>,
     scope_rules: Vec<ScopeRule>,
     guards: Vec<String>,
     judge_every: Option<u32>,
@@ -107,6 +131,8 @@ impl ConfigBuilder {
             log_dir: None,
             image: None,
             model: None,
+            claude_model: None,
+            thinking: None,
             scope_rules: Vec::new(),
             guards: Vec::new(),
             judge_every: None,
@@ -129,6 +155,22 @@ impl ConfigBuilder {
             "log-dir" => self.log_dir = Some(value.to_string()),
             "image" => self.image = Some(value.to_string()),
             "model" => self.model = Some(value.to_string()),
+            "claude-model" => self.claude_model = Some(value.to_string()),
+            "thinking" => {
+                self.thinking = Some(match value.trim() {
+                    "off" => Thinking::Off,
+                    "low" => Thinking::Low,
+                    "medium" => Thinking::Medium,
+                    "high" => Thinking::High,
+                    other => {
+                        return Err(cfg_err(
+                            path,
+                            line_num,
+                            &format!("thinking must be 'off', 'low', 'medium', or 'high', got '{}'", other),
+                        ));
+                    }
+                });
+            }
             "allow" => self.scope_rules.push(ScopeRule { tag: ScopeTag::Allow, prefix: value.to_string() }),
             "add-only" => self.scope_rules.push(ScopeRule { tag: ScopeTag::AddOnly, prefix: value.to_string() }),
             "no-modify" => self.scope_rules.push(ScopeRule { tag: ScopeTag::NoModify, prefix: value.to_string() }),
@@ -156,6 +198,19 @@ impl ConfigBuilder {
     }
 
     fn build(self, path: &Path) -> Result<Config, String> {
+        if self.model.is_some() && self.claude_model.is_some() {
+            return Err(cfg_err(
+                path,
+                0,
+                "'model' (OpenCode backend) and 'claude-model' (Claude CLI backend) are mutually exclusive",
+            ));
+        }
+        if self.model.is_some() && self.thinking.is_some() {
+            eprintln!(
+                "warning: {}: 'thinking' directive is only honored by the Claude CLI backend; ignored when 'model' (OpenCode) is set",
+                path.display(),
+            );
+        }
         let mut periodics = self.periodics;
         for (pname, cmd, ln) in self.pending_guard_afters {
             match periodics.iter_mut().find(|p| p.name == pname) {
@@ -172,6 +227,8 @@ impl ConfigBuilder {
             log_dir: self.log_dir,
             image: self.image,
             model: self.model,
+            claude_model: self.claude_model,
+            thinking: self.thinking,
             scope_rules: self.scope_rules,
             guards: self.guards,
             judge_every: self.judge_every,

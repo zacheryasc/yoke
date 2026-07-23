@@ -493,7 +493,7 @@ fn container_home(image: &str) -> String {
 }
 
 /// Build a docker command that runs the claude CLI inside a container.
-fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
+fn build_docker_claude_command(image: &str, claude_args: &[&str], extra_env: &[(&str, String)]) -> Command {
     let workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
@@ -528,6 +528,10 @@ fn build_docker_claude_command(image: &str, claude_args: &[&str]) -> Command {
         if key.starts_with("CLAUDE_") || key.starts_with("ANTHROPIC_") {
             c.arg("-e").arg(format!("{}={}", key, val));
         }
+    }
+
+    for (key, val) in extra_env {
+        c.arg("-e").arg(format!("{}={}", key, val));
     }
 
     if let Some(home) = std::env::var_os("HOME") {
@@ -570,17 +574,28 @@ fn build_command(config: &Config, prompt: &str, resume: Option<&str>) -> Command
                 "--include-partial-messages",
                 "--dangerously-skip-permissions",
             ];
+            if let Some(m) = config.claude_model.as_deref() {
+                claude_args.push("--model");
+                claude_args.push(m);
+            }
             if let Some(sid) = resume {
                 claude_args.push("--resume");
                 claude_args.push(sid);
             }
             claude_args.push("-p");
             claude_args.push(prompt);
+            let extra_env: Vec<(&str, String)> = match config.thinking {
+                Some(t) => vec![("MAX_THINKING_TOKENS", t.max_tokens().to_string())],
+                None => Vec::new(),
+            };
             match config.image {
-                Some(ref image) => build_docker_claude_command(image, &claude_args),
+                Some(ref image) => build_docker_claude_command(image, &claude_args, &extra_env),
                 None => {
                     let mut c = Command::new("claude");
                     c.args(&claude_args);
+                    for (key, val) in &extra_env {
+                        c.env(key, val);
+                    }
                     c
                 }
             }
