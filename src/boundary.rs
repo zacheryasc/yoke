@@ -115,8 +115,8 @@ pub fn check(config: &Config) -> BoundaryResult {
 
     for file in &changed {
         // Skip .loop/ files — they are harness infrastructure, not user code.
-        // The protocol requires Claude to write notes.md, and the harness
-        // itself writes guard-results.md and verdict.md.
+        // The agent writes notes.md, and the harness itself writes
+        // guard-results.md and verdict.md.
         if file.starts_with(".loop/") {
             continue;
         }

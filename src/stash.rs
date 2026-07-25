@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::ansi::{BLUE, BOLD, ORANGE, RESET};
-use crate::{log, log_error, STASH_DIR};
+use crate::{STASH_DIR, log, log_error};
 
 // ── Stash helpers ──────────────────────────────────────────────────────
 
@@ -139,13 +139,7 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
 
     // Append to index
     let index_path = format!("{}/index", STASH_DIR);
-    let line = format!(
-        "{}|{}|{}|{}\n",
-        hash,
-        timestamp,
-        mode,
-        file_names.join(",")
-    );
+    let line = format!("{}|{}|{}|{}\n", hash, timestamp, mode, file_names.join(","));
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -258,9 +252,8 @@ fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
         for entry in dir_entries.flatten() {
             let name = entry.file_name();
             let dest = Path::new(".loop").join(&name);
-            fs::copy(entry.path(), &dest).map_err(|e| {
-                format!("failed to restore {}: {}", name.to_string_lossy(), e)
-            })?;
+            fs::copy(entry.path(), &dest)
+                .map_err(|e| format!("failed to restore {}: {}", name.to_string_lossy(), e))?;
         }
     }
     Ok(())
@@ -317,10 +310,7 @@ pub(crate) fn print_stash_help() {
         ORANGE, BOLD, RESET
     );
     eprintln!();
-    eprintln!(
-        "{}USAGE:{} yoke stash [subcommand]",
-        BOLD, RESET
-    );
+    eprintln!("{}USAGE:{} yoke stash [subcommand]", BOLD, RESET);
     eprintln!();
     eprintln!("{}SUBCOMMANDS:{}", BOLD, RESET);
     eprintln!(

@@ -31,10 +31,7 @@ fn tail_lines(text: &str, max: usize) -> String {
 /// Returns (passed, raw_output, elapsed_secs).
 fn run_one(cmd: &str) -> (bool, String, f64) {
     let start = Instant::now();
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output();
+    let output = Command::new("sh").arg("-c").arg(cmd).output();
     let elapsed_secs = start.elapsed().as_secs_f64();
 
     let (exit_ok, raw_output) = match output {
@@ -91,7 +88,13 @@ pub fn run_guards(guards: &[String], max_tail: usize, results_path: &Path) -> Ve
             Ok(r) => r,
             Err(_) => {
                 // Thread panicked — treat as failure
-                (String::from("(unknown)"), false, String::from("guard thread panicked"), false, 0.0)
+                (
+                    String::from("(unknown)"),
+                    false,
+                    String::from("guard thread panicked"),
+                    false,
+                    0.0,
+                )
             }
         };
 

@@ -47,7 +47,7 @@ The first line of `.loop/notes.md` must be one of:
 
 1. Guards run (diff boundary check + configured guard commands).
 2. If guards pass and STATUS is DONE, the plan loop ends.
-3. Then the judge (a fresh Claude with zero implementation context) verifies the feature.
+3. Then the judge (a fresh OMP session with zero implementation context) verifies the feature.
 4. If the judge says FAIL, you get another brute attempt — your notes are preserved but STATUS is reset to IN_PROGRESS so you re-enter the plan loop with the judge's feedback.
 
 ## Rules

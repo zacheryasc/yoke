@@ -132,7 +132,9 @@ pub fn extract_num(line: &str, key: &str) -> Option<f64> {
 
     // Collect numeric chars: digits, '.', '-', '+', 'e', 'E'
     let num_end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E')
+        .find(|c: char| {
+            !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
+        })
         .unwrap_or(rest.len());
 
     if num_end == 0 {

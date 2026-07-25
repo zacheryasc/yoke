@@ -6,17 +6,16 @@ mod config;
 mod guard;
 mod json;
 mod metrics;
-mod session_trim;
 mod signal;
 mod stash;
 mod stream;
-mod stream_opencode;
+mod stream_omp;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 
-use config::{Backend, Config, Periodic};
+use config::{Config, Periodic};
 
 const CONF_PATH: &str = ".loop/yoke.conf";
 const NOTES_PATH: &str = ".loop/notes.md";
@@ -36,6 +35,9 @@ const DEFAULT_SAGA_PROTOCOL: &str = include_str!("templates/saga/saga-protocol.m
 const DEFAULT_SAGA_WORKER_PROTOCOL: &str = include_str!("templates/saga/protocol.md");
 const DEFAULT_SAGA_JUDGE: &str = include_str!("templates/saga/judge.md");
 const DEFAULT_SAGA_CONF: &str = include_str!("templates/saga/yoke.conf");
+const DEFAULT_GRIND_CONF: &str = include_str!("templates/grind/yoke.conf");
+const DEFAULT_GRIND_PROTOCOL: &str = include_str!("templates/grind/protocol.md");
+const DEFAULT_GRIND_GATE: &str = include_str!("templates/grind/grind-gate.py");
 
 const LAYER_REPL: &str = include_str!("templates/layers/repl.md");
 
@@ -46,6 +48,8 @@ const SAGA_NOTES_PATH: &str = ".loop/saga-notes.md";
 const SAGA_LOG_PATH: &str = ".loop/saga-log.md";
 const DECISIONS_PATH: &str = ".loop/decisions.md";
 const SUB_PLAN_PATH: &str = ".loop/sub-plan.md";
+const GRIND_GATE_PATH: &str = ".loop/grind-gate.py";
+const CSTAT_BASELINE_PATH: &str = ".loop/cstat-baseline.json";
 pub(crate) const STASH_DIR: &str = ".loop/.stash";
 
 /// Parse the plan file and notes.md to determine stage progress.
@@ -102,7 +106,10 @@ pub(crate) fn log(msg: &str) {
 }
 
 pub(crate) fn log_error(msg: &str) {
-    eprintln!("{}{}[yoke]{} {}{}ERROR:{} {}", ORANGE, BOLD, RESET, BOLD, RED, RESET, msg);
+    eprintln!(
+        "{}{}[yoke]{} {}{}ERROR:{} {}",
+        ORANGE, BOLD, RESET, BOLD, RED, RESET, msg
+    );
 }
 
 fn get_layer(name: &str) -> Option<(&'static str, &'static str)> {
@@ -138,7 +145,10 @@ fn apply_layers(names_arg: &str) -> i32 {
         let (heading, layer_content) = match get_layer(name) {
             Some(v) => v,
             None => {
-                log_error(&format!("unknown layer '{}' — use 'yoke layer --list'", name));
+                log_error(&format!(
+                    "unknown layer '{}' — use 'yoke layer --list'",
+                    name
+                ));
                 return 2;
             }
         };
@@ -199,15 +209,9 @@ fn print_layer_help() {
 }
 
 fn print_usage() {
-    eprintln!(
-        "{}{}[yoke]{} LLM loop harness",
-        ORANGE, BOLD, RESET
-    );
+    eprintln!("{}{}[yoke]{} LLM loop harness", ORANGE, BOLD, RESET);
     eprintln!();
-    eprintln!(
-        "{}USAGE:{} yoke <command> [options]",
-        BOLD, RESET
-    );
+    eprintln!("{}USAGE:{} yoke <command> [options]", BOLD, RESET);
     eprintln!();
     eprintln!("{}COMMANDS:{}", BOLD, RESET);
     eprintln!(
@@ -223,6 +227,10 @@ fn print_usage() {
         BOLD, RESET
     );
     eprintln!(
+        "  {}init grind{}      Initialize .loop/ for grind mode (cstat cleanup loop)",
+        BOLD, RESET
+    );
+    eprintln!(
         "  {}clean{}            Reset .loop/ working files to blank slate",
         BOLD, RESET
     );
@@ -235,11 +243,11 @@ fn print_usage() {
         BOLD, RESET
     );
     eprintln!(
-        "  {}run{}              Launch the loop (invoke Claude, run guards, iterate)",
+        "  {}run{}              Launch the loop (invoke OMP, run guards, iterate)",
         BOLD, RESET
     );
     eprintln!(
-        "  {}run --dry-run{}    Single iteration: boundary check + guards only, no Claude",
+        "  {}run --dry-run{}    Single iteration: boundary check + guards only, no OMP",
         BOLD, RESET
     );
     eprintln!(
@@ -250,10 +258,7 @@ fn print_usage() {
     eprintln!("{}OPTIONS:{}", BOLD, RESET);
     eprintln!("  --help, -h       Show this help message");
     eprintln!();
-    eprintln!(
-        "{}CONFIG:{}  {}{}",
-        BOLD, RESET, DIM, CONF_PATH
-    );
+    eprintln!("{}CONFIG:{}  {}{}", BOLD, RESET, DIM, CONF_PATH);
     eprintln!(
         "{}EXIT:{}   0=success  1=guard failure  2=usage error",
         BOLD, RESET
@@ -261,26 +266,36 @@ fn print_usage() {
 }
 
 fn print_run_help() {
-    eprintln!(
-        "{}{}[yoke run]{} execute the loop",
-        ORANGE, BOLD, RESET
-    );
+    eprintln!("{}{}[yoke run]{} execute the loop", ORANGE, BOLD, RESET);
     eprintln!();
     eprintln!(
-        "{}USAGE:{} yoke run [--dry-run]",
+        "{}USAGE:{} yoke run [--dry-run] [--no-sandbox]",
         BOLD, RESET
     );
     eprintln!();
     eprintln!("{}OPTIONS:{}", BOLD, RESET);
-    eprintln!("  --dry-run       Run one iteration without invoking Claude");
+    eprintln!("  --dry-run       Run one iteration without invoking OMP");
     eprintln!("                  (boundary check + configured guards only)");
-    eprintln!("  --no-sandbox    Allow running without a container image");
+    eprintln!("  --no-sandbox    Accepted for compatibility; OMP runs locally when image is unset");
     eprintln!();
     eprintln!("{}MODES:{}", BOLD, RESET);
     eprintln!("  Detected automatically from .loop/ contents.");
-    eprintln!("  {}saga{}    Scoper + brute loop — detected when {} exists.", BOLD, RESET, SPECIFICATION_PATH);
-    eprintln!("  {}brute{}   Plan stages + judge — detected when {} exists.", BOLD, RESET, JUDGE_PATH);
-    eprintln!("  {}loop{}    (default) Staged plan loop — iterates until STATUS: DONE and guards pass.", BOLD, RESET);
+    eprintln!(
+        "  {}saga{}    Scoper + brute loop — detected when {} exists.",
+        BOLD, RESET, SPECIFICATION_PATH
+    );
+    eprintln!(
+        "  {}brute{}   Plan stages + judge — detected when {} exists.",
+        BOLD, RESET, JUDGE_PATH
+    );
+    eprintln!(
+        "  {}grind{}   cstat cleanup loop — detected when {} and {} exist.",
+        BOLD, RESET, GRIND_GATE_PATH, CSTAT_BASELINE_PATH
+    );
+    eprintln!(
+        "  {}loop{}    (default) Staged plan loop — iterates until STATUS: DONE and guards pass.",
+        BOLD, RESET
+    );
     eprintln!();
     eprintln!("{}WORKFLOW (saga):{}", BOLD, RESET);
     eprintln!("  1. Load config from {}", CONF_PATH);
@@ -296,7 +311,7 @@ fn print_run_help() {
     eprintln!("  2. Backup protected files (protocol.md, plan.md, yoke.conf)");
     eprintln!("  3. Per iteration:");
     eprintln!("     a. Restore protected files");
-    eprintln!("     b. Invoke Claude with stream-json output");
+    eprintln!("     b. Invoke OMP with JSON output");
     eprintln!("     c. Run diff boundary check");
     eprintln!("     d. Run configured guard commands");
     eprintln!("  4. Exit when STATUS: DONE and all guards pass");
@@ -307,7 +322,7 @@ fn print_run_help() {
     eprintln!("  3. Per brute attempt:");
     eprintln!("     a. Restore protected files, clear verdict");
     eprintln!("     b. Run plan loop (stages + guards until DONE)");
-    eprintln!("     c. Invoke judge (fresh Claude, zero context)");
+    eprintln!("     c. Invoke judge (fresh OMP session, zero context)");
     eprintln!("     d. If judge FAILs, reset STATUS and retry");
     eprintln!("  4. Exit when judge returns VERDICT: PASS");
 }
@@ -318,24 +333,31 @@ fn print_init_help() {
         ORANGE, BOLD, RESET
     );
     eprintln!();
-    eprintln!(
-        "{}USAGE:{} yoke init [brute|saga]",
-        BOLD, RESET
-    );
+    eprintln!("{}USAGE:{} yoke init [brute|saga|grind]", BOLD, RESET);
     eprintln!();
     eprintln!("{}MODES:{}", BOLD, RESET);
     eprintln!("  {}(default){}  Staged plan loop. Creates:", BOLD, RESET);
     eprintln!("              yoke.conf, protocol.md, briefing.md, plan.md, notes.md,");
     eprintln!("              guard-results.md");
     eprintln!();
-    eprintln!("  {}brute{}      Plan stages + judge. Creates:", BOLD, RESET);
+    eprintln!(
+        "  {}brute{}      Plan stages + judge. Creates:",
+        BOLD, RESET
+    );
     eprintln!("              yoke.conf, protocol.md, briefing.md, plan.md, judge.md,");
     eprintln!("              notes.md, verdict.md, guard-results.md");
     eprintln!();
-    eprintln!("  {}saga{}       Scoper + brute loop. Creates:", BOLD, RESET);
+    eprintln!(
+        "  {}saga{}       Scoper + brute loop. Creates:",
+        BOLD, RESET
+    );
     eprintln!("              yoke.conf, saga-protocol.md, protocol.md, judge.md,");
     eprintln!("              specification.md, saga-notes.md, decisions.md,");
     eprintln!("              sub-plan.md, notes.md, verdict.md, guard-results.md");
+    eprintln!();
+    eprintln!("  {}grind{}      cstat cleanup loop. Creates:", BOLD, RESET);
+    eprintln!("              yoke.conf, protocol.md, grind-gate.py,");
+    eprintln!("              cstat-baseline.json, notes.md, guard-results.md");
     eprintln!();
     eprintln!("Existing files are never overwritten.");
     eprintln!();
@@ -346,17 +368,16 @@ fn print_init_help() {
 
 /// Holds loop state and cleans up on drop.
 ///
-/// Drop kills any running Claude child process and removes the backup
+/// Drop kills any running OMP child process and removes the backup
 /// directory. Note: Drop does not run on raw SIGINT — the child process
 /// shares the process group and receives the signal directly, and the
 /// backup temp dir is small and inconsequential.
 struct LoopRunner {
     backup_dir: PathBuf,
     child: Option<Child>,
-    /// Claude session id from the most recent agent invocation. When `Some`,
-    /// the next worker invocation will `--resume` it so the prompt cache and
-    /// the trimmed conversation prefix carry forward. Cleared on stash
-    /// checkout / mode switch / explicit reset.
+    /// OMP session id from the most recent worker invocation. When `Some`,
+    /// the next worker invocation will `--resume` it so conversation context
+    /// carries forward. Cleared on stash checkout / mode switch / explicit reset.
     last_session_id: Option<String>,
 }
 
@@ -384,16 +405,23 @@ impl Drop for LoopRunner {
 }
 
 /// Check that required loop files exist, create notes if missing.
+/// `plan_path` is required for plan-driven modes and absent for grind.
 ///
 /// When `clear_guard_results` is true (standalone loop), guard-results.md is
 /// cleared on entry. When false (nested inside brute), the previous attempt's
 /// guard feedback is preserved so the worker can read it.
-fn preflight(plan_path: &str, clear_guard_results: bool) {
-    for path in &[PROTOCOL_PATH, plan_path, CONF_PATH] {
+fn preflight(plan_path: Option<&str>, clear_guard_results: bool) {
+    for path in [PROTOCOL_PATH, CONF_PATH] {
         if !Path::new(path).exists() {
             log_error(&format!("required file not found: {}", path));
             process::exit(1);
         }
+    }
+    if let Some(path) = plan_path
+        && !Path::new(path).exists()
+    {
+        log_error(&format!("required file not found: {}", path));
+        process::exit(1);
     }
     // Ensure notes file exists
     if !Path::new(NOTES_PATH).exists()
@@ -481,19 +509,46 @@ fn reset_notes_status() {
 /// Detect the home directory of the default user inside a Docker image.
 fn container_home(image: &str) -> String {
     let output = Command::new("docker")
-        .args(["run", "--rm", "--entrypoint", "sh", image, "-c", "echo $HOME"])
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            "echo $HOME",
+        ])
         .output();
     match output {
         Ok(o) if o.status.success() => {
             let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if h.is_empty() { "/home/sandbox".to_string() } else { h }
+            if h.is_empty() {
+                "/home/sandbox".to_string()
+            } else {
+                h
+            }
         }
         _ => "/home/sandbox".to_string(),
     }
 }
 
-/// Build a docker command that runs the claude CLI inside a container.
-fn build_docker_claude_command(image: &str, claude_args: &[&str], extra_env: &[(&str, String)]) -> Command {
+fn should_forward_env(key: &str) -> bool {
+    key.starts_with("OMP_")
+        || key.starts_with("PI_")
+        || key.starts_with("ANTHROPIC_")
+        || key.starts_with("OPENAI_")
+        || key.starts_with("GEMINI_")
+        || key.starts_with("OPENROUTER_")
+        || key.starts_with("CLAUDE_CODE_")
+        || key.starts_with("FOUNDRY_")
+        || key == "NODE_EXTRA_CA_CERTS"
+        || key.ends_with("_API_KEY")
+        || key.ends_with("_OAUTH_TOKEN")
+        || key.ends_with("_ACCESS_TOKEN")
+}
+
+/// Build a docker command that runs OMP inside a container.
+fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Command {
     let workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
@@ -510,7 +565,7 @@ fn build_docker_claude_command(image: &str, claude_args: &[&str], extra_env: &[(
         "--cap-add=NET_ADMIN",
         "--cap-add=NET_RAW",
     ]);
-    c.args(["--entrypoint", "claude"]);
+    c.args(["--entrypoint", "omp"]);
     c.arg("-v").arg(format!("{}:/workspace", workdir));
     c.arg("-w").arg("/workspace");
 
@@ -525,92 +580,59 @@ fn build_docker_claude_command(image: &str, claude_args: &[&str], extra_env: &[(
     }
 
     for (key, val) in std::env::vars() {
-        if key.starts_with("CLAUDE_") || key.starts_with("ANTHROPIC_") {
+        if should_forward_env(&key) {
             c.arg("-e").arg(format!("{}={}", key, val));
         }
     }
 
-    for (key, val) in extra_env {
-        c.arg("-e").arg(format!("{}={}", key, val));
-    }
-
     if let Some(home) = std::env::var_os("HOME") {
         let home_path = PathBuf::from(&home);
-        let claude_dir = home_path.join(".claude");
-        if claude_dir.exists() {
-            c.arg("-v").arg(format!(
-                "{}:{}/.claude",
-                claude_dir.display(),
-                container_home
-            ));
-        }
-        let claude_json = home_path.join(".claude.json");
-        if claude_json.exists() {
-            c.arg("-v").arg(format!(
-                "{}:{}/.claude.json",
-                claude_json.display(),
-                container_home
-            ));
+        let omp_dir = home_path.join(".omp");
+        if omp_dir.exists() {
+            c.arg("-v")
+                .arg(format!("{}:{}/.omp", omp_dir.display(), container_home));
         }
     }
 
     c.arg(image);
-    c.args(claude_args);
+    c.args(omp_args);
     c
 }
 
-/// Build a Command for invoking the agent backend.
+fn build_omp_args(config: &Config, prompt: &str, resume: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "--mode".to_string(),
+        "json".to_string(),
+        "--auto-approve".to_string(),
+    ];
+    if let Some(model) = config.model.as_deref() {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(thinking) = config.thinking {
+        args.push("--thinking".to_string());
+        args.push(thinking.as_omp_arg().to_string());
+    }
+    if let Some(sid) = resume {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+    args.push("-p".to_string());
+    args.push(prompt.to_string());
+    args
+}
+
+/// Build a Command for invoking OMP.
 ///
-/// `resume` carries a Claude session id when the harness wants to continue
-/// the previous round's conversation (preserves prompt cache + the trimmed
-/// JSONL prefix). `None` produces a fresh session. OpenCode ignores it.
+/// `resume` carries an OMP session id when the harness wants to continue the
+/// previous round's conversation. `None` produces a fresh session.
 fn build_command(config: &Config, prompt: &str, resume: Option<&str>) -> Command {
-    match config.backend() {
-        Backend::Claude => {
-            let mut claude_args: Vec<&str> = vec![
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--include-partial-messages",
-                "--dangerously-skip-permissions",
-            ];
-            if let Some(m) = config.claude_model.as_deref() {
-                claude_args.push("--model");
-                claude_args.push(m);
-            }
-            if let Some(sid) = resume {
-                claude_args.push("--resume");
-                claude_args.push(sid);
-            }
-            claude_args.push("-p");
-            claude_args.push(prompt);
-            let extra_env: Vec<(&str, String)> = match config.thinking {
-                Some(t) => vec![("MAX_THINKING_TOKENS", t.max_tokens().to_string())],
-                None => Vec::new(),
-            };
-            match config.image {
-                Some(ref image) => build_docker_claude_command(image, &claude_args, &extra_env),
-                None => {
-                    let mut c = Command::new("claude");
-                    c.args(&claude_args);
-                    for (key, val) in &extra_env {
-                        c.env(key, val);
-                    }
-                    c
-                }
-            }
-        }
-        Backend::OpenCode => {
-            let model = config.model.as_ref().expect("model must be set for OpenCode backend");
-            let mut c = Command::new("opencode");
-            c.args([
-                "run",
-                "--format",
-                "json",
-                "--model",
-                model,
-                prompt,
-            ]);
+    let omp_args = build_omp_args(config, prompt, resume);
+    match &config.image {
+        Some(image) => build_docker_omp_command(image, &omp_args),
+        None => {
+            let mut c = Command::new("omp");
+            c.args(&omp_args);
             c
         }
     }
@@ -642,8 +664,7 @@ fn invoke_process(
     prior_total: f64,
     resume: Option<&str>,
 ) -> AgentRunStats {
-    let backend = config.backend();
-    let in_container = config.image.is_some() && backend == Backend::Claude;
+    let in_container = config.image.is_some();
     let wall_start = std::time::Instant::now();
 
     log(&format!(
@@ -667,10 +688,10 @@ fn invoke_process(
     {
         Ok(c) => c,
         Err(e) => {
-            let bin = match backend {
-                Backend::Claude if config.image.is_some() => "docker",
-                Backend::Claude => "claude",
-                Backend::OpenCode => "opencode",
+            let bin = if config.image.is_some() {
+                "docker"
+            } else {
+                "omp"
             };
             log_error(&format!("failed to spawn '{}': {}", bin, e));
             return AgentRunStats {
@@ -683,20 +704,18 @@ fn invoke_process(
 
     signal::set_child_pid(child.id() as i32);
 
-    let log_path = config.log_dir.as_ref().map(|dir| {
-        PathBuf::from(dir).join(format!("{}-{}.jsonl", log_prefix, iteration))
-    });
+    let log_path = config
+        .log_dir
+        .as_ref()
+        .map(|dir| PathBuf::from(dir).join(format!("{}-{}.jsonl", log_prefix, iteration)));
 
     let mut summary = stream::StreamSummary::default();
     if let Some(stdout) = child.stdout.take() {
         runner.child = Some(child);
-        summary = match backend {
-            Backend::Claude => stream::filter_stream(stdout, log_path.as_deref(), prior_total),
-            Backend::OpenCode => stream_opencode::filter_stream(stdout, log_path.as_deref(), prior_total),
-        };
+        summary = stream_omp::filter_stream(stdout, log_path.as_deref(), prior_total);
         // Kill the child after streaming ends — prevents deadlock if it
         // ignores SIGPIPE and keeps writing.  No-op if already exited.
-        if let Some(ref mut ch) = runner.child {
+        if let Some(ch) = &mut runner.child {
             let _ = ch.kill();
         }
         if signal::interrupted() {
@@ -710,7 +729,7 @@ fn invoke_process(
         runner.child = Some(child);
     }
 
-    let status = if let Some(ref mut child) = runner.child {
+    let status = if let Some(child) = &mut runner.child {
         match child.wait() {
             Ok(s) => {
                 if signal::interrupted() {
@@ -747,15 +766,23 @@ fn invoke_process(
 }
 
 /// Invoke the agent, piping stdout through the stream filter.
-fn invoke_agent(runner: &mut LoopRunner, config: &Config, iteration: u32, prior_total: f64) -> AgentRunStats {
+fn invoke_agent(
+    runner: &mut LoopRunner,
+    config: &Config,
+    iteration: u32,
+    prior_total: f64,
+) -> AgentRunStats {
     let prompt = "Read .loop/protocol.md and follow its instructions.";
-    let label = match config.backend() {
-        Backend::Claude => "Claude",
-        Backend::OpenCode => "OpenCode",
-    };
+    let label = "OMP";
     let resume = runner.last_session_id.clone();
     let stats = invoke_process(
-        runner, config, prompt, label, "iteration", iteration, prior_total,
+        runner,
+        config,
+        prompt,
+        label,
+        "iteration",
+        iteration,
+        prior_total,
         resume.as_deref(),
     );
     if let Some(sid) = stats.stream.session_id.clone() {
@@ -768,57 +795,25 @@ fn invoke_agent(runner: &mut LoopRunner, config: &Config, iteration: u32, prior_
 /// Returns true if the invocation succeeded.
 ///
 /// Periodic agents always run in a fresh session: they have a different
-/// protocol than the main worker and conflating their conversation prefix
-/// with the worker's would poison the worker's prompt cache. Periodics
-/// don't update `runner.last_session_id`.
-fn invoke_periodic(runner: &mut LoopRunner, config: &Config, periodic: &Periodic, iteration: u32) -> bool {
+/// protocol than the main worker. They don't update `runner.last_session_id`.
+fn invoke_periodic(
+    runner: &mut LoopRunner,
+    config: &Config,
+    periodic: &Periodic,
+    iteration: u32,
+) -> bool {
     let prompt = format!("Read {} and follow its instructions.", periodic.path);
     let stats = invoke_process(
-        runner, config, &prompt, &periodic.name,
-        &format!("periodic-{}", periodic.name), iteration, 0.0,
+        runner,
+        config,
+        &prompt,
+        &periodic.name,
+        &format!("periodic-{}", periodic.name),
+        iteration,
+        0.0,
         None,
     );
     stats.success
-}
-
-/// Trim the worker's resumed Claude session in place. No-op on first
-/// iteration (no prior session), on docker/sandboxed runs (session file is
-/// inside the container — out of reach), or if the agent didn't declare a
-/// KEEP list. Any failure is logged and swallowed: better to over-pay
-/// than to break the resume.
-fn trim_worker_session(runner: &LoopRunner) {
-    let Some(sid) = runner.last_session_id.as_deref() else { return };
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
-    let Ok(cwd) = std::env::current_dir() else { return };
-    let session_path = session_trim::session_file_path(&home, &cwd, sid);
-    if !session_path.exists() {
-        // Sandboxed (in-container) sessions live in the container's HOME, not the host's.
-        return;
-    }
-    let notes_text = match std::fs::read_to_string(NOTES_PATH) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    let keep = session_trim::parse_keep_list(&notes_text, &cwd);
-    match session_trim::trim_session(&session_path, &keep) {
-        Ok(stats) if stats.skipped => {}
-        Ok(stats) => {
-            log(&format!(
-                "Session trim: kept {}/{} records ({} dropped); KEEP={}",
-                stats.records_kept,
-                stats.records_total,
-                stats.records_dropped,
-                if stats.keep_paths.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    stats.keep_paths.join(" ")
-                }
-            ));
-        }
-        Err(e) => {
-            log_error(&format!("Session trim failed (resuming anyway): {}", e));
-        }
-    }
 }
 
 /// Render a box-drawn iteration banner to stderr.
@@ -828,23 +823,45 @@ fn render_iteration_banner(label: &str, iteration: u32, nested: bool) {
     // Pad content to fill inner width of 38 characters
     let inner = format!("{:^38}", content);
     if nested {
-        eprintln!("{}{}┌──────────────────────────────────────┐{}", BOLD, ORANGE, RESET);
+        eprintln!(
+            "{}{}┌──────────────────────────────────────┐{}",
+            BOLD, ORANGE, RESET
+        );
         eprintln!("{}{}│{}│{}", BOLD, ORANGE, inner, RESET);
-        eprintln!("{}{}└──────────────────────────────────────┘{}", BOLD, ORANGE, RESET);
+        eprintln!(
+            "{}{}└──────────────────────────────────────┘{}",
+            BOLD, ORANGE, RESET
+        );
     } else {
-        eprintln!("{}{}╔══════════════════════════════════════╗{}", BOLD, ORANGE, RESET);
+        eprintln!(
+            "{}{}╔══════════════════════════════════════╗{}",
+            BOLD, ORANGE, RESET
+        );
         eprintln!("{}{}║{}║{}", BOLD, ORANGE, inner, RESET);
-        eprintln!("{}{}╚══════════════════════════════════════╝{}", BOLD, ORANGE, RESET);
+        eprintln!(
+            "{}{}╚══════════════════════════════════════╝{}",
+            BOLD, ORANGE, RESET
+        );
     }
 }
 
 /// Render a named section banner to stderr (for judge, periodic, etc.).
 fn render_section_banner(title: &str, subtitle: &str, color: &str) {
     let fill_len = 40usize.saturating_sub(title.len() + 4); // "┌─ Title ──...──┐"
-    eprintln!("{}{}┌─ {} {}┐{}", BOLD, color, title, "─".repeat(fill_len), RESET);
+    eprintln!(
+        "{}{}┌─ {} {}┐{}",
+        BOLD,
+        color,
+        title,
+        "─".repeat(fill_len),
+        RESET
+    );
     let inner = format!("  {:<38}", subtitle);
     eprintln!("{}{}│{}│{}", BOLD, color, inner, RESET);
-    eprintln!("{}{}└────────────────────────────────────────┘{}", BOLD, color, RESET);
+    eprintln!(
+        "{}{}└────────────────────────────────────────┘{}",
+        BOLD, color, RESET
+    );
 }
 
 /// Render a box-drawn table of guard results to stderr.
@@ -852,11 +869,26 @@ fn render_guard_table(results: &[guard::GuardResult]) {
     if results.is_empty() {
         return;
     }
-    let cmd_w = results.iter().map(|r| r.name.len()).max().unwrap_or(10).max(10);
+    let cmd_w = results
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
     let stat_w = 8;
     let time_w = 6;
-    let top    = format!("  ┌{}┬{}┬{}┐", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
-    let bottom = format!("  └{}┴{}┴{}┘", "─".repeat(cmd_w + 2), "─".repeat(stat_w), "─".repeat(time_w + 1));
+    let top = format!(
+        "  ┌{}┬{}┬{}┐",
+        "─".repeat(cmd_w + 2),
+        "─".repeat(stat_w),
+        "─".repeat(time_w + 1)
+    );
+    let bottom = format!(
+        "  └{}┴{}┴{}┘",
+        "─".repeat(cmd_w + 2),
+        "─".repeat(stat_w),
+        "─".repeat(time_w + 1)
+    );
     eprintln!("{}", top);
     for r in results {
         let cmd_padded = format!("{:<w$}", r.name, w = cmd_w);
@@ -893,7 +925,10 @@ fn run_periodic_guards(periodic: &Periodic, max_tail: usize) {
     if !all_passed {
         log(&format!(
             "{}WARNING: periodic '{}' guard(s) failed — results in {}{}",
-            ORANGE, periodic.name, format!(".loop/periodic-{}-results.md", periodic.name), RESET
+            ORANGE,
+            periodic.name,
+            format!(".loop/periodic-{}-results.md", periodic.name),
+            RESET
         ));
     }
 }
@@ -994,7 +1029,16 @@ VERDICT: FAIL
 <what you tested, what went wrong, and what the correct behavior should be>";
 
     // Judge is always a fresh session — independence per behavioral-specification §2.1.
-    let stats = invoke_process(runner, config, judge_prompt, "judge", "judge", iteration, 0.0, None);
+    let stats = invoke_process(
+        runner,
+        config,
+        judge_prompt,
+        "judge",
+        "judge",
+        iteration,
+        0.0,
+        None,
+    );
     if !stats.success {
         return false;
     }
@@ -1056,7 +1100,11 @@ fn render_violation_tree(violations: &[String]) {
     let dir_count = dirs.len();
     for (di, dir) in dirs.iter().enumerate() {
         let is_last_dir = di + 1 == dir_count;
-        let dir_prefix = if is_last_dir { "└── " } else { "├── " };
+        let dir_prefix = if is_last_dir {
+            "└── "
+        } else {
+            "├── "
+        };
         let child_prefix = if is_last_dir { "    " } else { "│   " };
 
         eprintln!("  {}{}{}/{}", dir_prefix, DIM, dir, RESET);
@@ -1065,7 +1113,11 @@ fn render_violation_tree(violations: &[String]) {
         let file_count = files.len();
         for (fi, (file, reason)) in files.iter().enumerate() {
             let is_last_file = fi + 1 == file_count;
-            let file_conn = if is_last_file { "└── " } else { "├── " };
+            let file_conn = if is_last_file {
+                "└── "
+            } else {
+                "├── "
+            };
             eprintln!(
                 "  {}{}{}✗{} {} {}{}{}",
                 child_prefix, file_conn, RED, RESET, file, DIM, reason, RESET
@@ -1113,7 +1165,10 @@ fn run_all_guards(config: &Config) -> GuardOutcome {
             md.push_str("```\nSkipped due to diff boundary violation.\n```\n\n");
         }
         let _ = fs::write(GUARD_RESULTS_PATH, &md);
-        return GuardOutcome { passed: false, guard_results: Vec::new() };
+        return GuardOutcome {
+            passed: false,
+            guard_results: Vec::new(),
+        };
     }
 
     // Boundary passed — write that to results then run configured guards
@@ -1133,7 +1188,10 @@ fn run_all_guards(config: &Config) -> GuardOutcome {
 
     render_guard_table(&guard_results);
 
-    GuardOutcome { passed: all_passed, guard_results }
+    GuardOutcome {
+        passed: all_passed,
+        guard_results,
+    }
 }
 
 fn print_clean_help() {
@@ -1142,10 +1200,7 @@ fn print_clean_help() {
         ORANGE, BOLD, RESET
     );
     eprintln!();
-    eprintln!(
-        "{}USAGE:{} yoke clean",
-        BOLD, RESET
-    );
+    eprintln!("{}USAGE:{} yoke clean", BOLD, RESET);
     eprintln!();
     eprintln!("Clears working files back to a blank slate:");
     eprintln!("  plan.md, notes.md, verdict.md, guard-results.md  →  emptied");
@@ -1156,7 +1211,10 @@ fn print_clean_help() {
     eprintln!("  protocol.md, saga-protocol.md, yoke.conf, briefing.md, specification.md");
     eprintln!();
     eprintln!("Non-empty working files are auto-stashed to .loop/.stash/ before wiping.");
-    eprintln!("Browse with: {}yoke stash log{}   Recover with: {}yoke stash pop{}", BOLD, RESET, BOLD, RESET);
+    eprintln!(
+        "Browse with: {}yoke stash log{}   Recover with: {}yoke stash pop{}",
+        BOLD, RESET, BOLD, RESET
+    );
 }
 
 fn clean() -> i32 {
@@ -1174,8 +1232,13 @@ fn clean() -> i32 {
 
     // Clear working files to empty
     for path in &[
-        PLAN_PATH, NOTES_PATH, VERDICT_PATH, GUARD_RESULTS_PATH,
-        SAGA_NOTES_PATH, DECISIONS_PATH, SUB_PLAN_PATH,
+        PLAN_PATH,
+        NOTES_PATH,
+        VERDICT_PATH,
+        GUARD_RESULTS_PATH,
+        SAGA_NOTES_PATH,
+        DECISIONS_PATH,
+        SUB_PLAN_PATH,
     ] {
         let p = Path::new(path);
         if p.exists() {
@@ -1191,7 +1254,11 @@ fn clean() -> i32 {
     let judge = Path::new(JUDGE_PATH);
     if judge.exists() {
         let is_saga = Path::new(SPECIFICATION_PATH).exists();
-        let template = if is_saga { DEFAULT_SAGA_JUDGE } else { DEFAULT_JUDGE };
+        let template = if is_saga {
+            DEFAULT_SAGA_JUDGE
+        } else {
+            DEFAULT_JUDGE
+        };
         if let Err(e) = fs::write(judge, template) {
             log_error(&format!("failed to reset {}: {}", JUDGE_PATH, e));
             return 1;
@@ -1208,7 +1275,6 @@ fn clean() -> i32 {
     }
     0
 }
-
 
 /// Return the list of (path, default_content) pairs for a given mode.
 fn mode_files(mode: &str) -> Option<Vec<(&'static str, &'static str)>> {
@@ -1245,6 +1311,14 @@ fn mode_files(mode: &str) -> Option<Vec<(&'static str, &'static str)>> {
             (VERDICT_PATH, ""),
             (GUARD_RESULTS_PATH, ""),
         ],
+        "grind" => vec![
+            (CONF_PATH, DEFAULT_GRIND_CONF),
+            (PROTOCOL_PATH, DEFAULT_GRIND_PROTOCOL),
+            (GRIND_GATE_PATH, DEFAULT_GRIND_GATE),
+            (CSTAT_BASELINE_PATH, ""),
+            (NOTES_PATH, ""),
+            (GUARD_RESULTS_PATH, ""),
+        ],
         _ => return None,
     })
 }
@@ -1258,6 +1332,8 @@ fn detect_mode() -> Option<&'static str> {
         Some("saga")
     } else if Path::new(JUDGE_PATH).exists() {
         Some("brute")
+    } else if Path::new(GRIND_GATE_PATH).exists() && Path::new(CSTAT_BASELINE_PATH).exists() {
+        Some("grind")
     } else if Path::new(PROTOCOL_PATH).exists() {
         Some("loop")
     } else {
@@ -1296,9 +1372,52 @@ fn switch_mode(current: &str, target: &str) -> i32 {
         }
         log(&format!("created: {}", path));
     }
+    if target == "grind" {
+        capture_grind_baseline_if_missing();
+    }
 
     log(&format!("Switched from '{}' to '{}' mode", current, target));
     0
+}
+
+fn capture_grind_baseline_if_missing() {
+    let path = Path::new(CSTAT_BASELINE_PATH);
+    if path.exists() && fs::read_to_string(path).is_ok_and(|s| !s.trim().is_empty()) {
+        log(&format!("skip (exists): {}", CSTAT_BASELINE_PATH));
+        return;
+    }
+
+    let output = Command::new("cstat")
+        .args(["--path", ".", "--json", "scorecard"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            if let Err(e) = fs::write(path, out.stdout) {
+                log_error(&format!("failed to write {}: {}", CSTAT_BASELINE_PATH, e));
+            } else {
+                log(&format!(
+                    "captured cstat scorecard baseline: {}",
+                    CSTAT_BASELINE_PATH
+                ));
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            log(&format!(
+                "WARNING: cstat baseline not captured; `cstat --path . --json scorecard` exited with {}{}{}",
+                out.status,
+                if stderr.trim().is_empty() { "" } else { ": " },
+                stderr.trim()
+            ));
+        }
+        Err(e) => {
+            log(&format!(
+                "WARNING: cstat baseline not captured; failed to run cstat: {}",
+                e
+            ));
+        }
+    }
 }
 
 fn init(mode: &str) -> i32 {
@@ -1313,7 +1432,10 @@ fn init(mode: &str) -> i32 {
     // Detect current mode — if different, do a backup/restore switch
     match detect_mode() {
         Some(current) if current != mode => {
-            log(&format!("Switching from '{}' to '{}' mode...", current, mode));
+            log(&format!(
+                "Switching from '{}' to '{}' mode...",
+                current, mode
+            ));
             return switch_mode(current, mode);
         }
         _ => {} // fresh init or same-mode idempotent
@@ -1343,6 +1465,9 @@ fn init(mode: &str) -> i32 {
         }
     }
 
+    if mode == "grind" {
+        capture_grind_baseline_if_missing();
+    }
     0
 }
 
@@ -1470,11 +1595,7 @@ fn validate_loop_config(config: &Config) {
 }
 
 /// Fire any periodic agents whose cadence matches this iteration.
-fn fire_periodic_agents(
-    runner: &mut LoopRunner,
-    config: &Config,
-    iteration: u32,
-) {
+fn fire_periodic_agents(runner: &mut LoopRunner, config: &Config, iteration: u32) {
     for periodic in &config.periodics {
         if iteration % periodic.cadence == 0 {
             eprintln!();
@@ -1513,7 +1634,9 @@ fn run_hooks(config: &Config, iteration: u32) {
                 log(&format!(
                     "{}WARNING: hook exited with {}: {}{}",
                     ORANGE,
-                    status.code().map_or("signal".to_string(), |c| c.to_string()),
+                    status
+                        .code()
+                        .map_or("signal".to_string(), |c| c.to_string()),
                     cmd,
                     RESET
                 ));
@@ -1555,25 +1678,21 @@ fn run_iteration_step(
     iteration: u32,
     prior_total: f64,
     dry_run: bool,
+    protected: &[&str],
 ) -> IterationStepResult {
     if dry_run {
-        log(&format!(
-            "(dry-run) Skipping {} invocation",
-            match config.backend() {
-                Backend::Claude => "Claude",
-                Backend::OpenCode => "OpenCode",
-            }
-        ));
+        log("(dry-run) Skipping OMP invocation");
     } else {
         let stats = invoke_agent(runner, config, iteration, prior_total);
         if !stats.success {
-            log_error("Claude invocation failed — aborting loop");
+            log_error("OMP invocation failed — aborting loop");
             return IterationStepResult::Terminal(PlanLoopOutcome::Error);
         }
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
             return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
         }
+        restore_files(&runner.backup_dir, protected);
         let guards_start = std::time::Instant::now();
         let guard_outcome = run_all_guards(config);
         let guards_secs = guards_start.elapsed().as_secs_f64();
@@ -1581,7 +1700,7 @@ fn run_iteration_step(
             log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
         } else {
             log(&format!(
-                "{}Some guards failed \u{2014} Claude will see results next iteration{}",
+                "{}Some guards failed \u{2014} OMP will see results next iteration{}",
                 ORANGE, RESET
             ));
         }
@@ -1595,15 +1714,14 @@ fn run_iteration_step(
     }
 
     // Dry-run path: run guards and exit after one iteration.
+    restore_files(&runner.backup_dir, protected);
     let guard_outcome = run_all_guards(config);
     if guard_outcome.passed {
         log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
         log("(dry-run) Guards passed \u{2014} exiting after one iteration");
         IterationStepResult::Terminal(PlanLoopOutcome::Done)
     } else {
-        log(&format!(
-            "{}Some guards failed{}", ORANGE, RESET
-        ));
+        log(&format!("{}Some guards failed{}", ORANGE, RESET));
         log("(dry-run) Exiting after one iteration");
         IterationStepResult::Terminal(PlanLoopOutcome::Error)
     }
@@ -1612,13 +1730,13 @@ fn run_iteration_step(
 /// Core plan-loop runner that can be called standalone or nested inside brute.
 ///
 /// - `config`: already-loaded Config
-/// - `plan_path`: path to the plan file (e.g. PLAN_PATH or SUB_PLAN_PATH)
-/// - `dry_run`: if true, skip Claude invocation (one iteration only)
+/// - `plan_path`: path to the plan file, or `None` for planless modes such as grind
+/// - `dry_run`: if true, skip OMP invocation (one iteration only)
 /// - `nested`: if true, running inside brute (adjusts output banners)
-/// - `mctx`: metrics context carrying run_id + project + output dir
+/// - `recorder`: metrics recorder carrying run_id + project + output dir
 fn run_plan_loop(
     config: &Config,
-    plan_path: &str,
+    plan_path: Option<&str>,
     dry_run: bool,
     nested: bool,
     recorder: &mut metrics::RunRecorder,
@@ -1627,7 +1745,16 @@ fn run_plan_loop(
     validate_loop_config(config);
     log("Preflight OK");
 
-    let mut protected: Vec<&str> = vec![PROTOCOL_PATH, plan_path, CONF_PATH];
+    let mut protected: Vec<&str> = vec![PROTOCOL_PATH, CONF_PATH];
+    if let Some(plan_path) = plan_path {
+        protected.push(plan_path);
+    }
+    if Path::new(GRIND_GATE_PATH).exists() {
+        protected.push(GRIND_GATE_PATH);
+    }
+    if Path::new(CSTAT_BASELINE_PATH).exists() {
+        protected.push(CSTAT_BASELINE_PATH);
+    }
     let periodic_paths: Vec<String> = config.periodics.iter().map(|p| p.path.clone()).collect();
     for pp in &periodic_paths {
         protected.push(pp.as_str());
@@ -1651,10 +1778,16 @@ fn run_plan_loop(
         let iter_wall_start = std::time::Instant::now();
 
         eprintln!();
-        let label = if nested { "Plan Iteration" } else { "Iteration" };
+        let label = if nested {
+            "Plan Iteration"
+        } else {
+            "Iteration"
+        };
         render_iteration_banner(label, iteration, nested);
 
-        if let Some((completed, total)) = stage_progress(plan_path) {
+        if let Some(plan_path) = plan_path
+            && let Some((completed, total)) = stage_progress(plan_path)
+        {
             eprintln!("{}", format_progress_bar(completed, total));
         }
 
@@ -1662,12 +1795,14 @@ fn run_plan_loop(
         restore_files(&runner.backup_dir, &protected);
         let restore_ms = restore_start.elapsed().as_millis() as u64;
 
-        // Trim the worker's resumed session, if any — drops bash output,
-        // thinking, and Reads not on the agent's KEEP list, so the prefix
-        // we re-send to Claude stays compact.
-        trim_worker_session(&runner);
-
-        let step_stats = match run_iteration_step(&mut runner, config, iteration, total_cost, dry_run) {
+        let step_stats = match run_iteration_step(
+            &mut runner,
+            config,
+            iteration,
+            total_cost,
+            dry_run,
+            &protected,
+        ) {
             IterationStepResult::Continue(s) => s,
             IterationStepResult::Terminal(outcome) => return outcome,
         };
@@ -1685,8 +1820,13 @@ fn run_plan_loop(
         let mut early_return: Option<PlanLoopOutcome> = None;
         if let Some(judge_every) = config.judge_every {
             match evaluate_judge_every(
-                &mut runner, config, iteration, step_stats.guards_passed,
-                &mut consecutive_judge_failures, judge_every, &mut judge_secs,
+                &mut runner,
+                config,
+                iteration,
+                step_stats.guards_passed,
+                &mut consecutive_judge_failures,
+                judge_every,
+                &mut judge_secs,
             ) {
                 JudgeEveryAction::Pass => early_return = Some(PlanLoopOutcome::JudgePass),
                 JudgeEveryAction::Bailout => early_return = Some(PlanLoopOutcome::JudgeBailout),
@@ -1717,12 +1857,16 @@ fn run_plan_loop(
             thinking_secs: step_stats.stream.thinking_secs,
             tool_counts: step_stats.stream.tool_counts.clone(),
             tool_durations_secs: step_stats.stream.tool_durations_secs.clone(),
-            guards: step_stats.guard_results.iter().map(|g| metrics::GuardRow {
-                name: g.name.clone(),
-                passed: g.passed,
-                skipped: g.skipped,
-                elapsed_secs: g.elapsed_secs,
-            }).collect(),
+            guards: step_stats
+                .guard_results
+                .iter()
+                .map(|g| metrics::GuardRow {
+                    name: g.name.clone(),
+                    passed: g.passed,
+                    skipped: g.skipped,
+                    elapsed_secs: g.elapsed_secs,
+                })
+                .collect(),
             guards_passed: step_stats.guards_passed,
             status_done,
         };
@@ -1745,6 +1889,10 @@ fn run_plan_loop(
 }
 
 fn run_loop(dry_run: bool) -> i32 {
+    run_loop_with_label(dry_run, "loop")
+}
+
+fn run_loop_with_label(dry_run: bool, mode_label: &'static str) -> i32 {
     // Load config
     let config = match Config::load(Path::new(CONF_PATH)) {
         Ok(c) => c,
@@ -1755,24 +1903,28 @@ fn run_loop(dry_run: bool) -> i32 {
     };
 
     log(&format!(
-        "Config loaded: max_tail={}, {} scope rules, {} guards, {} hooks, backend={}{}",
+        "Config loaded: max_tail={}, {} scope rules, {} guards, {} hooks, backend={}{}{}",
         config.max_tail,
         config.scope_rules.len(),
         config.guards.len(),
         config.hooks.len(),
-        match config.backend() {
-            Backend::Claude => "claude",
-            Backend::OpenCode => config.model.as_ref().map_or("opencode", |m| m.as_str()),
-        },
-        config.image.as_ref().map_or(
-            String::from(", sandbox=off"),
-            |img| format!(", image={}", img)
-        )
+        "omp",
+        config
+            .model
+            .as_ref()
+            .map_or(String::new(), |m| format!(", model={}", m)),
+        config
+            .image
+            .as_ref()
+            .map_or(String::from(", sandbox=off"), |img| format!(
+                ", image={}",
+                img
+            ))
     ));
 
     let mctx = metrics::MetricsContext::new(
         config.metrics_dir.clone(),
-        "loop",
+        mode_label,
         config.metrics_enabled,
     );
     if mctx.enabled {
@@ -1785,7 +1937,12 @@ fn run_loop(dry_run: bool) -> i32 {
     let mut recorder = metrics::RunRecorder::new(mctx);
     recorder.on_finalize(|r| render_run_summary(r));
 
-    let outcome = run_plan_loop(&config, PLAN_PATH, dry_run, false, &mut recorder);
+    let plan_path = if mode_label == "grind" {
+        None
+    } else {
+        Some(PLAN_PATH)
+    };
+    let outcome = run_plan_loop(&config, plan_path, dry_run, false, &mut recorder);
     recorder.set_outcome(plan_outcome_label(&outcome));
     drop(recorder);
     match outcome {
@@ -1817,9 +1974,18 @@ fn brute_outcome_label(o: &BruteResult) -> &'static str {
 /// Render the end-of-run metrics table to stderr.
 fn render_run_summary(r: &metrics::RunMetrics) {
     eprintln!();
-    eprintln!("{}{}╔══════════════════════════════════════════════════════════════════╗{}", BOLD, ORANGE, RESET);
-    eprintln!("{}{}║  Run summary                                                     ║{}", BOLD, ORANGE, RESET);
-    eprintln!("{}{}╚══════════════════════════════════════════════════════════════════╝{}", BOLD, ORANGE, RESET);
+    eprintln!(
+        "{}{}╔══════════════════════════════════════════════════════════════════╗{}",
+        BOLD, ORANGE, RESET
+    );
+    eprintln!(
+        "{}{}║  Run summary                                                     ║{}",
+        BOLD, ORANGE, RESET
+    );
+    eprintln!(
+        "{}{}╚══════════════════════════════════════════════════════════════════╝{}",
+        BOLD, ORANGE, RESET
+    );
     let dim = DIM;
     let reset = RESET;
     eprintln!("  {}mode:{}       {}", dim, reset, r.mode);
@@ -1829,7 +1995,10 @@ fn render_run_summary(r: &metrics::RunMetrics) {
     eprintln!("  {}iterations:{} {}", dim, reset, r.iterations);
     eprintln!("  {}wall:{}       {:.1}s", dim, reset, r.total_wall_secs);
     eprintln!("  {}agent:{}      {:.1}s", dim, reset, r.total_agent_secs);
-    eprintln!("  {}thinking:{}   {:.1}s", dim, reset, r.total_thinking_secs);
+    eprintln!(
+        "  {}thinking:{}   {:.1}s",
+        dim, reset, r.total_thinking_secs
+    );
     eprintln!("  {}guards:{}     {:.1}s", dim, reset, r.total_guards_secs);
     eprintln!("  {}cost:{}       ${:.2}", dim, reset, r.total_cost_usd);
     eprintln!();
@@ -1865,10 +2034,13 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
         config.max_tail,
         config.scope_rules.len(),
         config.guards.len(),
-        config.image.as_ref().map_or(
-            String::from(", sandbox=off"),
-            |img| format!(", image={}", img)
-        )
+        config
+            .image
+            .as_ref()
+            .map_or(String::from(", sandbox=off"), |img| format!(
+                ", image={}",
+                img
+            ))
     ));
 
     // Preflight: require protocol.md, judge.md, yoke.conf
@@ -1902,11 +2074,8 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
 
     log("Preflight OK");
 
-    let mctx = metrics::MetricsContext::new(
-        config.metrics_dir.clone(),
-        "brute",
-        config.metrics_enabled,
-    );
+    let mctx =
+        metrics::MetricsContext::new(config.metrics_dir.clone(), "brute", config.metrics_enabled);
     if mctx.enabled {
         log(&format!(
             "Metrics: run_id={}, file={}",
@@ -1926,8 +2095,8 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
 ///
 /// - `config`: already-loaded Config
 /// - `plan_path`: path to the plan file
-/// - `dry_run_inner`: if true, skip Claude invocation (one iteration only)
-/// - `mctx`: metrics context (shared with nested plan loop)
+/// - `dry_run`: if true, skip OMP invocation (one iteration only)
+/// - `recorder`: metrics context (shared with nested plan loop)
 fn run_brute_core(
     config: &Config,
     plan_path: &str,
@@ -1964,7 +2133,7 @@ fn run_brute_core(
             log("(dry-run) Skipping worker invocation");
         } else {
             log("Using plan runner as worker...");
-            match run_plan_loop(config, plan_path, false, true, recorder) {
+            match run_plan_loop(config, Some(plan_path), false, true, recorder) {
                 PlanLoopOutcome::JudgePass => {
                     // Embedded judge already passed — skip standalone judge
                     log("Plan runner completed with embedded judge PASS");
@@ -1997,9 +2166,7 @@ fn run_brute_core(
         if dry_run {
             let outcome = run_all_guards(config);
             if !outcome.passed {
-                log(&format!(
-                    "{}Guards failed{}", ORANGE, RESET
-                ));
+                log(&format!("{}Guards failed{}", ORANGE, RESET));
                 log("(dry-run) Exiting after one iteration");
                 return BruteResult::Error;
             }
@@ -2067,7 +2234,6 @@ fn run_brute(dry_run: bool) -> i32 {
     }
 }
 
-
 /// Invoke the scoper (Agent 1) — a fresh LLM session that reads the spec,
 /// writes sub-plan.md, and updates saga-notes.md.
 /// Returns true if the invocation succeeded.
@@ -2075,7 +2241,14 @@ fn invoke_scoper(runner: &mut LoopRunner, config: &Config, cycle: u32) -> bool {
     let scoper_prompt = "Read .loop/saga-protocol.md and follow its instructions.";
     // Scoper is always a fresh session — saga cycles are independent by design.
     let stats = invoke_process(
-        runner, config, scoper_prompt, "scoper", "scoper", cycle, 0.0, None,
+        runner,
+        config,
+        scoper_prompt,
+        "scoper",
+        "scoper",
+        cycle,
+        0.0,
+        None,
     );
     stats.success
 }
@@ -2258,29 +2431,24 @@ fn run_saga(dry_run: bool) -> i32 {
         config.max_tail,
         config.scope_rules.len(),
         config.guards.len(),
-        config.image.as_ref().map_or(
-            String::from(", sandbox=off"),
-            |img| format!(", image={}", img)
-        )
+        config
+            .image
+            .as_ref()
+            .map_or(String::from(", sandbox=off"), |img| format!(
+                ", image={}",
+                img
+            ))
     ));
 
     saga_preflight();
 
-    let saga_protected: Vec<&str> = vec![
-        SAGA_PROTOCOL_PATH,
-        PROTOCOL_PATH,
-        JUDGE_PATH,
-        CONF_PATH,
-    ];
+    let saga_protected: Vec<&str> = vec![SAGA_PROTOCOL_PATH, PROTOCOL_PATH, JUDGE_PATH, CONF_PATH];
 
     let backup_dir = backup_files(&saga_protected);
     log(&format!("Backups in {}", backup_dir.display()));
 
-    let mctx = metrics::MetricsContext::new(
-        config.metrics_dir.clone(),
-        "saga",
-        config.metrics_enabled,
-    );
+    let mctx =
+        metrics::MetricsContext::new(config.metrics_dir.clone(), "saga", config.metrics_enabled);
     if mctx.enabled {
         log(&format!(
             "Metrics: run_id={}, file={}",
@@ -2304,7 +2472,14 @@ fn run_saga(dry_run: bool) -> i32 {
         eprintln!();
         render_iteration_banner("Saga Cycle", cycle, false);
 
-        if let Some(exit_code) = run_saga_cycle(&mut runner, &config, cycle, dry_run, &saga_protected, &mut recorder) {
+        if let Some(exit_code) = run_saga_cycle(
+            &mut runner,
+            &config,
+            cycle,
+            dry_run,
+            &saga_protected,
+            &mut recorder,
+        ) {
             recorder.set_outcome(match exit_code {
                 0 => "done",
                 130 => "interrupt",
@@ -2324,6 +2499,7 @@ fn cmd_init(args: &[String]) -> ! {
         None => "loop",
         Some("brute") => "brute",
         Some("saga") => "saga",
+        Some("grind") => "grind",
         Some(other) => {
             log_error(&format!("unknown argument '{}'", other));
             print_init_help();
@@ -2589,11 +2765,11 @@ fn cmd_run(args: &[String]) -> ! {
         process::exit(0);
     }
     let mut dry_run = false;
-    let mut no_sandbox = false;
+    let mut _no_sandbox = false;
     for arg in &args[2..] {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
-            "--no-sandbox" => no_sandbox = true,
+            "--no-sandbox" => _no_sandbox = true,
             other => {
                 log_error(&format!("unknown flag '{}'", other));
                 print_run_help();
@@ -2601,29 +2777,18 @@ fn cmd_run(args: &[String]) -> ! {
             }
         }
     }
-    let config = match Config::load(Path::new(CONF_PATH)) {
-        Ok(c) => c,
-        Err(e) => {
-            log_error(&e);
-            process::exit(1);
-        }
-    };
-    if config.image.is_none() && !no_sandbox {
-        log_error("no 'image' directive in config — refusing to run without sandbox");
-        eprintln!("  Add 'image <name>' to {} or pass --no-sandbox to override.", CONF_PATH);
-        process::exit(2);
+    if let Err(e) = Config::load(Path::new(CONF_PATH)) {
+        log_error(&e);
+        process::exit(1);
     }
     match detect_mode() {
         Some("saga") => {
             log("Detected saga mode");
             process::exit(run_saga(dry_run))
         }
-        Some("brute") => {
-            process::exit(run_brute(dry_run))
-        }
-        _ => {
-            process::exit(run_loop(dry_run))
-        }
+        Some("grind") => process::exit(run_loop_with_label(dry_run, "grind")),
+        Some("brute") => process::exit(run_brute(dry_run)),
+        _ => process::exit(run_loop(dry_run)),
     }
 }
 

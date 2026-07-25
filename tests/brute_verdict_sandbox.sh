@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - docker daemon running
-#   - claude-code-sandbox:latest image available
+#   - omp-sandbox:latest image available
 #   - cargo (to build yoke)
 #
 # Usage:
@@ -33,8 +33,8 @@ if ! command -v docker &>/dev/null; then
     exit 0
 fi
 
-if ! docker image inspect claude-code-sandbox:latest &>/dev/null; then
-    echo "SKIP: claude-code-sandbox:latest image not found"
+if ! docker image inspect omp-sandbox:latest &>/dev/null; then
+    echo "SKIP: omp-sandbox:latest image not found"
     exit 0
 fi
 
@@ -60,9 +60,9 @@ TMPDIR_ROOT="$(mktemp -d)"
 PROJECT="$TMPDIR_ROOT/project"
 mkdir -p "$PROJECT"
 
-# ── Write mock-claude script ──
+# ── Write mock-omp script ──
 
-cat > "$TMPDIR_ROOT/mock-claude" <<'MOCK'
+cat > "$TMPDIR_ROOT/mock-omp" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -110,14 +110,14 @@ fi
 
 exit 0
 MOCK
-chmod +x "$TMPDIR_ROOT/mock-claude"
+chmod +x "$TMPDIR_ROOT/mock-omp"
 
 # ── Build test Docker image ──
 
 echo "Building test image $TEST_IMAGE..."
 docker build -t "$TEST_IMAGE" -f- "$TMPDIR_ROOT" <<'DOCKERFILE'
-FROM claude-code-sandbox:latest
-COPY --chmod=755 mock-claude /usr/local/bin/claude
+FROM omp-sandbox:latest
+COPY --chmod=755 mock-omp /usr/local/bin/omp
 DOCKERFILE
 
 # ── Set up project directory ──

@@ -197,7 +197,9 @@ pub fn unix_now() -> u64 {
 /// six-digit sub-second microsecond count.  Lexicographic sort matches
 /// chronological order.  No external time crate dep.
 pub fn new_run_id() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let micros = now.subsec_micros();
     let (y, m, d, hh, mm, ss) = unix_to_utc(secs);
@@ -217,7 +219,11 @@ fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let ss = (tod % 60) as u32;
 
     let z = days + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;
@@ -246,7 +252,13 @@ pub fn project_slug() -> String {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -729,8 +741,12 @@ mod tests {
             cost_usd: 0.42,
             num_turns: 7,
             thinking_secs: 4.1,
-            tool_counts: [("Edit".to_string(), 3u32), ("Bash".to_string(), 1)].into_iter().collect(),
-            tool_durations_secs: [("Edit".to_string(), 1.8), ("Bash".to_string(), 12.3)].into_iter().collect(),
+            tool_counts: [("Edit".to_string(), 3u32), ("Bash".to_string(), 1)]
+                .into_iter()
+                .collect(),
+            tool_durations_secs: [("Edit".to_string(), 1.8), ("Bash".to_string(), 12.3)]
+                .into_iter()
+                .collect(),
             guards: vec![GuardRow {
                 name: "cargo test".to_string(),
                 passed: true,

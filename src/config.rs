@@ -2,27 +2,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Backend {
-    Claude,
-    OpenCode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Thinking {
     Off,
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 impl Thinking {
-    /// MAX_THINKING_TOKENS value to forward to the Claude CLI.
-    pub fn max_tokens(self) -> u32 {
+    /// Value to forward to `omp --thinking`.
+    pub fn as_omp_arg(self) -> &'static str {
         match self {
-            Thinking::Off => 0,
-            Thinking::Low => 2000,
-            Thinking::Medium => 10000,
-            Thinking::High => 32000,
+            Thinking::Off => "off",
+            Thinking::Low => "low",
+            Thinking::Medium => "medium",
+            Thinking::High => "high",
+            Thinking::XHigh => "xhigh",
         }
     }
 }
@@ -42,8 +38,8 @@ pub struct ScopeRule {
 
 #[derive(Debug, Clone)]
 pub struct Periodic {
-    pub path: String,        // e.g., ".loop/cleaner.md"
-    pub name: String,        // derived from filename stem: "cleaner"
+    pub path: String, // e.g., ".loop/cleaner.md"
+    pub name: String, // derived from filename stem: "cleaner"
     pub cadence: u32,
     pub guards: Vec<String>, // from guard-after directives
 }
@@ -54,7 +50,6 @@ pub struct Config {
     pub log_dir: Option<String>,
     pub image: Option<String>,
     pub model: Option<String>,
-    pub claude_model: Option<String>,
     pub thinking: Option<Thinking>,
     pub scope_rules: Vec<ScopeRule>,
     pub guards: Vec<String>,
@@ -73,7 +68,6 @@ struct ConfigBuilder {
     log_dir: Option<String>,
     image: Option<String>,
     model: Option<String>,
-    claude_model: Option<String>,
     thinking: Option<Thinking>,
     scope_rules: Vec<ScopeRule>,
     guards: Vec<String>,
@@ -90,9 +84,19 @@ fn cfg_err(path: &Path, line_num: usize, msg: &str) -> String {
     format!("{}:{}: {}", path.display(), line_num, msg)
 }
 
-fn parse_positive_u32(value: &str, path: &Path, line_num: usize, label: &str) -> Result<u32, String> {
-    let n = value.parse::<u32>()
-        .map_err(|_| cfg_err(path, line_num, &format!("invalid {} value '{}'", label, value)))?;
+fn parse_positive_u32(
+    value: &str,
+    path: &Path,
+    line_num: usize,
+    label: &str,
+) -> Result<u32, String> {
+    let n = value.parse::<u32>().map_err(|_| {
+        cfg_err(
+            path,
+            line_num,
+            &format!("invalid {} value '{}'", label, value),
+        )
+    })?;
     if n == 0 {
         return Err(cfg_err(path, line_num, &format!("{} must be > 0", label)));
     }
@@ -102,23 +106,49 @@ fn parse_positive_u32(value: &str, path: &Path, line_num: usize, label: &str) ->
 #[allow(clippy::string_slice)]
 fn parse_periodic(value: &str, path: &Path, line_num: usize) -> Result<Periodic, String> {
     let trimmed = value.trim();
-    let split_pos = trimmed.rfind(char::is_whitespace)
+    let split_pos = trimmed
+        .rfind(char::is_whitespace)
         .ok_or_else(|| cfg_err(path, line_num, "periodic requires '<path> <cadence>'"))?;
     let ppath = trimmed[..split_pos].trim();
-    let cadence = parse_positive_u32(trimmed[split_pos..].trim(), path, line_num, "periodic cadence")?;
+    let cadence = parse_positive_u32(
+        trimmed[split_pos..].trim(),
+        path,
+        line_num,
+        "periodic cadence",
+    )?;
     let name = Path::new(ppath)
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| cfg_err(path, line_num, &format!("cannot derive name from periodic path '{}'", ppath)))?
+        .ok_or_else(|| {
+            cfg_err(
+                path,
+                line_num,
+                &format!("cannot derive name from periodic path '{}'", ppath),
+            )
+        })?
         .to_string();
-    Ok(Periodic { path: ppath.to_string(), name, cadence, guards: Vec::new() })
+    Ok(Periodic {
+        path: ppath.to_string(),
+        name,
+        cadence,
+        guards: Vec::new(),
+    })
 }
 
 #[allow(clippy::string_slice)]
-fn parse_guard_after(value: &str, path: &Path, line_num: usize) -> Result<(String, String, usize), String> {
+fn parse_guard_after(
+    value: &str,
+    path: &Path,
+    line_num: usize,
+) -> Result<(String, String, usize), String> {
     let trimmed = value.trim();
-    let split_pos = trimmed.find(char::is_whitespace)
-        .ok_or_else(|| cfg_err(path, line_num, "guard-after requires '<periodic-name> <command>'"))?;
+    let split_pos = trimmed.find(char::is_whitespace).ok_or_else(|| {
+        cfg_err(
+            path,
+            line_num,
+            "guard-after requires '<periodic-name> <command>'",
+        )
+    })?;
     let pname = trimmed[..split_pos].trim().to_string();
     let cmd = trimmed[split_pos..].trim().to_string();
     Ok((pname, cmd, line_num))
@@ -131,7 +161,6 @@ impl ConfigBuilder {
             log_dir: None,
             image: None,
             model: None,
-            claude_model: None,
             thinking: None,
             scope_rules: Vec::new(),
             guards: Vec::new(),
@@ -146,39 +175,69 @@ impl ConfigBuilder {
     }
 
     #[allow(clippy::string_slice)]
-    fn parse_line(&mut self, directive: &str, value: &str, path: &Path, line_num: usize) -> Result<(), String> {
+    fn parse_line(
+        &mut self,
+        directive: &str,
+        value: &str,
+        path: &Path,
+        line_num: usize,
+    ) -> Result<(), String> {
         match directive {
             "max-tail" => {
-                self.max_tail = value.parse::<usize>()
-                    .map_err(|_| cfg_err(path, line_num, &format!("invalid max-tail value '{}'", value)))?;
+                self.max_tail = value.parse::<usize>().map_err(|_| {
+                    cfg_err(
+                        path,
+                        line_num,
+                        &format!("invalid max-tail value '{}'", value),
+                    )
+                })?;
             }
             "log-dir" => self.log_dir = Some(value.to_string()),
             "image" => self.image = Some(value.to_string()),
             "model" => self.model = Some(value.to_string()),
-            "claude-model" => self.claude_model = Some(value.to_string()),
             "thinking" => {
                 self.thinking = Some(match value.trim() {
                     "off" => Thinking::Off,
                     "low" => Thinking::Low,
                     "medium" => Thinking::Medium,
                     "high" => Thinking::High,
+                    "xhigh" => Thinking::XHigh,
                     other => {
                         return Err(cfg_err(
                             path,
                             line_num,
-                            &format!("thinking must be 'off', 'low', 'medium', or 'high', got '{}'", other),
+                            &format!(
+                                "thinking must be 'off', 'low', 'medium', 'high', or 'xhigh', got '{}'",
+                                other
+                            ),
                         ));
                     }
                 });
             }
-            "allow" => self.scope_rules.push(ScopeRule { tag: ScopeTag::Allow, prefix: value.to_string() }),
-            "add-only" => self.scope_rules.push(ScopeRule { tag: ScopeTag::AddOnly, prefix: value.to_string() }),
-            "no-modify" => self.scope_rules.push(ScopeRule { tag: ScopeTag::NoModify, prefix: value.to_string() }),
+            "allow" => self.scope_rules.push(ScopeRule {
+                tag: ScopeTag::Allow,
+                prefix: value.to_string(),
+            }),
+            "add-only" => self.scope_rules.push(ScopeRule {
+                tag: ScopeTag::AddOnly,
+                prefix: value.to_string(),
+            }),
+            "no-modify" => self.scope_rules.push(ScopeRule {
+                tag: ScopeTag::NoModify,
+                prefix: value.to_string(),
+            }),
             "guard" => self.guards.push(value.to_string()),
-            "judge-every" => self.judge_every = Some(parse_positive_u32(value, path, line_num, "judge-every")?),
-            "max-judge-failures" => self.max_judge_failures = parse_positive_u32(value, path, line_num, "max-judge-failures")?,
+            "judge-every" => {
+                self.judge_every = Some(parse_positive_u32(value, path, line_num, "judge-every")?)
+            }
+            "max-judge-failures" => {
+                self.max_judge_failures =
+                    parse_positive_u32(value, path, line_num, "max-judge-failures")?
+            }
             "periodic" => self.periodics.push(parse_periodic(value, path, line_num)?),
-            "guard-after" => self.pending_guard_afters.push(parse_guard_after(value, path, line_num)?),
+            "guard-after" => self
+                .pending_guard_afters
+                .push(parse_guard_after(value, path, line_num)?),
             "hook" => self.hooks.push(value.to_string()),
             "metrics-dir" => self.metrics_dir = Some(value.to_string()),
             "metrics" => match value.trim() {
@@ -192,30 +251,29 @@ impl ConfigBuilder {
                     ));
                 }
             },
-            other => return Err(cfg_err(path, line_num, &format!("unknown directive '{}'", other))),
+            other => {
+                return Err(cfg_err(
+                    path,
+                    line_num,
+                    &format!("unknown directive '{}'", other),
+                ));
+            }
         }
         Ok(())
     }
 
     fn build(self, path: &Path) -> Result<Config, String> {
-        if self.model.is_some() && self.claude_model.is_some() {
-            return Err(cfg_err(
-                path,
-                0,
-                "'model' (OpenCode backend) and 'claude-model' (Claude CLI backend) are mutually exclusive",
-            ));
-        }
-        if self.model.is_some() && self.thinking.is_some() {
-            eprintln!(
-                "warning: {}: 'thinking' directive is only honored by the Claude CLI backend; ignored when 'model' (OpenCode) is set",
-                path.display(),
-            );
-        }
         let mut periodics = self.periodics;
         for (pname, cmd, ln) in self.pending_guard_afters {
             match periodics.iter_mut().find(|p| p.name == pname) {
                 Some(p) => p.guards.push(cmd),
-                None => return Err(cfg_err(path, ln, &format!("guard-after references unknown periodic '{}'", pname))),
+                None => {
+                    return Err(cfg_err(
+                        path,
+                        ln,
+                        &format!("guard-after references unknown periodic '{}'", pname),
+                    ));
+                }
             }
         }
         let metrics_dir = match self.metrics_dir {
@@ -227,7 +285,6 @@ impl ConfigBuilder {
             log_dir: self.log_dir,
             image: self.image,
             model: self.model,
-            claude_model: self.claude_model,
             thinking: self.thinking,
             scope_rules: self.scope_rules,
             guards: self.guards,
@@ -261,7 +318,11 @@ impl Config {
             let (directive, value) = match line.find(char::is_whitespace) {
                 Some(pos) => (&line[..pos], line[pos..].trim_start()),
                 None => {
-                    return Err(cfg_err(path, line_num + 1, &format!("directive '{}' has no value", line)));
+                    return Err(cfg_err(
+                        path,
+                        line_num + 1,
+                        &format!("directive '{}' has no value", line),
+                    ));
                 }
             };
 
@@ -293,15 +354,5 @@ impl Config {
         // "." has length 1 but should match everything — already handled above.
         // If only "." matched, best_len is 1, which is correct.
         best_tag
-    }
-
-    /// Determine which backend to use based on config.
-    /// If `model` is set, use OpenCode; otherwise default to Claude CLI.
-    pub fn backend(&self) -> Backend {
-        if self.model.is_some() {
-            Backend::OpenCode
-        } else {
-            Backend::Claude
-        }
     }
 }

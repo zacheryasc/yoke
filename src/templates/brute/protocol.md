@@ -43,39 +43,20 @@ The first line of `.loop/notes.md` must be one of:
 - `STATUS: IN_PROGRESS` — You have more work to do (stages remain, or you expect guard failures).
 - `STATUS: DONE` — All stages are implemented and you believe guards will pass.
 
-## KEEP: Carrying File Context Across Iterations
+## Session Continuity
 
-Your conversation history persists across worker iterations via `--resume`.
-To keep Claude's prompt cache warm without ballooning, the outer loop trims
-your session between rounds: it drops `Bash` output, thinking, and any file
-`Read` results that aren't on your KEEP list. Everything else (text turns,
-intermediate `Edit`/`Grep`/`Glob` results) is also dropped.
+Yoke resumes the same worker OMP session across worker iterations.
+`.loop/notes.md`, `.loop/plan.md`, `.loop/protocol.md`, `.loop/verdict.md`,
+and `.loop/guard-results.md` also live on disk, so re-read them every
+iteration instead of trusting stale context.
 
-After STATUS, on its own line in `.loop/notes.md`, list the file paths you
-want to keep cached for the next iteration:
-
-```
-STATUS: IN_PROGRESS
-KEEP: src/foo.rs src/bar.rs tests/baz.rs
-```
-
-Rules:
-
-- Space-separated repo-relative paths (or absolute).
-- List files you read **this iteration** and will still need next iteration.
-- Don't list `.loop/*` files — those live on disk and are re-read fresh.
-- Keep the list tight. Every kept file is paid for at cache-read rates
-  every round it stays. Drop a file once it's no longer relevant.
-- Omit `KEEP:` (or `KEEP: *`) to keep nothing.
-
-Note: the judge always runs in a fresh session — your KEEP list does not
-affect the judge.
+The judge always runs in a fresh OMP session.
 
 ## What Happens After You Exit
 
 1. Guards run (diff boundary check + configured guard commands).
 2. If guards pass and STATUS is DONE, the plan loop ends.
-3. Then the judge (a fresh Claude with zero implementation context) verifies the feature.
+3. Then the judge (a fresh OMP session with zero implementation context) verifies the feature.
 4. If the judge says FAIL, you get another brute attempt — your notes are preserved but STATUS is reset to IN_PROGRESS so you re-enter the plan loop with the judge's feedback.
 
 ## Rules

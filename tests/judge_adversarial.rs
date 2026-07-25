@@ -40,12 +40,25 @@ fn git_init(project: &std::path::Path) {
             .env("GIT_COMMITTER_EMAIL", "test@test")
             .output()
             .unwrap_or_else(|e| panic!("git {:?} failed: {}", args, e));
-        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init"]);
     fs::write(project.join("dummy.txt"), "seed\n").unwrap();
     git(&["add", "dummy.txt"]);
-    git(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "init"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@test",
+        "commit",
+        "-m",
+        "init",
+    ]);
 }
 
 // ── Test 1: stash + clean round-trip after extraction ──────────────────
@@ -73,12 +86,24 @@ fn stash_roundtrip_after_extraction() {
         .current_dir(project)
         .output()
         .expect("yoke init brute");
-    assert!(out.status.success(), "yoke init brute failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "yoke init brute failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Write distinctive content into plan.md and notes.md
     let loop_dir = project.join(".loop");
-    fs::write(loop_dir.join("plan.md"), "## Stage 1 — Build the widget\n\nDo the thing.\n").unwrap();
-    fs::write(loop_dir.join("notes.md"), "STATUS: IN_PROGRESS\n\nSome important notes here.\n").unwrap();
+    fs::write(
+        loop_dir.join("plan.md"),
+        "## Stage 1 — Build the widget\n\nDo the thing.\n",
+    )
+    .unwrap();
+    fs::write(
+        loop_dir.join("notes.md"),
+        "STATUS: IN_PROGRESS\n\nSome important notes here.\n",
+    )
+    .unwrap();
 
     // Stash the current state
     let out = Command::new(&yoke)
@@ -86,7 +111,11 @@ fn stash_roundtrip_after_extraction() {
         .current_dir(project)
         .output()
         .expect("yoke stash");
-    assert!(out.status.success(), "yoke stash failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "yoke stash failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Verify stash log shows an entry
     let out = Command::new(&yoke)
@@ -95,12 +124,25 @@ fn stash_roundtrip_after_extraction() {
         .output()
         .expect("yoke stash log");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("mode=brute"), "stash log should show mode=brute, got:\n{}", stderr);
+    assert!(
+        stderr.contains("mode=brute"),
+        "stash log should show mode=brute, got:\n{}",
+        stderr
+    );
 
     // Verify stash cleared .loop/ working files
-    assert!(!loop_dir.join("plan.md").exists(), "plan.md should be gone after stash");
-    assert!(!loop_dir.join("notes.md").exists(), "notes.md should be gone after stash");
-    assert!(loop_dir.join(".stash").exists(), ".stash/ should survive stash clear");
+    assert!(
+        !loop_dir.join("plan.md").exists(),
+        "plan.md should be gone after stash"
+    );
+    assert!(
+        !loop_dir.join("notes.md").exists(),
+        "notes.md should be gone after stash"
+    );
+    assert!(
+        loop_dir.join(".stash").exists(),
+        ".stash/ should survive stash clear"
+    );
 
     // Pop — should restore the stashed state with our distinctive content
     let out = Command::new(&yoke)
@@ -108,11 +150,19 @@ fn stash_roundtrip_after_extraction() {
         .current_dir(project)
         .output()
         .expect("yoke stash pop");
-    assert!(out.status.success(), "yoke stash pop failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "yoke stash pop failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Verify round-trip: files restored with original content
     let plan = fs::read_to_string(loop_dir.join("plan.md")).unwrap();
-    assert!(plan.contains("Build the widget"), "plan.md should be restored after pop, got: {:?}", plan);
+    assert!(
+        plan.contains("Build the widget"),
+        "plan.md should be restored after pop, got: {:?}",
+        plan
+    );
 }
 
 // ── Test 2: plan loop exits on STATUS: DONE with generalized is_status_done ──
@@ -153,18 +203,18 @@ Read plan.md, implement it, then set STATUS: DONE in notes.md.
     fs::write(loop_dir.join("notes.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
-    // Mock claude: immediately writes STATUS: DONE and exits
+    // Mock OMP: immediately writes STATUS: DONE and exits
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).unwrap();
 
-    let mock_claude = r#"#!/usr/bin/env bash
+    let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
 # Always signal done immediately
 printf 'STATUS: DONE\n' > .loop/notes.md
 exit 0
 "#;
-    let mock_path = mock_bin_dir.join("claude");
-    fs::write(&mock_path, mock_claude).unwrap();
+    let mock_path = mock_bin_dir.join("omp");
+    fs::write(&mock_path, mock_omp).unwrap();
     fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -237,8 +287,8 @@ Read plan, implement, set STATUS: DONE in notes.md.
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).unwrap();
 
-    // Mock claude: agent writes STATUS: DONE, judge FAILs once then PASSes
-    let mock_claude = r#"#!/usr/bin/env bash
+    // Mock OMP: agent writes STATUS: DONE, judge FAILs once then PASSes
+    let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
 PROMPT=""
 while [[ $# -gt 0 ]]; do
@@ -264,8 +314,8 @@ elif echo "$PROMPT" | grep -q "judge.md"; then
 fi
 exit 0
 "#;
-    let mock_path = mock_bin_dir.join("claude");
-    fs::write(&mock_path, mock_claude).unwrap();
+    let mock_path = mock_bin_dir.join("omp");
+    fs::write(&mock_path, mock_omp).unwrap();
     fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -291,7 +341,8 @@ exit 0
     // Judge should have been called exactly 2 times
     let judge_count = fs::read_to_string(loop_dir.join(".judge-count")).unwrap();
     assert_eq!(
-        judge_count.trim(), "2",
+        judge_count.trim(),
+        "2",
         "judge should be called exactly twice (FAIL then PASS), got: {:?}",
         judge_count.trim(),
     );
@@ -344,13 +395,13 @@ fn saga_exits_on_saga_notes_done() {
     fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
-    // Mock claude: scoper writes STATUS: DONE to saga-notes.md immediately.
+    // Mock OMP: scoper writes STATUS: DONE to saga-notes.md immediately.
     // Critically: notes.md is left empty — if yoke checks notes.md instead of
     // saga-notes.md, it would NOT see DONE and would spin forever.
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).unwrap();
 
-    let mock_claude = r#"#!/usr/bin/env bash
+    let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
 PROMPT=""
 while [[ $# -gt 0 ]]; do
@@ -366,8 +417,8 @@ if echo "$PROMPT" | grep -q "saga-protocol.md"; then
 fi
 exit 0
 "#;
-    let mock_path = mock_bin_dir.join("claude");
-    fs::write(&mock_path, mock_claude).unwrap();
+    let mock_path = mock_bin_dir.join("omp");
+    fs::write(&mock_path, mock_omp).unwrap();
     fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -447,7 +498,7 @@ guard  echo SENTINEL_GUARD_OUTPUT && exit 1
     fs::write(loop_dir.join("notes.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
-    // Dry-run: no Claude invocation, but guards still execute
+    // Dry-run: no OMP invocation, but guards still execute
     let output = Command::new(&yoke)
         .args(["run", "--no-sandbox", "--dry-run"])
         .current_dir(project)
@@ -525,9 +576,9 @@ max-judge-failures 2
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).unwrap();
 
-    // Mock claude: agent always writes STATUS: DONE, judge always FAILs.
+    // Mock OMP: agent always writes STATUS: DONE, judge always FAILs.
     // Tracks call counts so we can assert the exact number of iterations.
-    let mock_claude = r#"#!/usr/bin/env bash
+    let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
 PROMPT=""
 while [[ $# -gt 0 ]]; do
@@ -555,8 +606,8 @@ elif echo "$PROMPT" | grep -q "judge.md"; then
 fi
 exit 0
 "#;
-    let mock_path = mock_bin_dir.join("claude");
-    fs::write(&mock_path, mock_claude).unwrap();
+    let mock_path = mock_bin_dir.join("omp");
+    fs::write(&mock_path, mock_omp).unwrap();
     fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -589,7 +640,8 @@ exit 0
     // Judge should have been called exactly 2 times (matching max-judge-failures)
     let judge_count = fs::read_to_string(loop_dir.join(".judge-count")).unwrap();
     assert_eq!(
-        judge_count.trim(), "2",
+        judge_count.trim(),
+        "2",
         "judge should be called exactly 2 times (max-judge-failures=2), got: {:?}\nStderr:\n{}",
         judge_count.trim(),
         stderr,
@@ -648,8 +700,8 @@ judge-every 5
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).unwrap();
 
-    // Mock claude: agent immediately signals DONE, judge immediately returns PASS
-    let mock_claude = r#"#!/usr/bin/env bash
+    // Mock OMP: agent immediately signals DONE, judge immediately returns PASS
+    let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
 PROMPT=""
 while [[ $# -gt 0 ]]; do
@@ -666,8 +718,8 @@ elif echo "$PROMPT" | grep -q "judge.md"; then
 fi
 exit 0
 "#;
-    let mock_path = mock_bin_dir.join("claude");
-    fs::write(&mock_path, mock_claude).unwrap();
+    let mock_path = mock_bin_dir.join("omp");
+    fs::write(&mock_path, mock_omp).unwrap();
     fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -737,7 +789,11 @@ fn stash_records_correct_mode_after_extraction() {
         .current_dir(project)
         .output()
         .expect("yoke init brute");
-    assert!(out.status.success(), "yoke init brute failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "yoke init brute failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Write some content so stash has something to snapshot
     fs::write(project.join(".loop/plan.md"), "## Stage 1\nDo it.\n").unwrap();
@@ -748,15 +804,25 @@ fn stash_records_correct_mode_after_extraction() {
         .current_dir(project)
         .output()
         .expect("yoke stash");
-    assert!(out.status.success(), "yoke stash failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "yoke stash failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Read the stash index directly and verify mode=brute
     let index_path = project.join(".loop/.stash/index");
-    assert!(index_path.exists(), "stash index should exist after stashing");
+    assert!(
+        index_path.exists(),
+        "stash index should exist after stashing"
+    );
 
     let index = fs::read_to_string(&index_path).unwrap();
     // Index format: hash|timestamp|mode|file1,file2,...
-    let first_line = index.lines().next().expect("index should have at least one line");
+    let first_line = index
+        .lines()
+        .next()
+        .expect("index should have at least one line");
     let parts: Vec<&str> = first_line.splitn(4, '|').collect();
     assert!(
         parts.len() >= 3,

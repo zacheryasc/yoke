@@ -3,7 +3,7 @@
 //! Verifies that after a judge writes VERDICT: FAIL, the verdict.md content
 //! survives into the next brute iteration so the agent can read the feedback.
 //!
-//! Uses a mock `claude` bash script to simulate both agent and judge,
+//! Uses a mock `omp` bash script to simulate both agent and judge,
 //! recording what the agent sees in verdict.md at each invocation.
 
 use std::fs;
@@ -75,7 +75,7 @@ const CONF: &str = "\
 allow .
 ";
 
-/// Mock claude script that distinguishes agent vs judge by the -p prompt.
+/// Mock OMP script that distinguishes agent vs judge by the -p prompt.
 ///
 /// Agent mode (prompt contains "protocol.md"):
 ///   - Increments .loop/.agent-calls counter
@@ -86,8 +86,15 @@ allow .
 ///   - Increments .loop/.judge-calls counter
 ///   - Call 1: writes VERDICT: FAIL + feedback to verdict.md
 ///   - Call 2+: writes VERDICT: PASS to verdict.md
-const MOCK_CLAUDE: &str = r#"#!/usr/bin/env bash
+const MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
+
+{
+    echo "CALL"
+    for arg in "$@"; do
+        echo "$arg"
+    done
+} >> .loop/.omp-argv
 
 # Extract the prompt from -p argument
 PROMPT=""
@@ -162,13 +169,21 @@ fn brute_verdict_preserved_across_iterations() {
     fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
-    // Set up mock claude script on PATH
+    // Set up mock OMP script on PATH
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).expect("create mock-bin");
 
-    let mock_claude_path = mock_bin_dir.join("claude");
-    fs::write(&mock_claude_path, MOCK_CLAUDE).unwrap();
-    fs::set_permissions(&mock_claude_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let mock_omp_path = mock_bin_dir.join("omp");
+    fs::write(&mock_omp_path, MOCK_OMP).unwrap();
+    fs::set_permissions(&mock_omp_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let legacy_bin_path = mock_bin_dir.join(["cl", "aude"].concat());
+    fs::write(
+        &legacy_bin_path,
+        "#!/usr/bin/env bash\necho 'legacy agent must not be invoked' >&2\nexit 99\n",
+    )
+    .unwrap();
+    fs::set_permissions(&legacy_bin_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     // Set up git repo (boundary checker needs `git diff HEAD` to work)
     let git = |args: &[&str]| {
@@ -193,9 +208,17 @@ fn brute_verdict_preserved_across_iterations() {
     git(&["init"]);
     fs::write(project.join("dummy.txt"), "seed\n").unwrap();
     git(&["add", "dummy.txt"]);
-    git(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "init"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@test",
+        "commit",
+        "-m",
+        "init",
+    ]);
 
-    // Build PATH: mock-bin first so our mock claude shadows the real one
+    // Build PATH: mock-bin first so our mock OMP shadows the real one
     let original_path = std::env::var("PATH").unwrap_or_default();
     let test_path = format!("{}:{}", mock_bin_dir.display(), original_path);
 
@@ -210,6 +233,14 @@ fn brute_verdict_preserved_across_iterations() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // ── Assertions ──
+    let argv = fs::read_to_string(loop_dir.join(".omp-argv")).expect("mock omp argv");
+    assert!(
+        argv.contains("--mode\njson")
+            && argv.contains("--auto-approve")
+            && argv.contains("-p\nRead .loop/protocol.md and follow its instructions."),
+        "default backend should invoke omp in JSON print mode with the worker prompt.\nargv:\n{}",
+        argv
+    );
 
     // 1. witness-1 should be empty: no verdict exists before first agent run
     let witness_1 = fs::read_to_string(loop_dir.join(".witness-1"))

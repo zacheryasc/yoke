@@ -2,7 +2,7 @@
 //! metrics rows under the user's home directory (`~/.yoke/metrics/`) and the
 //! rows survive `yoke clean`.
 //!
-//! Uses a mock `claude` script so no real agent invocation happens.  The
+//! Uses a mock `omp` script so no real agent invocation happens.  The
 //! subprocess gets HOME pointed at the test tempdir so writes don't escape
 //! the test sandbox.
 
@@ -38,10 +38,17 @@ const CONF: &str = "\
 allow .
 ";
 
-const MOCK_CLAUDE: &str = r#"#!/usr/bin/env bash
+const MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 # Always: write STATUS: DONE so the loop exits after one iteration.
 printf 'STATUS: DONE\n\n## Stage 1\nDone.\n' > .loop/notes.md
+cat <<'JSON'
+{"type":"session","version":3,"id":"sess-metrics","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"gpt-test","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.1,"output":0.15,"cacheRead":0,"cacheWrite":0,"total":0.25}},"duration":1500}}
+{"type":"agent_end","messages":[]}
+JSON
 exit 0
 "#;
 
@@ -72,12 +79,12 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
     fs::write(loop_dir.join("notes.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
-    // Mock claude on PATH
+    // Mock OMP on PATH
     let mock_bin_dir = project.join("mock-bin");
     fs::create_dir(&mock_bin_dir).expect("create mock-bin");
-    let mock_claude_path = mock_bin_dir.join("claude");
-    fs::write(&mock_claude_path, MOCK_CLAUDE).unwrap();
-    fs::set_permissions(&mock_claude_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let mock_omp_path = mock_bin_dir.join("omp");
+    fs::write(&mock_omp_path, MOCK_OMP).unwrap();
+    fs::set_permissions(&mock_omp_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     // Boundary check needs a git repo
     let git = |args: &[&str]| {
@@ -101,7 +108,15 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
     git(&["init"]);
     fs::write(project.join("seed.txt"), "x\n").unwrap();
     git(&["add", "seed.txt"]);
-    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "init",
+    ]);
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let test_path = format!("{}:{}", mock_bin_dir.display(), original_path);
@@ -182,6 +197,16 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
     assert!(
         iter_content.contains("\"restore_ms\":"),
         "iter row should record restore_ms.\ncontent: {}",
+        iter_content
+    );
+    assert!(
+        iter_content.contains("\"cost_usd\":0.25"),
+        "iter row should record OMP stream cost.\ncontent: {}",
+        iter_content
+    );
+    assert!(
+        iter_content.contains("\"num_turns\":1"),
+        "iter row should record OMP turn count.\ncontent: {}",
         iter_content
     );
 
