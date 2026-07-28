@@ -269,7 +269,29 @@ Read plan.md, implement it, then set STATUS: DONE in notes.md.
 
     let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
-# Always signal done immediately
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            printf 'STATUS: DONE\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-loop-done","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
 printf 'STATUS: DONE\n' > .loop/notes.md
 exit 0
 "#;
@@ -350,6 +372,29 @@ Read plan, implement, set STATUS: DONE in notes.md.
     // Mock OMP: agent writes STATUS: DONE, judge FAILs once then PASSes
     let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            printf 'STATUS: DONE\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-brute-worker","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -640,6 +685,34 @@ max-judge-failures 2
     // Tracks call counts so we can assert the exact number of iterations.
     let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            COUNTER=".loop/.agent-count"
+            N=0
+            if [[ -f "$COUNTER" ]]; then N=$(cat "$COUNTER"); fi
+            N=$((N + 1))
+            echo "$N" > "$COUNTER"
+            printf 'STATUS: DONE\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-bailout-worker","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -661,7 +734,6 @@ elif echo "$PROMPT" | grep -q "judge.md"; then
     if [[ -f "$COUNTER" ]]; then N=$(cat "$COUNTER"); fi
     N=$((N + 1))
     echo "$N" > "$COUNTER"
-    # Always FAIL
     printf 'VERDICT: FAIL\n\nStill broken.\n' > .loop/verdict.md
 fi
 exit 0
@@ -763,6 +835,29 @@ judge-every 5
     // Mock OMP: agent immediately signals DONE, judge immediately returns PASS
     let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            printf 'STATUS: DONE\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-judge-every","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in

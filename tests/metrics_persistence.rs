@@ -40,7 +40,33 @@ allow .
 
 const MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
-# Always: write STATUS: DONE so the loop exits after one iteration.
+
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            printf 'STATUS: DONE\n\n## Stage 1\nDone.\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-metrics","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"gpt-test","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.1,"output":0.15,"cacheRead":0,"cacheWrite":0,"total":0.25}},"duration":1500}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
+
 printf 'STATUS: DONE\n\n## Stage 1\nDone.\n' > .loop/notes.md
 cat <<'JSON'
 {"type":"session","version":3,"id":"sess-metrics","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}

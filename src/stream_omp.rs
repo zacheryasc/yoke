@@ -250,6 +250,52 @@ fn format_summary_strip(state: &StreamState) -> String {
     format!("{}  ⟪ {} ⟫{}", DIM, parts.join(" │ "), RESET)
 }
 
+/// Incremental OMP NDJSON formatter for runtimes that do not expose a
+/// `ChildStdout` directly, such as OMP RPC.
+pub(crate) struct OmpStreamProcessor {
+    state: StreamState,
+    log_file: Option<std::fs::File>,
+    prior_total: f64,
+}
+
+impl OmpStreamProcessor {
+    pub(crate) fn new(log_path: Option<&Path>, prior_total: f64) -> Self {
+        let log_file = log_path.and_then(|p| {
+            std::fs::create_dir_all(p.parent().unwrap_or(Path::new("."))).ok();
+            std::fs::File::create(p).ok()
+        });
+        Self {
+            state: StreamState::new(),
+            log_file,
+            prior_total,
+        }
+    }
+
+    /// Process one raw OMP JSONL line. Returns true when the line ends the
+    /// current agent turn.
+    pub(crate) fn process_line(&mut self, line: &str) -> bool {
+        if line.trim().is_empty() {
+            return false;
+        }
+        if let Some(f) = &mut self.log_file {
+            let _ = writeln!(f, "{}", line);
+        }
+        let mut out = io::stdout().lock();
+        let _ = process_line(&mut out, line, &mut self.state, self.prior_total);
+        let _ = out.flush();
+        extract_str(line, "type") == Some("agent_end")
+    }
+
+    pub(crate) fn finish(self) -> StreamSummary {
+        let mut out = io::stdout().lock();
+        if self.state.turn_num > 0 {
+            let _ = writeln!(out, "{}", format_summary_strip(&self.state));
+        }
+        let _ = out.flush();
+        self.state.into_summary()
+    }
+}
+
 /// Filter OMP NDJSON and format it as rich ANSI output on stdout.
 pub fn filter_stream(
     stdout: ChildStdout,

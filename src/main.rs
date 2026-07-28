@@ -6,6 +6,7 @@ mod config;
 mod guard;
 mod json;
 mod metrics;
+mod runtime;
 mod signal;
 mod stash;
 mod stream;
@@ -252,6 +253,10 @@ fn print_usage() {
         BOLD, RESET
     );
     eprintln!(
+        "  {}inject{}           Send human steering to an active yoke run",
+        BOLD, RESET
+    );
+    eprintln!(
         "  {}stats{}            Inspect persisted run metrics (~/.yoke/metrics/)",
         BOLD, RESET
     );
@@ -266,11 +271,29 @@ fn print_usage() {
     );
 }
 
+fn print_inject_help() {
+    eprintln!(
+        "{}{}[yoke inject]{} steer an active run",
+        ORANGE, BOLD, RESET
+    );
+    eprintln!();
+    eprintln!("{}USAGE:{} yoke inject [--shutdown] <message>", BOLD, RESET);
+    eprintln!();
+    eprintln!("{}OPTIONS:{}", BOLD, RESET);
+    eprintln!("  --shutdown      Ask the worker to preserve progress and exit promptly");
+    eprintln!("  --help, -h      Show this help message");
+    eprintln!();
+    eprintln!(
+        "Sends the message to the active run through {}.",
+        runtime::YOKE_SOCKET_PATH
+    );
+}
+
 fn print_run_help() {
     eprintln!("{}{}[yoke run]{} execute the loop", ORANGE, BOLD, RESET);
     eprintln!();
     eprintln!(
-        "{}USAGE:{} yoke run [--dry-run] [--no-sandbox]",
+        "{}USAGE:{} yoke run [--dry-run] [--no-sandbox]\\n       yoke inject [--shutdown] <message>",
         BOLD, RESET
     );
     eprintln!();
@@ -568,7 +591,7 @@ fn should_forward_env(key: &str) -> bool {
 }
 
 /// Build a docker command that runs OMP inside a container.
-fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Command {
+pub(crate) fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Command {
     let workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
@@ -788,23 +811,15 @@ fn invoke_process(
 /// Invoke the agent, piping stdout through the stream filter.
 fn invoke_agent(
     runner: &mut LoopRunner,
+    supervisor: &mut runtime::RunSupervisor,
     config: &Config,
     iteration: u32,
     prior_total: f64,
 ) -> AgentRunStats {
     let prompt = "Read .loop/protocol.md and follow its instructions.";
     let label = "OMP";
-    let resume = runner.last_session_id.clone();
-    let stats = invoke_process(
-        runner,
-        config,
-        prompt,
-        label,
-        "iteration",
-        iteration,
-        prior_total,
-        resume.as_deref(),
-    );
+    let stats =
+        supervisor.invoke_worker(config, prompt, label, "iteration", iteration, prior_total);
     if let Some(sid) = stats.stream.session_id.clone() {
         runner.last_session_id = Some(sid);
     }
@@ -1732,6 +1747,7 @@ enum IterationStepResult {
 /// when an early exit is needed.
 fn run_iteration_step(
     runner: &mut LoopRunner,
+    supervisor: &mut runtime::RunSupervisor,
     config: &Config,
     iteration: u32,
     prior_total: f64,
@@ -1741,13 +1757,18 @@ fn run_iteration_step(
     if dry_run {
         log("(dry-run) Skipping OMP invocation");
     } else {
-        let stats = invoke_agent(runner, config, iteration, prior_total);
+        let stats = invoke_agent(runner, supervisor, config, iteration, prior_total);
         if !stats.success {
             log_error("OMP invocation failed — aborting loop");
             return IterationStepResult::Terminal(PlanLoopOutcome::Error);
         }
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
+            return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
+        }
+        if supervisor.shutdown_requested() {
+            restore_files(&runner.backup_dir, protected);
+            log("Shutdown steering handled — stopping run");
             return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
         }
         restore_files(&runner.backup_dir, protected);
@@ -1799,10 +1820,18 @@ fn run_plan_loop(
     nested: bool,
     recorder: &mut metrics::RunRecorder,
     kind: LoopKind,
+    supervisor: &mut runtime::RunSupervisor,
 ) -> PlanLoopOutcome {
     preflight(plan_path, !nested);
     validate_loop_config(config);
     log("Preflight OK");
+    if !dry_run {
+        if let Err(e) = supervisor.ensure_control_started() {
+            log_error(&e);
+            return PlanLoopOutcome::Error;
+        }
+        supervisor.reset_worker_session();
+    }
 
     let mut protected: Vec<&str> = vec![PROTOCOL_PATH, CONF_PATH];
     if let Some(plan_path) = plan_path {
@@ -1862,6 +1891,7 @@ fn run_plan_loop(
 
         let step_stats = match run_iteration_step(
             &mut runner,
+            supervisor,
             config,
             iteration,
             total_cost,
@@ -1982,11 +2012,15 @@ fn run_plan_loop(
     }
 }
 
-fn run_loop(dry_run: bool) -> i32 {
-    run_loop_with_label(dry_run, "loop")
+fn run_loop(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> i32 {
+    run_loop_with_label(dry_run, "loop", supervisor)
 }
 
-fn run_loop_with_label(dry_run: bool, mode_label: &'static str) -> i32 {
+fn run_loop_with_label(
+    dry_run: bool,
+    mode_label: &'static str,
+    supervisor: &mut runtime::RunSupervisor,
+) -> i32 {
     // Load config
     let config = match Config::load(Path::new(CONF_PATH)) {
         Ok(c) => c,
@@ -2041,7 +2075,15 @@ fn run_loop_with_label(dry_run: bool, mode_label: &'static str) -> i32 {
     } else {
         LoopKind::Plan
     };
-    let outcome = run_plan_loop(&config, plan_path, dry_run, false, &mut recorder, kind);
+    let outcome = run_plan_loop(
+        &config,
+        plan_path,
+        dry_run,
+        false,
+        &mut recorder,
+        kind,
+        supervisor,
+    );
     recorder.set_outcome(plan_outcome_label(&outcome));
     drop(recorder);
     match outcome {
@@ -2118,7 +2160,7 @@ enum BruteResult {
 /// Protected files for the brute runner.
 const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, PLAN_PATH, JUDGE_PATH, CONF_PATH];
 
-fn run_brute_inner(dry_run: bool) -> BruteResult {
+fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> BruteResult {
     // Load config
     let config = match Config::load(Path::new(CONF_PATH)) {
         Ok(c) => c,
@@ -2172,6 +2214,10 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
     }
 
     log("Preflight OK");
+    if !dry_run && let Err(e) = supervisor.ensure_control_started() {
+        log_error(&e);
+        return BruteResult::Error;
+    }
 
     let mctx =
         metrics::MetricsContext::new(config.metrics_dir.clone(), "brute", config.metrics_enabled);
@@ -2184,7 +2230,7 @@ fn run_brute_inner(dry_run: bool) -> BruteResult {
     }
     let mut recorder = metrics::RunRecorder::new(mctx);
     recorder.on_finalize(|r| render_run_summary(r));
-    let result = run_brute_core(&config, PLAN_PATH, dry_run, &mut recorder);
+    let result = run_brute_core(&config, PLAN_PATH, dry_run, &mut recorder, supervisor);
     recorder.set_outcome(brute_outcome_label(&result));
     result
 }
@@ -2201,6 +2247,7 @@ fn run_brute_core(
     plan_path: &str,
     dry_run: bool,
     recorder: &mut metrics::RunRecorder,
+    supervisor: &mut runtime::RunSupervisor,
 ) -> BruteResult {
     // Backup protected files
     let backup_dir = backup_files(BRUTE_PROTECTED_FILES);
@@ -2239,6 +2286,7 @@ fn run_brute_core(
                 true,
                 recorder,
                 LoopKind::Plan,
+                supervisor,
             ) {
                 PlanLoopOutcome::JudgePass => {
                     // Embedded judge already passed — skip standalone judge
@@ -2331,8 +2379,8 @@ fn run_brute_core(
 }
 
 /// Top-level brute runner that maps BruteResult to an exit code.
-fn run_brute(dry_run: bool) -> i32 {
-    match run_brute_inner(dry_run) {
+fn run_brute(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> i32 {
+    match run_brute_inner(dry_run, supervisor) {
         BruteResult::Pass => 0,
         BruteResult::Bailout => 1,
         BruteResult::Interrupt => 130,
@@ -2420,6 +2468,7 @@ fn run_saga_cycle(
     dry_run: bool,
     saga_protected: &[&str],
     recorder: &mut metrics::RunRecorder,
+    supervisor: &mut runtime::RunSupervisor,
 ) -> Option<i32> {
     restore_files(&runner.backup_dir, saga_protected);
 
@@ -2498,7 +2547,7 @@ fn run_saga_cycle(
     // scoper (and the user) can read why the previous chunk failed or
     // succeeded.  Use `yoke clean` or `yoke stash` for a full reset.
 
-    match run_brute_core(config, SUB_PLAN_PATH, false, recorder) {
+    match run_brute_core(config, SUB_PLAN_PATH, false, recorder, supervisor) {
         BruteResult::Pass => {
             log(&format!(
                 "{}Sub-plan passed \u{2014} looping back to scoper{}",
@@ -2523,7 +2572,7 @@ fn run_saga_cycle(
     None
 }
 
-fn run_saga(dry_run: bool) -> i32 {
+fn run_saga(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> i32 {
     let config = match Config::load(Path::new(CONF_PATH)) {
         Ok(c) => c,
         Err(e) => {
@@ -2547,6 +2596,10 @@ fn run_saga(dry_run: bool) -> i32 {
     ));
 
     saga_preflight();
+    if !dry_run && let Err(e) = supervisor.ensure_control_started() {
+        log_error(&e);
+        return 1;
+    }
 
     let saga_protected: Vec<&str> = vec![SAGA_PROTOCOL_PATH, PROTOCOL_PATH, JUDGE_PATH, CONF_PATH];
 
@@ -2585,6 +2638,7 @@ fn run_saga(dry_run: bool) -> i32 {
             dry_run,
             &saga_protected,
             &mut recorder,
+            supervisor,
         ) {
             recorder.set_outcome(match exit_code {
                 0 => "done",
@@ -2865,6 +2919,76 @@ fn stats_show_run(slug_dir: &Path, run_id: &str, slug: &str) -> i32 {
     0
 }
 
+fn cmd_inject(args: &[String]) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        print_inject_help();
+        process::exit(0);
+    }
+
+    let mut shutdown = false;
+    let mut message: Option<String> = None;
+    for arg in &args[2..] {
+        match arg.as_str() {
+            "--shutdown" => shutdown = true,
+            other if other.starts_with('-') => {
+                log_error(&format!("unknown flag '{}'", other));
+                print_inject_help();
+                process::exit(2);
+            }
+            other => {
+                if message.is_some() {
+                    log_error("inject expects exactly one message argument");
+                    print_inject_help();
+                    process::exit(2);
+                }
+                message = Some(other.to_string());
+            }
+        }
+    }
+
+    let Some(message) = message else {
+        log_error("inject message is required");
+        print_inject_help();
+        process::exit(2);
+    };
+    if message.trim().is_empty() {
+        log_error("inject message must not be empty");
+        process::exit(2);
+    }
+
+    let kind = if shutdown {
+        runtime::InjectionKind::Shutdown
+    } else {
+        runtime::InjectionKind::Normal
+    };
+    match runtime::send_inject_command(runtime::YOKE_SOCKET_PATH, kind, &message) {
+        Ok(response) => {
+            if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                let status = response
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("accepted");
+                let id = response
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                log(&format!("injection {} ({})", status, id));
+                process::exit(0);
+            }
+            let error = response
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("active run rejected injection");
+            log_error(error);
+            process::exit(1);
+        }
+        Err(e) => {
+            log_error(&e);
+            process::exit(1);
+        }
+    }
+}
+
 fn cmd_run(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
         print_run_help();
@@ -2887,15 +3011,18 @@ fn cmd_run(args: &[String]) -> ! {
         log_error(&e);
         process::exit(1);
     }
-    match detect_mode() {
+    let mut supervisor = runtime::RunSupervisor::new();
+    let code = match detect_mode() {
         Some("saga") => {
             log("Detected saga mode");
-            process::exit(run_saga(dry_run))
+            run_saga(dry_run, &mut supervisor)
         }
-        Some("grind") => process::exit(run_loop_with_label(dry_run, "grind")),
-        Some("brute") => process::exit(run_brute(dry_run)),
-        _ => process::exit(run_loop(dry_run)),
-    }
+        Some("grind") => run_loop_with_label(dry_run, "grind", &mut supervisor),
+        Some("brute") => run_brute(dry_run, &mut supervisor),
+        _ => run_loop(dry_run, &mut supervisor),
+    };
+    drop(supervisor);
+    process::exit(code)
 }
 
 fn main() {
@@ -2913,6 +3040,7 @@ fn main() {
         "stash" => cmd_stash(&args),
         "layer" => cmd_layer(&args),
         "run" => cmd_run(&args),
+        "inject" => cmd_inject(&args),
         "stats" => cmd_stats(&args),
         "--help" | "-h" | "help" => {
             print_usage();

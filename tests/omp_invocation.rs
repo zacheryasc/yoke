@@ -55,6 +55,33 @@ set -euo pipefail
         echo "$arg"
     done
 } >> .loop/.omp-argv
+
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        echo "$line" >> .loop/.omp-stdin
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            printf 'STATUS: DONE\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-argv","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
+
 printf 'STATUS: DONE\n' > .loop/notes.md
 exit 0
 "#;
@@ -121,8 +148,8 @@ fn default_backend_invokes_omp_with_model_and_thinking() {
 
     let argv = fs::read_to_string(loop_dir.join(".omp-argv")).expect("mock omp argv");
     assert!(
-        argv.contains("--mode\njson"),
-        "OMP must run in JSON mode.\nargv:\n{}",
+        argv.contains("--mode\nrpc"),
+        "main worker must run in OMP RPC mode.\nargv:\n{}",
         argv
     );
     assert!(
@@ -140,9 +167,11 @@ fn default_backend_invokes_omp_with_model_and_thinking() {
         "thinking directive must pass through to OMP.\nargv:\n{}",
         argv
     );
+    let stdin = fs::read_to_string(loop_dir.join(".omp-stdin")).expect("mock omp stdin");
     assert!(
-        argv.contains("-p\nRead .loop/protocol.md and follow its instructions."),
-        "worker prompt must be passed after -p for OMP print mode.\nargv:\n{}",
-        argv
+        stdin.contains("\"type\":\"prompt\"")
+            && stdin.contains("Read .loop/protocol.md and follow its instructions."),
+        "worker prompt must be sent through OMP RPC stdin.\nstdin:\n{}",
+        stdin
     );
 }

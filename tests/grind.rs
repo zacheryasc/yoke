@@ -316,6 +316,36 @@ EOF
     exit 0
 fi
 
+if [[ "$args" == *"--mode rpc"* ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            count_file=".worker-count"
+            count=0
+            if [ -f "$count_file" ]; then
+                count=$(cat "$count_file")
+            fi
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$count_file"
+            if [ "$count" -gt 2 ]; then
+                exit 42
+            fi
+            printf 'pass %s completed without status\n' "$count" > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-grind","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
+
 count_file=".worker-count"
 count=0
 if [ -f "$count_file" ]; then
@@ -413,6 +443,29 @@ printf '{"cstat_version":"fake","score_version":"code_complexity_cost_v0","targe
         &mock_bin_dir.join("omp"),
         r#"#!/usr/bin/env bash
 set -euo pipefail
+if [[ "$*" == *"--mode rpc"* ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            printf 'STATUS: DONE\n' > .loop/notes.md
+            cat > .loop/grind-gate.py <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.exit(99)
+PY
+            printf '{"code_complexity_cost":1.0}\n' > .loop/cstat-baseline.json
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-grind-restore","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+            exit 0
+        fi
+    done
+fi
 printf 'STATUS: DONE\n' > .loop/notes.md
 cat > .loop/grind-gate.py <<'PY'
 #!/usr/bin/env python3

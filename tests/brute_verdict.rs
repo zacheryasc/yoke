@@ -96,7 +96,40 @@ set -euo pipefail
     done
 } >> .loop/.omp-argv
 
-# Extract the prompt from -p argument
+MODE=""
+for arg in "$@"; do
+    if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
+done
+
+if [[ "$MODE" == "rpc" ]]; then
+    echo '{"type":"ready"}'
+    while IFS= read -r line; do
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        if [[ "$line" == *'"type":"prompt"'* ]]; then
+            COUNTER_FILE=".loop/.agent-calls"
+            N=0
+            if [[ -f "$COUNTER_FILE" ]]; then
+                N=$(cat "$COUNTER_FILE")
+            fi
+            N=$((N + 1))
+            echo "$N" > "$COUNTER_FILE"
+            cp .loop/verdict.md ".loop/.witness-${N}"
+            printf 'STATUS: DONE\n\n## Stage 1 — Minimal\nDone.\n' > .loop/notes.md
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            cat <<'JSON'
+{"type":"session","version":3,"id":"sess-brute-worker","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"agent_end","messages":[]}
+JSON
+        elif [[ "$line" == *'"type":"steer"'* ]]; then
+            printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
+        fi
+    done
+    exit 0
+fi
+
+# Extract the prompt from -p argument for fresh judge/scoper invocations.
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -106,7 +139,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 if echo "$PROMPT" | grep -q "protocol.md"; then
-    # ── Agent mode ──
     COUNTER_FILE=".loop/.agent-calls"
     N=0
     if [[ -f "$COUNTER_FILE" ]]; then
@@ -114,15 +146,9 @@ if echo "$PROMPT" | grep -q "protocol.md"; then
     fi
     N=$((N + 1))
     echo "$N" > "$COUNTER_FILE"
-
-    # Witness: snapshot of verdict.md at the moment the agent runs
     cp .loop/verdict.md ".loop/.witness-${N}"
-
-    # Write STATUS: DONE so plan loop exits
     printf 'STATUS: DONE\n\n## Stage 1 — Minimal\nDone.\n' > .loop/notes.md
-
 elif echo "$PROMPT" | grep -q "judge.md"; then
-    # ── Judge mode ──
     COUNTER_FILE=".loop/.judge-calls"
     N=0
     if [[ -f "$COUNTER_FILE" ]]; then
@@ -130,7 +156,6 @@ elif echo "$PROMPT" | grep -q "judge.md"; then
     fi
     N=$((N + 1))
     echo "$N" > "$COUNTER_FILE"
-
     if [[ "$N" -eq 1 ]]; then
         printf 'VERDICT: FAIL\n\nFeature is broken — step counter never increments.' > .loop/verdict.md
     else
@@ -235,10 +260,11 @@ fn brute_verdict_preserved_across_iterations() {
     // ── Assertions ──
     let argv = fs::read_to_string(loop_dir.join(".omp-argv")).expect("mock omp argv");
     assert!(
-        argv.contains("--mode\njson")
+        argv.contains("--mode\nrpc")
             && argv.contains("--auto-approve")
-            && argv.contains("-p\nRead .loop/protocol.md and follow its instructions."),
-        "default backend should invoke omp in JSON print mode with the worker prompt.\nargv:\n{}",
+            && argv.contains("--mode\njson")
+            && argv.contains("-p\nRead .loop/judge.md"),
+        "main worker should use RPC and judge should still use JSON print mode.\nargv:\n{}",
         argv
     );
 
