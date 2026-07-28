@@ -19,6 +19,7 @@ use config::{Config, Periodic};
 
 const CONF_PATH: &str = ".loop/yoke.conf";
 const NOTES_PATH: &str = ".loop/notes.md";
+const ARCHIVE_DIR: &str = ".loop/archive";
 const GUARD_RESULTS_PATH: &str = ".loop/guard-results.md";
 const PROTOCOL_PATH: &str = ".loop/protocol.md";
 const PLAN_PATH: &str = ".loop/plan.md";
@@ -38,6 +39,7 @@ const DEFAULT_SAGA_CONF: &str = include_str!("templates/saga/yoke.conf");
 const DEFAULT_GRIND_CONF: &str = include_str!("templates/grind/yoke.conf");
 const DEFAULT_GRIND_PROTOCOL: &str = include_str!("templates/grind/protocol.md");
 const DEFAULT_GRIND_GATE: &str = include_str!("templates/grind/grind-gate.py");
+const DEFAULT_GRIND_JUDGE: &str = include_str!("templates/grind/judge.md");
 
 const LAYER_REPL: &str = include_str!("templates/layers/repl.md");
 
@@ -50,7 +52,6 @@ const DECISIONS_PATH: &str = ".loop/decisions.md";
 const SUB_PLAN_PATH: &str = ".loop/sub-plan.md";
 const GRIND_GATE_PATH: &str = ".loop/grind-gate.py";
 const CSTAT_BASELINE_PATH: &str = ".loop/cstat-baseline.json";
-pub(crate) const STASH_DIR: &str = ".loop/.stash";
 
 /// Parse the plan file and notes.md to determine stage progress.
 /// Returns `Some((completed, total))` if the plan has parseable `## Stage` headers.
@@ -285,12 +286,12 @@ fn print_run_help() {
         BOLD, RESET, SPECIFICATION_PATH
     );
     eprintln!(
-        "  {}brute{}   Plan stages + judge — detected when {} exists.",
-        BOLD, RESET, JUDGE_PATH
-    );
-    eprintln!(
         "  {}grind{}   cstat cleanup loop — detected when {} and {} exist.",
         BOLD, RESET, GRIND_GATE_PATH, CSTAT_BASELINE_PATH
+    );
+    eprintln!(
+        "  {}brute{}   Plan stages + judge — detected when {} exists without grind files.",
+        BOLD, RESET, JUDGE_PATH
     );
     eprintln!(
         "  {}loop{}    (default) Staged plan loop — iterates until STATUS: DONE and guards pass.",
@@ -316,6 +317,15 @@ fn print_run_help() {
     eprintln!("     d. Run configured guard commands");
     eprintln!("  4. Exit when STATUS: DONE and all guards pass");
     eprintln!();
+    eprintln!("{}WORKFLOW (grind):{}", BOLD, RESET);
+    eprintln!("  1. Load config from {}", CONF_PATH);
+    eprintln!("  2. Per grind pass:");
+    eprintln!("     a. Restore protected files");
+    eprintln!("     b. Invoke OMP with JSON output");
+    eprintln!("     c. Run diff boundary check and grind gate");
+    eprintln!("     d. Optionally invoke judge when judge-every cadence matches");
+    eprintln!("  3. Exit after grind-passes successful gate passes");
+    eprintln!();
     eprintln!("{}WORKFLOW (brute):{}", BOLD, RESET);
     eprintln!("  1. Load config from {}", CONF_PATH);
     eprintln!("  2. Backup protected files (protocol.md, plan.md, task.md, judge.md, yoke.conf)");
@@ -338,14 +348,14 @@ fn print_init_help() {
     eprintln!("{}MODES:{}", BOLD, RESET);
     eprintln!("  {}(default){}  Staged plan loop. Creates:", BOLD, RESET);
     eprintln!("              yoke.conf, protocol.md, briefing.md, plan.md, notes.md,");
-    eprintln!("              guard-results.md");
+    eprintln!("              archive/, guard-results.md");
     eprintln!();
     eprintln!(
         "  {}brute{}      Plan stages + judge. Creates:",
         BOLD, RESET
     );
     eprintln!("              yoke.conf, protocol.md, briefing.md, plan.md, judge.md,");
-    eprintln!("              notes.md, verdict.md, guard-results.md");
+    eprintln!("              notes.md, archive/, verdict.md, guard-results.md");
     eprintln!();
     eprintln!(
         "  {}saga{}       Scoper + brute loop. Creates:",
@@ -353,11 +363,13 @@ fn print_init_help() {
     );
     eprintln!("              yoke.conf, saga-protocol.md, protocol.md, judge.md,");
     eprintln!("              specification.md, saga-notes.md, decisions.md,");
-    eprintln!("              sub-plan.md, notes.md, verdict.md, guard-results.md");
+    eprintln!("              sub-plan.md, notes.md, archive/, verdict.md, guard-results.md");
     eprintln!();
     eprintln!("  {}grind{}      cstat cleanup loop. Creates:", BOLD, RESET);
-    eprintln!("              yoke.conf, protocol.md, grind-gate.py,");
-    eprintln!("              cstat-baseline.json, notes.md, guard-results.md");
+    eprintln!("              yoke.conf, protocol.md, grind-gate.py, judge.md,");
+    eprintln!(
+        "              cstat-baseline.json, notes.md, archive/, verdict.md, guard-results.md"
+    );
     eprintln!();
     eprintln!("Existing files are never overwritten.");
     eprintln!();
@@ -404,6 +416,13 @@ impl Drop for LoopRunner {
     }
 }
 
+fn ensure_archive_dir() {
+    if let Err(e) = fs::create_dir_all(ARCHIVE_DIR) {
+        log_error(&format!("cannot create {}: {}", ARCHIVE_DIR, e));
+        process::exit(1);
+    }
+}
+
 /// Check that required loop files exist, create notes if missing.
 /// `plan_path` is required for plan-driven modes and absent for grind.
 ///
@@ -430,6 +449,7 @@ fn preflight(plan_path: Option<&str>, clear_guard_results: bool) {
         log_error(&format!("cannot create {}: {}", NOTES_PATH, e));
         process::exit(1);
     }
+    ensure_archive_dir();
     // Clear guard results only on standalone (non-nested) runs.
     // In brute mode, run_brute_inner() handles the initial clear and
     // retries preserve guard feedback for the worker.
@@ -1204,13 +1224,16 @@ fn print_clean_help() {
     eprintln!();
     eprintln!("Clears working files back to a blank slate:");
     eprintln!("  plan.md, notes.md, verdict.md, guard-results.md  →  emptied");
-    eprintln!("  saga-notes.md, decisions.md, sub-plan.md          →  emptied (if present)");
+    eprintln!("  archive/*.md                                    →  removed");
+    eprintln!("  saga-notes.md, decisions.md, sub-plan.md        →  emptied (if present)");
     eprintln!("  judge.md  →  reset to default template");
     eprintln!();
     eprintln!("Structural files are left untouched:");
     eprintln!("  protocol.md, saga-protocol.md, yoke.conf, briefing.md, specification.md");
     eprintln!();
-    eprintln!("Non-empty working files are auto-stashed to .loop/.stash/ before wiping.");
+    eprintln!(
+        "Non-empty working files are auto-stashed to ~/.yoke/stash/<project-slug>/ before wiping."
+    );
     eprintln!(
         "Browse with: {}yoke stash log{}   Recover with: {}yoke stash pop{}",
         BOLD, RESET, BOLD, RESET
@@ -1250,14 +1273,23 @@ fn clean() -> i32 {
         }
     }
 
-    // Reset judge.md to default template (saga uses a different default)
+    let archive = Path::new(ARCHIVE_DIR);
+    if archive.exists() {
+        if let Err(e) = fs::remove_dir_all(archive) {
+            log_error(&format!("failed to clear {}: {}", ARCHIVE_DIR, e));
+            return 1;
+        }
+        log(&format!("cleared: {}", ARCHIVE_DIR));
+    }
+    ensure_archive_dir();
+
+    // Reset judge.md to the active mode's default template.
     let judge = Path::new(JUDGE_PATH);
     if judge.exists() {
-        let is_saga = Path::new(SPECIFICATION_PATH).exists();
-        let template = if is_saga {
-            DEFAULT_SAGA_JUDGE
-        } else {
-            DEFAULT_JUDGE
+        let template = match mode {
+            "saga" => DEFAULT_SAGA_JUDGE,
+            "grind" => DEFAULT_GRIND_JUDGE,
+            _ => DEFAULT_JUDGE,
         };
         if let Err(e) = fs::write(judge, template) {
             log_error(&format!("failed to reset {}: {}", JUDGE_PATH, e));
@@ -1315,8 +1347,10 @@ fn mode_files(mode: &str) -> Option<Vec<(&'static str, &'static str)>> {
             (CONF_PATH, DEFAULT_GRIND_CONF),
             (PROTOCOL_PATH, DEFAULT_GRIND_PROTOCOL),
             (GRIND_GATE_PATH, DEFAULT_GRIND_GATE),
+            (JUDGE_PATH, DEFAULT_GRIND_JUDGE),
             (CSTAT_BASELINE_PATH, ""),
             (NOTES_PATH, ""),
+            (VERDICT_PATH, ""),
             (GUARD_RESULTS_PATH, ""),
         ],
         _ => return None,
@@ -1330,10 +1364,10 @@ fn detect_mode() -> Option<&'static str> {
     }
     if Path::new(SPECIFICATION_PATH).exists() {
         Some("saga")
-    } else if Path::new(JUDGE_PATH).exists() {
-        Some("brute")
     } else if Path::new(GRIND_GATE_PATH).exists() && Path::new(CSTAT_BASELINE_PATH).exists() {
         Some("grind")
+    } else if Path::new(JUDGE_PATH).exists() {
+        Some("brute")
     } else if Path::new(PROTOCOL_PATH).exists() {
         Some("loop")
     } else {
@@ -1362,6 +1396,7 @@ fn switch_mode(current: &str, target: &str) -> i32 {
     for (name, _) in &current_files {
         let _ = fs::remove_file(Path::new(".loop").join(name));
     }
+    ensure_archive_dir();
 
     // 3. Fresh-init target mode
     let target_files = mode_files(target).unwrap();
@@ -1449,6 +1484,7 @@ fn init(mode: &str) -> i32 {
         }
         log("Created .loop/");
     }
+    ensure_archive_dir();
 
     log(&format!("Initializing '{}' mode...", mode));
 
@@ -1469,6 +1505,18 @@ fn init(mode: &str) -> i32 {
         capture_grind_baseline_if_missing();
     }
     0
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopKind {
+    Plan,
+    Grind,
+}
+
+impl LoopKind {
+    fn uses_status_completion(self) -> bool {
+        matches!(self, LoopKind::Plan)
+    }
 }
 
 /// Outcome of a plan loop run.
@@ -1507,8 +1555,8 @@ enum JudgeEveryAction {
     Pass,
     /// Consecutive failures hit threshold — bail out.
     Bailout,
-    /// Continue to next iteration (judge failed on DONE, or mid-loop check done).
-    Continue,
+    /// Continue to next iteration; carries whether a fired judge failed.
+    Continue { judge_failed: bool },
 }
 
 /// Evaluate judge-every logic: fire judge when worker signals DONE or at cadence checkpoints.
@@ -1518,12 +1566,13 @@ fn evaluate_judge_every(
     config: &Config,
     iteration: u32,
     guards_passed: bool,
+    loop_kind: LoopKind,
     consecutive_judge_failures: &mut u32,
     judge_every: u32,
     judge_secs_out: &mut Option<f64>,
 ) -> JudgeEveryAction {
-    if guards_passed && is_status_done(NOTES_PATH) {
-        // Always fire judge when worker signals DONE
+    if loop_kind.uses_status_completion() && guards_passed && is_status_done(NOTES_PATH) {
+        // Always fire judge when a status-driven worker signals DONE.
         eprintln!();
         render_section_banner("Judge (DONE)", "Worker DONE — invoking judge", BLUE);
         let judge_start = std::time::Instant::now();
@@ -1541,8 +1590,11 @@ fn evaluate_judge_every(
             ORANGE, *consecutive_judge_failures, config.max_judge_failures, RESET
         ));
         reset_notes_status();
-    } else if guards_passed && iteration % judge_every == 0 {
-        // Mid-loop quality checkpoint
+        return JudgeEveryAction::Continue { judge_failed: true };
+    }
+
+    if guards_passed && iteration % judge_every == 0 {
+        // Cadenced quality checkpoint.
         eprintln!();
         render_section_banner(
             "Mid-loop Judge",
@@ -1554,15 +1606,21 @@ fn evaluate_judge_every(
         *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
         if pass {
             *consecutive_judge_failures = 0;
-        } else {
-            *consecutive_judge_failures += 1;
-            if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
-                return JudgeEveryAction::Bailout;
-            }
+            return JudgeEveryAction::Continue {
+                judge_failed: false,
+            };
         }
-        // Either way, worker continues — verdict.md has feedback
+
+        *consecutive_judge_failures += 1;
+        if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
+            return JudgeEveryAction::Bailout;
+        }
+        return JudgeEveryAction::Continue { judge_failed: true };
     }
-    JudgeEveryAction::Continue
+
+    JudgeEveryAction::Continue {
+        judge_failed: false,
+    }
 }
 
 /// Validate config preconditions for the plan loop. Exits on failure.
@@ -1740,6 +1798,7 @@ fn run_plan_loop(
     dry_run: bool,
     nested: bool,
     recorder: &mut metrics::RunRecorder,
+    kind: LoopKind,
 ) -> PlanLoopOutcome {
     preflight(plan_path, !nested);
     validate_loop_config(config);
@@ -1748,6 +1807,9 @@ fn run_plan_loop(
     let mut protected: Vec<&str> = vec![PROTOCOL_PATH, CONF_PATH];
     if let Some(plan_path) = plan_path {
         protected.push(plan_path);
+    }
+    if Path::new(JUDGE_PATH).exists() {
+        protected.push(JUDGE_PATH);
     }
     if Path::new(GRIND_GATE_PATH).exists() {
         protected.push(GRIND_GATE_PATH);
@@ -1767,6 +1829,7 @@ fn run_plan_loop(
     let mut iteration: u32 = 0;
     let mut total_cost: f64 = 0.0;
     let mut consecutive_judge_failures: u32 = 0;
+    let mut completed_grind_passes: u32 = 0;
 
     loop {
         if signal::interrupted() {
@@ -1780,6 +1843,8 @@ fn run_plan_loop(
         eprintln!();
         let label = if nested {
             "Plan Iteration"
+        } else if kind == LoopKind::Grind {
+            "Grind Iteration"
         } else {
             "Iteration"
         };
@@ -1818,23 +1883,28 @@ fn run_plan_loop(
 
         let mut judge_secs: Option<f64> = None;
         let mut early_return: Option<PlanLoopOutcome> = None;
+        let mut judge_failed_this_iteration = false;
         if let Some(judge_every) = config.judge_every {
             match evaluate_judge_every(
                 &mut runner,
                 config,
                 iteration,
                 step_stats.guards_passed,
+                kind,
                 &mut consecutive_judge_failures,
                 judge_every,
                 &mut judge_secs,
             ) {
                 JudgeEveryAction::Pass => early_return = Some(PlanLoopOutcome::JudgePass),
                 JudgeEveryAction::Bailout => early_return = Some(PlanLoopOutcome::JudgeBailout),
-                JudgeEveryAction::Continue => {}
+                JudgeEveryAction::Continue { judge_failed } => {
+                    judge_failed_this_iteration = judge_failed;
+                }
             }
         }
 
-        let status_done = step_stats.guards_passed && is_status_done(NOTES_PATH);
+        let status_done =
+            kind.uses_status_completion() && step_stats.guards_passed && is_status_done(NOTES_PATH);
 
         // Build & flush iteration metrics row before any return path so
         // every completed iteration is recorded.
@@ -1874,6 +1944,30 @@ fn run_plan_loop(
 
         if let Some(outcome) = early_return {
             return outcome;
+        }
+
+        if kind == LoopKind::Grind && step_stats.guards_passed {
+            if judge_failed_this_iteration {
+                log(&format!(
+                    "{}Grind gate passed but judge failed \u{2014} worker will see verdict next iteration{}",
+                    ORANGE, RESET
+                ));
+            } else {
+                completed_grind_passes += 1;
+                if completed_grind_passes >= config.grind_passes {
+                    eprintln!();
+                    eprintln!(
+                        "{}{}  Grind passes complete ({}/{}) \u{2014} loop complete  {}",
+                        GREEN, BOLD, completed_grind_passes, config.grind_passes, RESET
+                    );
+                    eprintln!();
+                    return PlanLoopOutcome::Done;
+                }
+                log(&format!(
+                    "{}Grind pass {}/{} complete \u{2014} continuing{}",
+                    GREEN, completed_grind_passes, config.grind_passes, RESET
+                ));
+            }
         }
 
         if status_done {
@@ -1942,7 +2036,12 @@ fn run_loop_with_label(dry_run: bool, mode_label: &'static str) -> i32 {
     } else {
         Some(PLAN_PATH)
     };
-    let outcome = run_plan_loop(&config, plan_path, dry_run, false, &mut recorder);
+    let kind = if mode_label == "grind" {
+        LoopKind::Grind
+    } else {
+        LoopKind::Plan
+    };
+    let outcome = run_plan_loop(&config, plan_path, dry_run, false, &mut recorder, kind);
     recorder.set_outcome(plan_outcome_label(&outcome));
     drop(recorder);
     match outcome {
@@ -2133,7 +2232,14 @@ fn run_brute_core(
             log("(dry-run) Skipping worker invocation");
         } else {
             log("Using plan runner as worker...");
-            match run_plan_loop(config, Some(plan_path), false, true, recorder) {
+            match run_plan_loop(
+                config,
+                Some(plan_path),
+                false,
+                true,
+                recorder,
+                LoopKind::Plan,
+            ) {
                 PlanLoopOutcome::JudgePass => {
                     // Embedded judge already passed — skip standalone judge
                     log("Plan runner completed with embedded judge PASS");

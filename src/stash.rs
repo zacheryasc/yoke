@@ -1,8 +1,8 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ansi::{BLUE, BOLD, ORANGE, RESET};
-use crate::{STASH_DIR, log, log_error};
+use crate::{log, log_error, metrics};
 
 // ── Stash helpers ──────────────────────────────────────────────────────
 
@@ -41,14 +41,43 @@ fn generate_stash_hash(timestamp: &str, files: &[(String, Vec<u8>)]) -> String {
     format!("{:07x}", hasher.finish() & 0x0FFF_FFFF)
 }
 
+/// Collect regular files under `dir`, storing paths relative to `.loop/`.
+fn collect_regular_files(files: &mut Vec<(String, Vec<u8>)>, dir: &Path, prefix: &str) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(contents) = fs::read(&path) {
+                    files.push((rel, contents));
+                }
+            } else if path.is_dir() {
+                collect_regular_files(files, &path, &rel);
+            }
+        }
+    }
+}
+
 /// Collect all regular files in `.loop/` excluding dotfile/dotdir entries.
-/// Returns sorted `(filename, contents)` pairs for deterministic hashing.
+///
+/// Top-level loop files are always included. The secondary note archive lives
+/// under `.loop/archive/`, so it is included recursively without pulling in
+/// unrelated log/checkpoint directories.
+/// Returns sorted `(relative path, contents)` pairs for deterministic hashing.
 pub(crate) fn collect_stashable_files() -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(".loop") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if name.starts_with('.') || name.starts_with("backups-") {
                 continue;
             }
             let path = entry.path();
@@ -56,6 +85,8 @@ pub(crate) fn collect_stashable_files() -> Vec<(String, Vec<u8>)> {
                 if let Ok(contents) = fs::read(&path) {
                     files.push((name, contents));
                 }
+            } else if name == "archive" && path.is_dir() {
+                collect_regular_files(&mut files, &path, "archive");
             }
         }
     }
@@ -70,9 +101,14 @@ pub(crate) struct StashEntry {
     pub files: Vec<String>,
 }
 
-/// Parse `.loop/.stash/index` into a list of stash entries (oldest first).
+/// Project-scoped stash storage under `~/.yoke/stash/<project-slug>/`.
+fn stash_base_dir() -> PathBuf {
+    metrics::expand_tilde("~/.yoke/stash").join(metrics::project_slug())
+}
+
+/// Parse `~/.yoke/stash/<project-slug>/index` into a list of stash entries (oldest first).
 pub(crate) fn parse_stash_index() -> Vec<StashEntry> {
-    let index_path = format!("{}/index", STASH_DIR);
+    let index_path = stash_base_dir().join("index");
     let content = match fs::read_to_string(&index_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -114,7 +150,9 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
     let mut hash = generate_stash_hash(&timestamp, &files);
 
     // Collision handling: rehash with counter suffix
-    let stash_base = Path::new(STASH_DIR);
+    let stash_base = stash_base_dir();
+    fs::create_dir_all(&stash_base)
+        .map_err(|e| format!("failed to create {}: {}", stash_base.display(), e))?;
     for attempt in 0..100u32 {
         if !stash_base.join(&hash).exists() {
             break;
@@ -133,18 +171,22 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
 
     for (name, contents) in &files {
         let dest = entry_dir.join(name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        }
         fs::write(&dest, contents)
             .map_err(|e| format!("failed to write {}: {}", dest.display(), e))?;
     }
 
     // Append to index
-    let index_path = format!("{}/index", STASH_DIR);
+    let index_path = stash_base.join("index");
     let line = format!("{}|{}|{}|{}\n", hash, timestamp, mode, file_names.join(","));
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&index_path)
-        .map_err(|e| format!("failed to open index: {}", e))?;
+        .map_err(|e| format!("failed to open {}: {}", index_path.display(), e))?;
     std::io::Write::write_all(&mut f, line.as_bytes())
         .map_err(|e| format!("failed to write index: {}", e))?;
 
@@ -248,13 +290,15 @@ fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
         let _ = fs::remove_file(Path::new(".loop").join(name));
     }
 
-    if let Ok(dir_entries) = fs::read_dir(entry_dir) {
-        for entry in dir_entries.flatten() {
-            let name = entry.file_name();
-            let dest = Path::new(".loop").join(&name);
-            fs::copy(entry.path(), &dest)
-                .map_err(|e| format!("failed to restore {}: {}", name.to_string_lossy(), e))?;
+    let mut restored_files = Vec::new();
+    collect_regular_files(&mut restored_files, entry_dir, "");
+    for (name, contents) in restored_files {
+        let dest = Path::new(".loop").join(&name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
         }
+        fs::write(&dest, contents).map_err(|e| format!("failed to restore {}: {}", name, e))?;
     }
     Ok(())
 }
@@ -277,7 +321,7 @@ pub(crate) fn stash_checkout(target_hash: &str, mode: &str) -> i32 {
         None => return 1,
     };
 
-    let entry_dir = Path::new(STASH_DIR).join(&target.hash);
+    let entry_dir = stash_base_dir().join(&target.hash);
     if !entry_dir.exists() {
         log_error("stash entry directory missing — index is corrupt");
         return 1;
@@ -329,6 +373,8 @@ pub(crate) fn print_stash_help() {
         "  {}pop{}              Alias for checkout of the most recent entry",
         BOLD, RESET
     );
+    eprintln!();
+    eprintln!("Storage: ~/.yoke/stash/<project-slug>/");
     eprintln!();
     eprintln!("{}EXAMPLES:{}", BOLD, RESET);
     eprintln!("  yoke stash                   # snapshot current .loop/ files");

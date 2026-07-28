@@ -27,6 +27,23 @@ fn yoke_bin() -> std::path::PathBuf {
     path
 }
 
+fn project_stash_dir(home: &std::path::Path) -> std::path::PathBuf {
+    let stash_root = home.join(".yoke/stash");
+    let mut dirs: Vec<std::path::PathBuf> = fs::read_dir(&stash_root)
+        .unwrap_or_else(|e| panic!("stash root {} should exist: {}", stash_root.display(), e))
+        .map(|entry| entry.expect("stash root entry").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    assert_eq!(
+        dirs.len(),
+        1,
+        "stash root should contain one project-slug directory, got: {:?}",
+        dirs
+    );
+    dirs.remove(0)
+}
+
 /// Set up a minimal git repo in the given directory.
 fn git_init(project: &std::path::Path) {
     let git = |args: &[&str]| {
@@ -77,7 +94,7 @@ fn stash_roundtrip_after_extraction() {
     let yoke = yoke_bin();
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = tmp.path();
-
+    let home = project.join("home");
     git_init(project);
 
     // Initialize brute mode (creates .loop/ with judge.md, etc.)
@@ -92,7 +109,7 @@ fn stash_roundtrip_after_extraction() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Write distinctive content into plan.md and notes.md
+    // Write distinctive content into plan.md, notes.md, and the detailed archive
     let loop_dir = project.join(".loop");
     fs::write(
         loop_dir.join("plan.md"),
@@ -104,11 +121,17 @@ fn stash_roundtrip_after_extraction() {
         "STATUS: IN_PROGRESS\n\nSome important notes here.\n",
     )
     .unwrap();
+    fs::write(
+        loop_dir.join("archive/stage-1-widget.md"),
+        "Tried path A; next try path B.\n",
+    )
+    .unwrap();
 
     // Stash the current state
     let out = Command::new(&yoke)
         .args(["stash"])
         .current_dir(project)
+        .env("HOME", &home)
         .output()
         .expect("yoke stash");
     assert!(
@@ -121,6 +144,7 @@ fn stash_roundtrip_after_extraction() {
     let out = Command::new(&yoke)
         .args(["stash", "log"])
         .current_dir(project)
+        .env("HOME", &home)
         .output()
         .expect("yoke stash log");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -140,14 +164,44 @@ fn stash_roundtrip_after_extraction() {
         "notes.md should be gone after stash"
     );
     assert!(
-        loop_dir.join(".stash").exists(),
-        ".stash/ should survive stash clear"
+        !loop_dir.join("archive/stage-1-widget.md").exists(),
+        "archive stage note should be gone after stash"
+    );
+    let project_stash = project_stash_dir(&home);
+    assert!(
+        project_stash.join("index").exists(),
+        "project-scoped stash index should exist"
+    );
+    let has_plan_backup = fs::read_dir(&project_stash)
+        .expect("project stash dir")
+        .any(|entry| entry.expect("stash entry").path().join("plan.md").exists());
+    assert!(
+        has_plan_backup,
+        "stashed files should live under ~/.yoke/stash/<project-slug>/<hash>/"
+    );
+    let has_archive_backup = fs::read_dir(&project_stash)
+        .expect("project stash dir")
+        .any(|entry| {
+            entry
+                .expect("stash entry")
+                .path()
+                .join("archive/stage-1-widget.md")
+                .exists()
+        });
+    assert!(
+        has_archive_backup,
+        "stashed archive files should live under ~/.yoke/stash/<project-slug>/<hash>/archive/"
+    );
+    assert!(
+        !loop_dir.join(".stash").exists(),
+        ".loop/.stash should not be used for stash storage"
     );
 
     // Pop — should restore the stashed state with our distinctive content
     let out = Command::new(&yoke)
         .args(["stash", "pop"])
         .current_dir(project)
+        .env("HOME", &home)
         .output()
         .expect("yoke stash pop");
     assert!(
@@ -162,6 +216,12 @@ fn stash_roundtrip_after_extraction() {
         plan.contains("Build the widget"),
         "plan.md should be restored after pop, got: {:?}",
         plan
+    );
+    let archive = fs::read_to_string(loop_dir.join("archive/stage-1-widget.md")).unwrap();
+    assert!(
+        archive.contains("next try path B"),
+        "archive note should be restored after pop, got: {:?}",
+        archive
     );
 }
 
@@ -780,7 +840,7 @@ fn stash_records_correct_mode_after_extraction() {
     let yoke = yoke_bin();
     let tmp = tempfile::tempdir().expect("tempdir");
     let project = tmp.path();
-
+    let home = project.join("home");
     git_init(project);
 
     // Initialize brute mode
@@ -802,6 +862,7 @@ fn stash_records_correct_mode_after_extraction() {
     let out = Command::new(&yoke)
         .args(["stash"])
         .current_dir(project)
+        .env("HOME", &home)
         .output()
         .expect("yoke stash");
     assert!(
@@ -810,8 +871,8 @@ fn stash_records_correct_mode_after_extraction() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Read the stash index directly and verify mode=brute
-    let index_path = project.join(".loop/.stash/index");
+    // Read the project-scoped stash index directly and verify mode=brute
+    let index_path = project_stash_dir(&home).join("index");
     assert!(
         index_path.exists(),
         "stash index should exist after stashing"

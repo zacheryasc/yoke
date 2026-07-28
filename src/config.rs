@@ -55,6 +55,7 @@ pub struct Config {
     pub guards: Vec<String>,
     pub judge_every: Option<u32>,
     pub max_judge_failures: u32,
+    pub grind_passes: u32,
     pub periodics: Vec<Periodic>,
     pub hooks: Vec<String>,
     /// Resolved absolute path where NDJSON metrics rows are written.
@@ -73,6 +74,7 @@ struct ConfigBuilder {
     guards: Vec<String>,
     judge_every: Option<u32>,
     max_judge_failures: u32,
+    grind_passes: u32,
     periodics: Vec<Periodic>,
     pending_guard_afters: Vec<(String, String, usize)>,
     hooks: Vec<String>,
@@ -166,6 +168,7 @@ impl ConfigBuilder {
             guards: Vec::new(),
             judge_every: None,
             max_judge_failures: 3,
+            grind_passes: 1,
             periodics: Vec::new(),
             pending_guard_afters: Vec::new(),
             hooks: Vec::new(),
@@ -234,6 +237,9 @@ impl ConfigBuilder {
                 self.max_judge_failures =
                     parse_positive_u32(value, path, line_num, "max-judge-failures")?
             }
+            "grind-passes" => {
+                self.grind_passes = parse_positive_u32(value, path, line_num, "grind-passes")?
+            }
             "periodic" => self.periodics.push(parse_periodic(value, path, line_num)?),
             "guard-after" => self
                 .pending_guard_afters
@@ -290,6 +296,7 @@ impl ConfigBuilder {
             guards: self.guards,
             judge_every: self.judge_every,
             max_judge_failures: self.max_judge_failures,
+            grind_passes: self.grind_passes,
             periodics,
             hooks: self.hooks,
             metrics_dir,

@@ -123,9 +123,15 @@ fn init_grind_creates_profile_and_captures_baseline() {
         "yoke.conf",
         "notes.md",
         "guard-results.md",
+        "judge.md",
+        "verdict.md",
     ] {
         assert!(loop_dir.join(name).exists(), "missing .loop/{name}");
     }
+    assert!(
+        loop_dir.join("archive").is_dir(),
+        "missing .loop/archive/ note archive"
+    );
     for name in ["grind.md", "plan.md"] {
         assert!(!loop_dir.join(name).exists(), "unexpected .loop/{name}");
     }
@@ -145,6 +151,16 @@ fn init_grind_creates_profile_and_captures_baseline() {
         conf
     );
     assert!(
+        conf.contains("grind-passes 1"),
+        "grind pass count must default to one. yoke.conf:\n{}",
+        conf
+    );
+    assert!(
+        conf.contains("# judge-every 3"),
+        "grind config should document optional judge cadence. yoke.conf:\n{}",
+        conf
+    );
+    assert!(
         conf.contains("# no-modify   tests/"),
         "tests no-modify example should be commented. yoke.conf:\n{}",
         conf
@@ -161,6 +177,21 @@ fn init_grind_creates_profile_and_captures_baseline() {
     assert!(
         !protocol.contains(".loop/plan.md"),
         "grind protocol must not reference plan.md. protocol:\n{}",
+        protocol
+    );
+    assert!(
+        protocol.contains("grind-passes"),
+        "grind protocol should document pass-count completion. protocol:\n{}",
+        protocol
+    );
+    assert!(
+        protocol.contains("grind mode ignores it for completion"),
+        "grind protocol should remove status-based completion. protocol:\n{}",
+        protocol
+    );
+    assert!(
+        protocol.contains(".loop/archive/<name>.md"),
+        "grind protocol should document the secondary note archive. protocol:\n{}",
         protocol
     );
     for command in [
@@ -232,6 +263,120 @@ fn grind_dry_run_rejects_without_cstat_improvement() {
         guard_results.contains("cstat scorecard did not improve"),
         "guard results should explain unchanged score. guard-results:\n{}",
         guard_results
+    );
+}
+
+#[test]
+fn grind_counts_gate_passes_without_status_and_runs_optional_judge() {
+    build_yoke();
+    let yoke = yoke_bin();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    seed_project(project);
+
+    let mock_bin_dir = project.join("mock-bin");
+    fs::create_dir(&mock_bin_dir).unwrap();
+    write_executable(
+        &mock_bin_dir.join("cstat"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+count_file=".cstat-count"
+count=0
+if [ -f "$count_file" ]; then
+    count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+    cost=10.0
+else
+    cost=8.0
+fi
+printf '{"cstat_version":"fake","score_version":"code_complexity_cost_v0","target":".","code_complexity_cost":%s,"top_contributors":[{"kind":"function","file":"src/lib.rs","function":"hot","cost":%s}]}\n' "$cost" "$cost"
+"#,
+    );
+    write_executable(
+        &mock_bin_dir.join("omp"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *".loop/judge.md"* ]]; then
+    count_file=".judge-count"
+    count=0
+    if [ -f "$count_file" ]; then
+        count=$(cat "$count_file")
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    cat > .loop/verdict.md <<'EOF'
+VERDICT: PASS
+
+grind gate passed and cleanup remains acceptable
+EOF
+    exit 0
+fi
+
+count_file=".worker-count"
+count=0
+if [ -f "$count_file" ]; then
+    count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if [ "$count" -gt 2 ]; then
+    exit 42
+fi
+printf 'pass %s completed without status\n' "$count" > .loop/notes.md
+exit 0
+"#,
+    );
+    let test_path = mock_path(&mock_bin_dir);
+
+    let init = run_yoke_init_grind(&yoke, project, &test_path);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let conf_path = project.join(".loop/yoke.conf");
+    let conf = fs::read_to_string(&conf_path)
+        .unwrap()
+        .replace("grind-passes 1", "grind-passes 2\njudge-every 1");
+    fs::write(&conf_path, conf).unwrap();
+
+    let output = Command::new(&yoke)
+        .args(["run"])
+        .current_dir(project)
+        .env("PATH", &test_path)
+        .env("GRIND_ORACLE", "true")
+        .output()
+        .expect("yoke run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "yoke run should complete two judged grind passes. exit={:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr
+    );
+
+    let worker_count = fs::read_to_string(project.join(".worker-count")).unwrap();
+    assert_eq!(
+        worker_count.trim(),
+        "2",
+        "grind-passes=2 should invoke exactly two workers"
+    );
+    let judge_count = fs::read_to_string(project.join(".judge-count")).unwrap();
+    assert_eq!(
+        judge_count.trim(),
+        "2",
+        "judge-every=1 should judge each successful grind pass"
+    );
+    let notes = fs::read_to_string(project.join(".loop/notes.md")).unwrap();
+    assert!(
+        !notes.starts_with("STATUS:"),
+        "grind completion must not depend on STATUS notes. notes:\n{}",
+        notes
     );
 }
 
