@@ -1168,6 +1168,15 @@ fn run_iteration_step(
     } else {
         let stats = invoke_agent(supervisor, config, iteration, prior_total);
         if !stats.success {
+            if signal::interrupted() {
+                log("Interrupted \u{2014} shutting down");
+                return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
+            }
+            if supervisor.shutdown_requested {
+                restore_files(&runner.backup_dir, protected);
+                log("Shutdown steering handled — stopping run");
+                return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
+            }
             log_error("OMP invocation failed — aborting loop");
             return IterationStepResult::Terminal(PlanLoopOutcome::Error);
         }

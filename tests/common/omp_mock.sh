@@ -49,8 +49,10 @@ stream() {
             echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"gpt-test","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.1,"output":0.15,"cacheRead":0,"cacheWrite":0,"total":0.25}},"duration":1500}}'
             ;;
         summary)
+            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}'
+            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"checking files"}}'
             echo '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"first block"}}'
-            echo '{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0,"content":"second block"}}'
+            echo '{"type":"tool_execution_start","toolName":"bash","toolCallId":"t1","args":{"command":"cargo test"}}'
             echo '{"type":"tool_execution_end","toolName":"bash","toolCallId":"t1","isError":false}'
             echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"partial block"}}'
             ;;
@@ -64,7 +66,12 @@ stream() {
             echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}'
             ;;
     esac
-    echo '{"type":"agent_end","messages":[]}'
+}
+
+complete() {
+    printf '{"type":"agent_end","messages":[],"isTerminal":true,"yielded":true}\n'
+    printf '{"type":"prompt_result","id":"%s","agentInvoked":true,"status":"completed","sessionSettled":true}\n' "$1"
+    echo '{"type":"session_settled"}'
 }
 
 for arg in "$@"; do
@@ -76,13 +83,21 @@ if [[ " $* " == *" --mode text "* ]]; then
         echo "summarizer used wrong model" >&2
         exit 9
     fi
-    for required in --no-session --no-tools --no-extensions --no-skills --no-rules --no-context-files; do
+    for required in --system-prompt --no-session --no-tools --no-extensions --no-skills --no-rules --no-context-files --no-lsp --no-title; do
         if [[ "$*" != *"$required"* ]]; then
             echo "summarizer missing $required" >&2
             exit 8
         fi
     done
-    if [[ "${MOCK_SUMMARY:-cheap}" == slow ]]; then
+    if [[ "${MOCK_SUMMARY:-cheap}" == inspect ]]; then
+        for arg in "$@"; do
+            if [[ "$arg" == @* ]]; then
+                printf '\n---PROMPT---\n' >> .loop/.summary-prompts
+                cat "${arg#@}" >> .loop/.summary-prompts
+            fi
+        done
+        echo "cheap summary of the batch"
+    elif [[ "${MOCK_SUMMARY:-cheap}" == slow ]]; then
         sleep 0.5
         echo "slow summary"
     else
@@ -101,11 +116,13 @@ if [[ "$RPC" == 0 ]]; then
     exit 0
 fi
 
+prompt_id=""
 echo '{"type":"ready"}'
 while IFS= read -r line; do
     echo "$line" >> .loop/.omp-stdin
     id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
     if [[ "$line" == *'"type":"prompt"'* ]]; then
+        prompt_id="$id"
         case "${MOCK_WORKER:-done}" in
             pause|await-steer) ;;
             *) agent ;;
@@ -131,6 +148,7 @@ while IFS= read -r line; do
                 ;;
             *)
                 stream
+                complete "$id"
                 exit 0
                 ;;
         esac
@@ -138,12 +156,11 @@ while IFS= read -r line; do
         echo "$line" >> .loop/.steer-requests
         if [[ "${MOCK_STEER:-accept}" == reject ]]; then
             printf '{"id":"%s","type":"response","command":"steer","success":false,"error":"steering rejected by fake RPC"}\n' "$id"
-            echo '{"type":"agent_end","messages":[]}'
         else
             printf '{"id":"%s","type":"response","command":"steer","success":true}\n' "$id"
             printf 'STATUS: DONE\n\nSteering handled.\n' > .loop/notes.md
             echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"steered"}}'
-            echo '{"type":"agent_end","messages":[]}'
+            complete "$prompt_id"
         fi
         exit 0
     fi

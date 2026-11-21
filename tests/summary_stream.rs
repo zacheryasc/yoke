@@ -17,7 +17,11 @@ fn summaries_arrive_on_the_side_stream_in_block_batches() {
     let log_path = p.path_of(".loop/run.log");
     let (mut child, stream) = spawn_with_summary(
         &p,
-        &[("PATH", &path), ("MOCK_WORKER", "summary")],
+        &[
+            ("PATH", &path),
+            ("MOCK_WORKER", "summary"),
+            ("MOCK_SUMMARY", "inspect"),
+        ],
         Stdio::from(fs::File::create(&log_path).unwrap()),
     );
     let records = summary_records(stream);
@@ -39,6 +43,17 @@ fn summaries_arrive_on_the_side_stream_in_block_batches() {
     assert!(
         summaries.iter().any(|s| s["blocks"] == 2),
         "first batch is exactly summary-every blocks: {summaries:?}"
+    );
+
+    let prompts =
+        fs::read_to_string(p.path_of(".loop/.summary-prompts")).expect("summary prompts captured");
+    assert!(
+        prompts.contains("cargo test"),
+        "summary prompt should contain terminal-visible tool text: {prompts:?}"
+    );
+    assert!(
+        !prompts.contains("assistantMessageEvent") && !prompts.contains("tool_execution_start"),
+        "summary prompt leaked raw JSON: {prompts:?}"
     );
 
     let end = records

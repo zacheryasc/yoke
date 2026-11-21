@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::config::{Config, Thinking};
+use crate::stream_omp;
 use crate::{log, log_error};
 
 #[derive(Debug, Clone)]
@@ -92,7 +93,7 @@ impl Queue {
 
 #[derive(Default)]
 struct BlockTracker {
-    current: Vec<String>,
+    current: String,
     completed: Vec<String>,
     blocks_since_batch: u32,
     in_block: bool,
@@ -105,15 +106,19 @@ impl BlockTracker {
         self.observe_with(line, started, ended)
     }
 
-    fn observe_with(&mut self, line: &str, started: bool, ended: bool) -> bool {
-        self.current.push(line.to_string());
+    fn observe_with(&mut self, display: &str, started: bool, ended: bool) -> bool {
+        if !display.is_empty() {
+            if !self.current.is_empty() {
+                self.current.push('\n');
+            }
+            self.current.push_str(display);
+        }
         if started {
             self.in_block = true;
         }
         if ended {
             self.in_block = false;
-            self.completed
-                .push(std::mem::take(&mut self.current).join("\n"));
+            self.completed.push(std::mem::take(&mut self.current));
             self.blocks_since_batch += 1;
         }
         ended
@@ -132,8 +137,7 @@ impl BlockTracker {
     /// dropped.
     fn take_partial(&mut self) -> Option<Batch> {
         if !self.current.is_empty() {
-            self.completed
-                .push(std::mem::take(&mut self.current).join("\n"));
+            self.completed.push(std::mem::take(&mut self.current));
         }
         self.blocks_since_batch = 0;
         if self.completed.is_empty() {
@@ -202,6 +206,7 @@ fn block_transition(line: &str) -> (bool, bool) {
 pub struct SummaryEngine {
     settings: Option<SummarySettings>,
     tracker: BlockTracker,
+    human: stream_omp::HumanStream,
     queue: Arc<Queue>,
     writer: Arc<Mutex<Option<File>>>,
     worker: Option<JoinHandle<()>>,
@@ -224,6 +229,7 @@ impl SummaryEngine {
         let mut engine = Self {
             settings: None,
             tracker: BlockTracker::default(),
+            human: stream_omp::HumanStream::new(),
             queue: Arc::new(Queue::new()),
             writer: Arc::new(Mutex::new(None)),
             worker: None,
@@ -304,7 +310,8 @@ impl SummaryEngine {
         let Some(settings) = self.settings.as_ref() else {
             return ended;
         };
-        self.tracker.observe_with(line, started, ended);
+        let display = self.human.line(line);
+        self.tracker.observe_with(&display, started, ended);
         if ended && let Some(batch) = self.tracker.take_batch(settings.every) {
             log(&format!(
                 "summary queued: {} blocks ({} outstanding)",
@@ -391,7 +398,7 @@ fn summary_worker(settings: SummarySettings, queue: Arc<Queue>, writer: Arc<Mute
 
 fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
     let mut raw = batch.join("\n\n");
-    const MAX_RAW_BYTES: usize = 100_000;
+    const MAX_RAW_BYTES: usize = 8_000;
     if raw.len() > MAX_RAW_BYTES {
         let mut cut = MAX_RAW_BYTES;
         while !raw.is_char_boundary(cut) {
@@ -401,10 +408,7 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
         raw.push_str("\n...[truncated]");
     }
     let prompt = format!(
-        "You are a terse observer of a coding agent. Summarize the raw OMP worker blocks below \
-         for the outer agent that is supervising this run. Report only what happened: work \
-         attempted, files and tools touched, errors, and progress toward STATUS: DONE. Do not \
-         use tools or ask questions. Keep it under 12 lines.\n\n{}",
+        "Summarize this OMP worker transcript in under 12 lines:\n\n{}",
         raw
     );
     // Raw block batches can exceed ARG_MAX. Pass the prompt as an @file
@@ -423,13 +427,16 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
         .args([
             "--mode",
             "text",
+            "--system-prompt",
+            "You summarize OMP worker transcripts. Be terse.",
             "--no-session",
             "--no-tools",
             "--no-extensions",
             "--no-skills",
             "--no-rules",
             "--no-context-files",
-            "--auto-approve",
+            "--no-lsp",
+            "--no-title",
             "--model",
             &settings.model,
             "--thinking",
@@ -437,6 +444,12 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
             "-p",
             &prompt_arg,
         ])
+        .env_remove("PI_SESSION_FILE")
+        .env_remove("PI_SESSION_ID")
+        .env_remove("PI_TOOL_CALL_ID")
+        .env_remove("PI_TERMINAL_OWNER_PID")
+        .env_remove("AGENT")
+        .env_remove("OMPCODE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

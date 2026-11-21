@@ -444,9 +444,9 @@ impl RunSupervisor {
 
         let mut formatter = stream_omp::OmpStreamProcessor::new(log_path.as_deref(), prior_total);
         let mut pending: HashMap<String, PendingRpc> = HashMap::new();
-        pending.insert(prompt_id, PendingRpc::Prompt);
+        pending.insert(prompt_id.clone(), PendingRpc::Prompt);
         let mut success = true;
-        let mut saw_agent_end = false;
+        let mut completion = TurnCompletion::default();
 
         while !signal::interrupted() {
             drain_control(
@@ -483,22 +483,20 @@ impl RunSupervisor {
                 Ok(Some(line)) => {
                     if handle_rpc_response(&line, &mut pending) == RpcResponseOutcome::Failure {
                         success = false;
+                        break;
                     }
-                    let is_agent_end = formatter.process_line(&line);
+                    formatter.process_line(&line);
                     if let Some(summary) = self.summary.as_mut() {
                         summary.observe(&line);
                     }
-                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
-                    if !is_agent_end
-                        && at_boundary
-                        && (self.pause_explicit || self.pause_backpressure)
-                    {
-                        self.pause_worker();
-                        continue;
-                    }
-                    if is_agent_end {
-                        saw_agent_end = true;
+                    observe_turn_completion(&line, &prompt_id, &mut completion);
+                    if completion.yielded && completion.settled {
+                        success &= !completion.failed;
                         break;
+                    }
+                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
+                    if at_boundary && (self.pause_explicit || self.pause_backpressure) {
+                        self.pause_worker();
                     }
                 }
                 Ok(None) => {
@@ -517,7 +515,7 @@ impl RunSupervisor {
 
         signal::set_child_pid(0);
         let summary = formatter.finish();
-        if signal::interrupted() || !saw_agent_end {
+        if signal::interrupted() || !completion.yielded || !completion.settled {
             success = false;
         }
 
@@ -737,6 +735,39 @@ enum RpcResponseOutcome {
     Ignored,
     Success,
     Failure,
+}
+
+#[derive(Default)]
+struct TurnCompletion {
+    yielded: bool,
+    settled: bool,
+    failed: bool,
+}
+
+/// A prompt is finished at its `prompt_result`, but the session is only safe
+/// for the next prompt after `session_settled`. Non-terminal `agent_end`
+/// frames (retry, compaction, TTSR continuation) must not complete a turn.
+fn observe_turn_completion(line: &str, prompt_id: &str, state: &mut TurnCompletion) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("prompt_result") => {
+            if value.get("id").and_then(Value::as_str) != Some(prompt_id) {
+                return;
+            }
+            state.yielded = true;
+            state.settled = value
+                .get("sessionSettled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if value.get("status").and_then(Value::as_str) != Some("completed") {
+                state.failed = true;
+            }
+        }
+        Some("session_settled") => state.settled = true,
+        _ => {}
+    }
 }
 
 #[derive(Debug)]

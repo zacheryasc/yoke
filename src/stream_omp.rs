@@ -246,6 +246,63 @@ fn format_summary_strip(state: &StreamState) -> String {
     format!("{}  ⟪ {} ⟫{}", DIM, parts.join(" │ "), RESET)
 }
 
+/// Formats a worker stream the same way a human sees it, without writing to
+/// the terminal. Used as summary input so summaries see tool names, commands,
+/// output text, and status, never raw JSONL.
+pub(crate) struct HumanStream {
+    state: StreamState,
+}
+
+impl HumanStream {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: StreamState::new(),
+        }
+    }
+
+    pub(crate) fn line(&mut self, line: &str) -> String {
+        let event = extract_str(line, "type");
+        if !matches!(
+            event,
+            Some(
+                "session"
+                    | "turn_start"
+                    | "message_update"
+                    | "tool_execution_start"
+                    | "tool_execution_end"
+                    | "message_end"
+                    | "agent_end"
+            )
+        ) {
+            return String::new();
+        }
+        let mut buf = Vec::new();
+        let _ = process_line(&mut buf, line, &mut self.state, 0.0);
+        strip_ansi(&String::from_utf8_lossy(&buf))
+            .trim()
+            .to_string()
+    }
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Incremental OMP NDJSON formatter for runtimes that do not expose a
 /// `ChildStdout` directly, such as OMP RPC.
 pub(crate) struct OmpStreamProcessor {
@@ -267,11 +324,11 @@ impl OmpStreamProcessor {
         }
     }
 
-    /// Process one raw OMP JSONL line. Returns true when the line ends the
-    /// current agent turn.
-    pub(crate) fn process_line(&mut self, line: &str) -> bool {
+    /// Process one raw OMP JSONL line for display and logging. Turn
+    /// completion is tracked separately from the RPC prompt result.
+    pub(crate) fn process_line(&mut self, line: &str) {
         if line.trim().is_empty() {
-            return false;
+            return;
         }
         if let Some(f) = &mut self.log_file {
             let _ = writeln!(f, "{}", line);
@@ -279,7 +336,6 @@ impl OmpStreamProcessor {
         let mut out = io::stdout().lock();
         let _ = process_line(&mut out, line, &mut self.state, self.prior_total);
         let _ = out.flush();
-        extract_str(line, "type") == Some("agent_end")
     }
 
     pub(crate) fn finish(self) -> StreamSummary {
@@ -326,4 +382,40 @@ pub fn filter_stream(
     }
     let _ = out.flush();
     state.into_summary()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_stream_uses_terminal_text_not_raw_json() {
+        let mut human = HumanStream::new();
+        let text = human.line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#,
+        );
+        assert!(
+            text.contains("hello"),
+            "text delta should be visible: {text:?}"
+        );
+        assert!(
+            !text.contains("assistantMessageEvent"),
+            "raw JSON leaked: {text:?}"
+        );
+
+        let tool = human.line(
+            r#"{"type":"tool_execution_start","toolName":"bash","toolCallId":"t1","args":{"command":"cargo test"}}"#,
+        );
+        assert!(
+            tool.contains("cargo test"),
+            "command should be visible: {tool:?}"
+        );
+        assert!(!tool.contains("toolCallId"), "raw JSON leaked: {tool:?}");
+
+        let response = human.line(r#"{"type":"response","id":"p1","success":true}"#);
+        assert!(
+            response.is_empty(),
+            "protocol frames should be skipped: {response:?}"
+        );
+    }
 }
