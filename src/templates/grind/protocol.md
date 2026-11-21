@@ -53,7 +53,6 @@ Commands from `cstat help`:
 - `signature` — function API boundary complexity rankings. Use it to reduce public surface, parameter sprawl, generic noise, and unnecessary result shapes.
 - `span` — function implementation span rankings. Use it to find long functions that should be deleted, flattened, or split only when splitting reduces real complexity.
 - `deps` — module dependency connectome. Use it to remove coupling, merge needless modules, or move code when it reduces dependency pressure.
-- `dead-code` — static dead-code candidates. Use it to delete unused items, stale exports, and obsolete branches.
 - `test-reachability` — static test/benchmark reachability. Use it to understand what behavior is protected before cutting.
 - `call-trace` — tree view of calls from the Cargo binary entrypoint or `--entry <PATH::FUNCTION>`. Use it to understand runtime paths before deleting or moving code.
 - `coverage` — dynamic line and branch coverage from Rust source-based coverage data. Use `--no-run` with `CSTAT_LLVM_COV_EXPORT_JSON` when parsing existing coverage data.

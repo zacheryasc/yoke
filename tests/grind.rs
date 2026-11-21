@@ -194,7 +194,6 @@ fn init_grind_creates_profile_and_captures_baseline() {
         "span",
         "scorecard",
         "deps",
-        "dead-code",
         "test-reachability",
         "call-trace",
         "coverage",

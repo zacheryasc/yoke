@@ -8,6 +8,7 @@ pub enum Thinking {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl Thinking {
@@ -19,6 +20,7 @@ impl Thinking {
             Thinking::Medium => "medium",
             Thinking::High => "high",
             Thinking::XHigh => "xhigh",
+            Thinking::Max => "max",
         }
     }
 }
@@ -205,12 +207,13 @@ impl ConfigBuilder {
                     "medium" => Thinking::Medium,
                     "high" => Thinking::High,
                     "xhigh" => Thinking::XHigh,
+                    "max" => Thinking::Max,
                     other => {
                         return Err(cfg_err(
                             path,
                             line_num,
                             &format!(
-                                "thinking must be 'off', 'low', 'medium', 'high', or 'xhigh', got '{}'",
+                                "thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max', got '{}'",
                                 other
                             ),
                         ));
@@ -361,5 +364,33 @@ impl Config {
         // "." has length 1 but should match everything — already handled above.
         // If only "." matched, best_len is 1, which is correct.
         best_tag
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_with_thinking(value: &str) -> Result<Config, String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("yoke.conf");
+        fs::write(&path, format!("allow .\nthinking {value}\n")).unwrap();
+        Config::load(&path)
+    }
+
+    #[test]
+    fn thinking_max_parses_and_forwards() {
+        let config = load_with_thinking("max").expect("thinking max should parse");
+        assert_eq!(config.thinking, Some(Thinking::Max));
+        assert_eq!(config.thinking.unwrap().as_omp_arg(), "max");
+    }
+
+    #[test]
+    fn thinking_rejects_unknown_level() {
+        let err = load_with_thinking("ultra").expect_err("unknown level should fail");
+        assert!(
+            err.contains("thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max'"),
+            "error should list valid levels, got: {err}"
+        );
     }
 }
