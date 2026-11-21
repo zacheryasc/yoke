@@ -75,7 +75,8 @@ fn run_captures_patch_and_vcs_metadata_without_committing() {
 
     git(project, &["init"]);
     fs::write(project.join("seed.txt"), "seed\n").unwrap();
-    git(project, &["add", "seed.txt"]);
+    fs::write(project.join(".gitignore"), ".loop/\n").unwrap();
+    git(project, &["add", ".gitignore", "seed.txt"]);
     git(project, &["commit", "-m", "seed"]);
     let branch = git(project, &["symbolic-ref", "--short", "HEAD"]);
     let base_sha = git(project, &["rev-parse", "HEAD"]);

@@ -329,15 +329,6 @@ fn append_injection_audit(injection: &Injection) {
     }
 }
 
-pub(crate) struct WorkerTurn<'a> {
-    pub config: &'a Config,
-    pub prompt: &'a str,
-    pub label: &'a str,
-    pub log_prefix: &'a str,
-    pub iteration: u32,
-    pub prior_total: f64,
-}
-
 pub(crate) struct RunSupervisor {
     control: Option<ControlServer>,
     worker: Option<OmpRpcWorker>,
@@ -420,46 +411,109 @@ impl RunSupervisor {
         self.shutdown_requested
     }
 
-    pub(crate) fn invoke_worker(&mut self, turn: &WorkerTurn<'_>) -> AgentRunStats {
+    pub(crate) fn invoke_worker(
+        &mut self,
+        config: &Config,
+        prompt: &str,
+        label: &str,
+        log_prefix: &str,
+        iteration: u32,
+        prior_total: f64,
+    ) -> AgentRunStats {
         let wall_start = std::time::Instant::now();
+        let in_container = config.image.is_some();
         log(&format!(
             "Launching {} RPC {}(iteration {})...",
-            turn.label,
-            if turn.config.image.is_some() {
-                "in container "
-            } else {
-                ""
-            },
-            turn.iteration,
+            label,
+            if in_container { "in container " } else { "" },
+            iteration,
         ));
 
-        if let Err(e) = self.ensure_worker(turn.config) {
+        if let Err(e) = self.ensure_worker(config) {
             log_error(&e);
-            return self.failed_turn_stats(wall_start);
+            return AgentRunStats {
+                success: false,
+                wall_secs: wall_start.elapsed().as_secs_f64(),
+                stream: stream::StreamSummary::default(),
+            };
         }
-        let (prompt_id, log_path) = match self.prepare_turn(turn) {
-            Ok(prepared) => prepared,
-            Err(e) => {
-                log_error(&e);
-                signal::set_child_pid(0);
-                return self.failed_turn_stats(wall_start);
-            }
-        };
 
-        let mut formatter =
-            stream_omp::OmpStreamProcessor::new(log_path.as_deref(), turn.prior_total);
+        let log_path = config
+            .log_dir
+            .as_ref()
+            .map(|dir| PathBuf::from(dir).join(format!("{}-{}.jsonl", log_prefix, iteration)));
+
+        let worker = self.worker.as_mut().expect("worker just ensured");
+        signal::set_child_pid(-(worker.child_id() as i32));
+
+        let prompt_id = worker.next_id("prompt");
+        if let Err(e) = worker.send_prompt(&prompt_id, prompt) {
+            log_error(&format!("failed to send OMP RPC prompt: {}", e));
+            signal::set_child_pid(0);
+            return AgentRunStats {
+                success: false,
+                wall_secs: wall_start.elapsed().as_secs_f64(),
+                stream: stream::StreamSummary::default(),
+            };
+        }
+
+        let mut formatter = stream_omp::OmpStreamProcessor::new(log_path.as_deref(), prior_total);
         let mut pending: HashMap<String, PendingRpc> = HashMap::new();
         pending.insert(prompt_id, PendingRpc::Prompt);
         let mut success = true;
         let mut saw_agent_end = false;
 
         while !signal::interrupted() {
-            self.drain_control();
-            if self.paused && !self.wait_while_paused() {
-                success = false;
-                break;
+            drain_control(
+                self.control.as_ref(),
+                &mut self.queued,
+                &mut self.pause_explicit,
+                &mut self.shutdown_requested,
+            );
+
+            if self.paused {
+                if self.shutdown_requested {
+                    // Stop wins over pause: thaw the worker so it can accept
+                    // the graceful shutdown steering.
+                    self.resume_worker();
+                } else {
+                    let backpressure_drained = !self.pause_backpressure
+                        || self
+                            .summary
+                            .as_ref()
+                            .is_none_or(|summary| summary.pending() == 0);
+                    if backpressure_drained && !self.pause_explicit {
+                        self.pause_backpressure = false;
+                        self.resume_worker();
+                    } else if let Ok(Some(status)) =
+                        self.worker.as_mut().expect("worker").try_wait()
+                    {
+                        log_error(&format!("OMP RPC process exited while paused: {}", status));
+                        success = false;
+                        break;
+                    } else {
+                        thread::sleep(RPC_EVENT_POLL);
+                        continue;
+                    }
+                }
             }
-            self.update_backpressure(turn.config.summary_queue_limit);
+
+            if let Some(summary) = self.summary.as_ref()
+                && summary.enabled()
+            {
+                if summary.pending() == 0 {
+                    self.pause_backpressure = false;
+                } else if summary.pending() >= config.summary_queue_limit as usize {
+                    if !self.pause_backpressure {
+                        log(&format!(
+                            "summary backlog reached {}; pausing at the next block boundary",
+                            summary.pending()
+                        ));
+                    }
+                    self.pause_backpressure = true;
+                }
+            }
+
             deliver_queued(
                 self.worker.as_mut().expect("worker"),
                 &mut self.queued,
@@ -467,7 +521,12 @@ impl RunSupervisor {
                 &mut self.shutdown_requested,
             );
 
-            match self.read_worker_line() {
+            match self
+                .worker
+                .as_mut()
+                .expect("worker")
+                .recv_line(RPC_EVENT_POLL)
+            {
                 Ok(Some(line)) => {
                     if handle_rpc_response(&line, &mut pending) == RpcResponseOutcome::Failure {
                         success = false;
@@ -476,22 +535,29 @@ impl RunSupervisor {
                     if let Some(summary) = self.summary.as_mut() {
                         summary.observe(&line);
                     }
+                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
+                    if !is_agent_end
+                        && at_boundary
+                        && (self.pause_explicit || self.pause_backpressure)
+                    {
+                        self.pause_worker();
+                        continue;
+                    }
                     if is_agent_end {
                         saw_agent_end = true;
                         break;
                     }
-                    if self.should_pause() {
-                        self.pause_worker();
-                    }
                 }
                 Ok(None) => {
-                    if let Some(status) = self.exited_early() {
+                    if let Ok(Some(status)) = self.worker.as_mut().expect("worker").try_wait() {
                         log_error(&format!("OMP RPC process exited early: {}", status));
                         success = false;
                         break;
                     }
-                    if self.should_pause() {
+                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
+                    if at_boundary && (self.pause_explicit || self.pause_backpressure) {
                         self.pause_worker();
+                        continue;
                     }
                 }
                 Err(e) => {
@@ -507,10 +573,11 @@ impl RunSupervisor {
         if signal::interrupted() || !saw_agent_end {
             success = false;
         }
+
         log(&format!(
             "{} RPC turn {} ({})",
-            turn.label,
-            turn.iteration,
+            label,
+            iteration,
             if success { "success" } else { "failure" }
         ));
         AgentRunStats {
@@ -518,140 +585,6 @@ impl RunSupervisor {
             wall_secs: wall_start.elapsed().as_secs_f64(),
             stream: summary,
         }
-    }
-
-    fn failed_turn_stats(&self, wall_start: std::time::Instant) -> AgentRunStats {
-        AgentRunStats {
-            success: false,
-            wall_secs: wall_start.elapsed().as_secs_f64(),
-            stream: stream::StreamSummary::default(),
-        }
-    }
-
-    fn prepare_turn(&mut self, turn: &WorkerTurn<'_>) -> Result<(String, Option<PathBuf>), String> {
-        let log_path = turn.config.log_dir.as_ref().map(|dir| {
-            PathBuf::from(dir).join(format!("{}-{}.jsonl", turn.log_prefix, turn.iteration))
-        });
-        let worker = self.worker.as_mut().expect("worker just ensured");
-        signal::set_child_pid(-(worker.child_id() as i32));
-        let prompt_id = worker.next_id("prompt");
-        worker
-            .send_prompt(&prompt_id, turn.prompt)
-            .map_err(|e| format!("failed to send OMP RPC prompt: {}", e))?;
-        Ok((prompt_id, log_path))
-    }
-
-    fn read_worker_line(&mut self) -> io::Result<Option<String>> {
-        self.worker
-            .as_mut()
-            .expect("worker")
-            .recv_line(RPC_EVENT_POLL)
-    }
-
-    fn exited_early(&mut self) -> Option<std::process::ExitStatus> {
-        match self.worker.as_mut().expect("worker").try_wait() {
-            Ok(status) => status,
-            Err(_) => None,
-        }
-    }
-
-    fn should_pause(&self) -> bool {
-        (self.pause_explicit || self.pause_backpressure)
-            && self.summary.as_ref().is_none_or(SummaryEngine::at_boundary)
-    }
-
-    /// Block while paused so controls keep flowing. Returns false when the
-    /// worker exits or the process is interrupted before a resume.
-    fn wait_while_paused(&mut self) -> bool {
-        loop {
-            self.drain_control();
-            if self.shutdown_requested {
-                // Stop wins over pause: thaw the worker so it can accept the
-                // graceful shutdown steering.
-                self.resume_worker();
-                return true;
-            }
-            let backpressure_drained = !self.pause_backpressure
-                || self
-                    .summary
-                    .as_ref()
-                    .is_none_or(|summary| summary.pending() == 0);
-            if backpressure_drained && !self.pause_explicit {
-                self.pause_backpressure = false;
-                self.resume_worker();
-                return true;
-            }
-            if self.exited_early().is_some() {
-                return false;
-            }
-            if signal::interrupted() {
-                return false;
-            }
-            thread::sleep(RPC_EVENT_POLL);
-        }
-    }
-
-    fn update_backpressure(&mut self, limit: u32) {
-        let Some(summary) = self.summary.as_ref().filter(|summary| summary.enabled()) else {
-            return;
-        };
-        if summary.pending() == 0 {
-            self.pause_backpressure = false;
-        } else if summary.pending() >= limit as usize {
-            if !self.pause_backpressure {
-                log(&format!(
-                    "summary backlog reached {}; pausing at the next block boundary",
-                    summary.pending()
-                ));
-            }
-            self.pause_backpressure = true;
-        }
-    }
-
-    fn drain_control(&mut self) {
-        let mut commands = Vec::new();
-        if let Some(control) = self.control.as_ref() {
-            while let Some(command) = control.try_recv() {
-                commands.push(command);
-            }
-        }
-        for command in commands {
-            match command {
-                ControlCommand::Inject(injection) => {
-                    log(&format!(
-                        "queued {} steering {}",
-                        injection.kind.as_str(),
-                        injection.id
-                    ));
-                    self.queued.push_back(injection);
-                }
-                ControlCommand::Pause => {
-                    self.pause_explicit = true;
-                    log("pause requested; will pause at the next block boundary");
-                }
-                ControlCommand::Resume => {
-                    self.pause_explicit = false;
-                    log("resume requested");
-                }
-                ControlCommand::Stop => self.request_stop(),
-            }
-        }
-    }
-
-    fn request_stop(&mut self) {
-        self.shutdown_requested = true;
-        self.pause_explicit = false;
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        self.queued.push_back(Injection {
-            id: format!("stop-{}", millis),
-            kind: InjectionKind::Shutdown,
-            message: "Stop the run gracefully and report the final result.".to_string(),
-            reply: None,
-        });
-        log("stop requested; delivering graceful shutdown");
     }
 
     fn pause_worker(&mut self) {
@@ -713,6 +646,52 @@ impl RunSupervisor {
 impl Drop for RunSupervisor {
     fn drop(&mut self) {
         self.stop_worker();
+    }
+}
+
+fn drain_control(
+    control: Option<&ControlServer>,
+    queued: &mut VecDeque<Injection>,
+    pause_explicit: &mut bool,
+    shutdown_requested: &mut bool,
+) {
+    let Some(control) = control else {
+        return;
+    };
+    while let Some(command) = control.try_recv() {
+        match command {
+            ControlCommand::Inject(injection) => {
+                log(&format!(
+                    "queued {} steering {}",
+                    injection.kind.as_str(),
+                    injection.id
+                ));
+                queued.push_back(injection);
+            }
+            ControlCommand::Pause => {
+                *pause_explicit = true;
+                log("pause requested; will pause at the next block boundary");
+            }
+            ControlCommand::Resume => {
+                *pause_explicit = false;
+                log("resume requested");
+            }
+            ControlCommand::Stop => {
+                *shutdown_requested = true;
+                *pause_explicit = false;
+                let millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                queued.push_back(Injection {
+                    id: format!("stop-{}", millis),
+                    kind: InjectionKind::Shutdown,
+                    message: "Stop the run gracefully and report the final result.".to_string(),
+                    reply: None,
+                });
+                log("stop requested; delivering graceful shutdown");
+            }
+        }
     }
 }
 

@@ -275,7 +275,17 @@ impl RunArtifacts {
         };
 
         run(&["read-tree", &git.base_ref])?;
-        run(&["add", "-A", "--", ".", ":(exclude).loop"])?;
+        // Stage everything into the temporary index, then drop `.loop` from
+        // it. A negative pathspec on an ignored `.loop` makes `git add` fail.
+        run(&["add", "-A", "--", "."])?;
+        run(&[
+            "rm",
+            "-r",
+            "--cached",
+            "--force",
+            "--ignore-unmatch",
+            ".loop",
+        ])?;
         let tree = String::from_utf8(run(&["write-tree"])?)
             .map_err(|e| format!("git write-tree output was not UTF-8: {}", e))?
             .trim()

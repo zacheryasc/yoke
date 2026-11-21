@@ -720,15 +720,7 @@ fn invoke_agent(
     prior_total: f64,
 ) -> AgentRunStats {
     let prompt = "Read .loop/protocol.md and follow its instructions.";
-    let turn = runtime::WorkerTurn {
-        config,
-        prompt,
-        label: "OMP",
-        log_prefix: "iteration",
-        iteration,
-        prior_total,
-    };
-    supervisor.invoke_worker(&turn)
+    supervisor.invoke_worker(config, prompt, "OMP", "iteration", iteration, prior_total)
 }
 
 /// Invoke a periodic agent with its protocol file.
