@@ -15,7 +15,6 @@ struct StreamState {
     tool_counts: HashMap<String, u32>,
     tool_durations: HashMap<String, f64>,
     tool_starts: HashMap<String, (String, Instant)>,
-    session_id: Option<String>,
     saw_done: bool,
 }
 
@@ -28,7 +27,6 @@ impl StreamState {
             tool_counts: HashMap::new(),
             tool_durations: HashMap::new(),
             tool_starts: HashMap::new(),
-            session_id: None,
             saw_done: false,
         }
     }
@@ -45,7 +43,6 @@ impl StreamState {
             thinking_secs: 0.0,
             tool_counts: self.tool_counts.into_iter().collect(),
             tool_durations_secs: self.tool_durations.into_iter().collect(),
-            session_id: self.session_id,
         }
     }
 }
@@ -180,7 +177,6 @@ fn process_line(
     match extract_str(line, "type") {
         Some("session") => {
             if let Some(id) = extract_str(line, "id") {
-                state.session_id = Some(id.to_string());
                 let sid_short: String = id.chars().take(12).collect();
                 writeln!(
                     out,

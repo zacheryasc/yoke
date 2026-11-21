@@ -316,16 +316,11 @@ fn print_init_help() {
 /// Holds loop state and cleans up on drop.
 ///
 /// Drop kills any running OMP child process and removes the backup
-/// directory. Note: Drop does not run on raw SIGINT — the child process
-/// shares the process group and receives the signal directly, and the
-/// backup temp dir is small and inconsequential.
+/// directory. Drop can be skipped on raw SIGINT; the backup temp dir is small
+/// and inconsequential.
 struct LoopRunner {
     backup_dir: PathBuf,
     child: Option<Child>,
-    /// OMP session id from the most recent worker invocation. When `Some`,
-    /// the next worker invocation will `--resume` it so conversation context
-    /// carries forward. Cleared on stash checkout / mode switch / explicit reset.
-    last_session_id: Option<String>,
 }
 
 impl LoopRunner {
@@ -333,7 +328,6 @@ impl LoopRunner {
         Self {
             backup_dir,
             child: None,
-            last_session_id: None,
         }
     }
 }
@@ -720,27 +714,28 @@ fn invoke_process(
 
 /// Invoke the agent, piping stdout through the stream filter.
 fn invoke_agent(
-    runner: &mut LoopRunner,
     supervisor: &mut runtime::RunSupervisor,
     config: &Config,
     iteration: u32,
     prior_total: f64,
 ) -> AgentRunStats {
     let prompt = "Read .loop/protocol.md and follow its instructions.";
-    let label = "OMP";
-    let stats =
-        supervisor.invoke_worker(config, prompt, label, "iteration", iteration, prior_total);
-    if let Some(sid) = stats.stream.session_id.clone() {
-        runner.last_session_id = Some(sid);
-    }
-    stats
+    let turn = runtime::WorkerTurn {
+        config,
+        prompt,
+        label: "OMP",
+        log_prefix: "iteration",
+        iteration,
+        prior_total,
+    };
+    supervisor.invoke_worker(&turn)
 }
 
 /// Invoke a periodic agent with its protocol file.
 /// Returns true if the invocation succeeded.
 ///
 /// Periodic agents always run in a fresh session: they have a different
-/// protocol than the main worker. They don't update `runner.last_session_id`.
+/// protocol than the main worker.
 fn invoke_periodic(
     runner: &mut LoopRunner,
     config: &Config,
@@ -1477,7 +1472,7 @@ fn run_iteration_step(
     if dry_run {
         log("(dry-run) Skipping OMP invocation");
     } else {
-        let stats = invoke_agent(runner, supervisor, config, iteration, prior_total);
+        let stats = invoke_agent(supervisor, config, iteration, prior_total);
         if !stats.success {
             log_error("OMP invocation failed — aborting loop");
             return IterationStepResult::Terminal(PlanLoopOutcome::Error);

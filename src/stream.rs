@@ -17,9 +17,6 @@ pub struct StreamSummary {
     pub thinking_secs: f64,
     pub tool_counts: BTreeMap<String, u32>,
     pub tool_durations_secs: BTreeMap<String, f64>,
-    /// OMP session ID extracted from the `session` event. Used by the harness
-    /// to resume the same worker session on the next iteration.
-    pub session_id: Option<String>,
 }
 
 /// Shared stream loop: reads lines from stdout, tees to log, calls processor per
