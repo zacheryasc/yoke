@@ -48,6 +48,13 @@ set -euo pipefail
     done
 } >> .loop/.omp-argv
 
+for arg in "$@"; do
+    if [[ "$arg" == *"judge.md"* ]]; then
+        printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md
+        exit 0
+    fi
+done
+
 MODE=""
 for arg in "$@"; do
     if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
@@ -99,12 +106,14 @@ fn default_backend_invokes_omp_with_model_and_thinking() {
     )
     .unwrap();
     fs::write(loop_dir.join("plan.md"), "## Stage 1\nDone.\n").unwrap();
+    fs::write(loop_dir.join("judge.md"), "# Judge\nVerify the change.\n").unwrap();
     fs::write(
         loop_dir.join("yoke.conf"),
         "model gpt-5.5\nthinking xhigh\nallow .\n",
     )
     .unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
+    fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
     let mock_bin_dir = project.join("mock-bin");

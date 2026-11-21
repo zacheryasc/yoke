@@ -62,8 +62,14 @@ fn seed_loop(project: &std::path::Path) {
     )
     .unwrap();
     fs::write(loop_dir.join("plan.md"), "## Stage 1\nSteer.\n").unwrap();
+    fs::write(
+        loop_dir.join("judge.md"),
+        "# Judge\nVerify the change.\n",
+    )
+    .unwrap();
     fs::write(loop_dir.join("yoke.conf"), "metrics off\nallow .\n").unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
+    fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 }
 
@@ -109,6 +115,12 @@ fn wait_output(mut child: std::process::Child, timeout: Duration) -> Output {
 
 const STEERABLE_MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
+for arg in "$@"; do
+    if [[ "$arg" == *"judge.md"* ]]; then
+        printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md
+        exit 0
+    fi
+done
 MODE=""
 for arg in "$@"; do
     if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
@@ -149,6 +161,12 @@ done
 
 const DONE_MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
+for arg in "$@"; do
+    if [[ "$arg" == *"judge.md"* ]]; then
+        printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md
+        exit 0
+    fi
+done
 MODE=""
 for arg in "$@"; do
     if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
@@ -174,6 +192,12 @@ fi
 
 const REJECT_STEER_MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
+for arg in "$@"; do
+    if [[ "$arg" == *"judge.md"* ]]; then
+        printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md
+        exit 0
+    fi
+done
 if [[ "$*" != *"--mode rpc"* ]]; then
     exit 0
 fi

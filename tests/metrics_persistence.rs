@@ -33,6 +33,13 @@ allow .
 const MOCK_OMP: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
+for arg in "$@"; do
+    if [[ "$arg" == *"judge.md"* ]]; then
+        printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md
+        exit 0
+    fi
+done
+
 MODE=""
 for arg in "$@"; do
     if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
@@ -93,8 +100,14 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
     fs::create_dir(&loop_dir).expect("create .loop");
     fs::write(loop_dir.join("protocol.md"), PROTOCOL).unwrap();
     fs::write(loop_dir.join("plan.md"), PLAN).unwrap();
+    fs::write(
+        loop_dir.join("judge.md"),
+        "# Judge\nVerify the change.\n",
+    )
+    .unwrap();
     fs::write(loop_dir.join("yoke.conf"), CONF).unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
+    fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
     // Mock OMP on PATH
@@ -187,11 +200,11 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
     let runs_path = runs_path.expect("runs.ndjson should exist");
     let iter_path = iter_path.expect("iteration ndjson file should exist");
 
-    // Run row: contains outcome=done and iterations >= 1
+    // Run row: contains outcome=judge_pass and iterations >= 1
     let runs_content = fs::read_to_string(&runs_path).expect("read runs.ndjson");
     assert!(
-        runs_content.contains("\"outcome\":\"done\""),
-        "runs.ndjson should record outcome=done.\ncontent: {}",
+        runs_content.contains("\"outcome\":\"judge_pass\""),
+        "runs.ndjson should record outcome=judge_pass.\ncontent: {}",
         runs_content
     );
     assert!(
@@ -200,11 +213,11 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
         runs_content
     );
 
-    // Iteration row: has mode=loop, status_done=true, restore_ms field
+    // Iteration row: has mode=brute, status_done=true, restore_ms field
     let iter_content = fs::read_to_string(&iter_path).expect("read iter ndjson");
     assert!(
-        iter_content.contains("\"mode\":\"loop\""),
-        "iter row should carry mode=loop.\ncontent: {}",
+        iter_content.contains("\"mode\":\"brute\""),
+        "iter row should carry mode=brute.\ncontent: {}",
         iter_content
     );
     assert!(
@@ -268,8 +281,8 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
         combined
     );
     assert!(
-        combined.contains("done"),
-        "yoke stats should show the run outcome 'done'.\ncombined:\n{}",
+        combined.contains("judge_pass"),
+        "yoke stats should show the run outcome 'judge_pass'.\ncombined:\n{}",
         combined
     );
 

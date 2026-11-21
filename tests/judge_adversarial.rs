@@ -5,9 +5,7 @@
 //!    snapshot and restore .loop/ files after stash code moved to stash.rs?
 //! 2. is_status_done refactor: does the plan loop correctly detect STATUS: DONE
 //!    when the generalized function is used instead of the old hardcoded one?
-//! 3. Saga mode: does the refactored is_status_done(SAGA_NOTES_PATH) correctly
-//!    detect scoper completion (vs the old hardcoded is_saga_done)?
-//! 4. Guard results file: after removing GuardResult.output field, does the
+//! 3. Guard results file: after removing GuardResult.output field, does the
 //!    guard results markdown file still get written with pass/fail content?
 
 use std::fs;
@@ -89,15 +87,15 @@ fn stash_roundtrip_after_extraction() {
     let home = project.join("home");
     git_init(project);
 
-    // Initialize brute mode (creates .loop/ with judge.md, etc.)
+    // Initialize the loop (creates .loop/ with judge.md, etc.)
     let out = Command::new(&yoke)
-        .args(["init", "brute"])
+        .args(["init"])
         .current_dir(project)
         .output()
-        .expect("yoke init brute");
+        .expect("yoke init");
     assert!(
         out.status.success(),
-        "yoke init brute failed: {}",
+        "yoke init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -241,7 +239,6 @@ fn plan_loop_exits_on_status_done() {
     let loop_dir = project.join(".loop");
     fs::create_dir(&loop_dir).unwrap();
 
-    // Minimal loop-mode setup (no judge.md → loop mode, not brute)
     let protocol = "\
 # Protocol
 Read plan.md, implement it, then set STATUS: DONE in notes.md.
@@ -252,7 +249,9 @@ Read plan.md, implement it, then set STATUS: DONE in notes.md.
     fs::write(loop_dir.join("protocol.md"), protocol).unwrap();
     fs::write(loop_dir.join("yoke.conf"), conf).unwrap();
     fs::write(loop_dir.join("plan.md"), plan).unwrap();
+    fs::write(loop_dir.join("judge.md"), "# Judge\nVerify the change.\n").unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
+    fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
     // Mock OMP: immediately writes STATUS: DONE and exits
@@ -261,6 +260,12 @@ Read plan.md, implement it, then set STATUS: DONE in notes.md.
 
     let mock_omp = r#"#!/usr/bin/env bash
 set -euo pipefail
+for arg in "$@"; do
+    if [[ "$arg" == *"judge.md"* ]]; then
+        printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md
+        exit 0
+    fi
+done
 MODE=""
 for arg in "$@"; do
     if [[ "$arg" == "rpc" ]]; then MODE="rpc"; fi
@@ -445,117 +450,7 @@ exit 0
     );
 }
 
-// ── Test 4: saga exits on STATUS: DONE in saga-notes.md (not notes.md) ──
-
-/// The cleaner replaced the hardcoded `is_saga_done()` (which read SAGA_NOTES_PATH)
-/// with the generic `is_status_done(SAGA_NOTES_PATH)`. If a refactoring mistake
-/// accidentally passes NOTES_PATH instead, the saga loop would either spin forever
-/// (scoper keeps writing DONE to saga-notes.md but yoke checks notes.md) or
-/// would exit prematurely based on the inner brute worker's notes.md.
-///
-/// This test sets up saga mode, mocks the scoper to write STATUS: DONE to
-/// saga-notes.md on the first cycle, and verifies yoke exits 0 with the
-/// "saga complete" message.
-#[test]
-fn saga_exits_on_saga_notes_done() {
-    let status = Command::new("cargo")
-        .args(["build", "--quiet"])
-        .status()
-        .expect("cargo build");
-    assert!(status.success(), "cargo build failed");
-
-    let yoke = yoke_bin();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let project = tmp.path();
-
-    git_init(project);
-
-    let loop_dir = project.join(".loop");
-    fs::create_dir(&loop_dir).unwrap();
-
-    // Saga mode files
-    let saga_protocol = "# Saga Protocol\nRead specification.md, decompose into sub-plans.\n";
-    let protocol = "# Worker Protocol\nRead plan, implement, set STATUS: DONE.\n";
-    let judge = "# Judge\nVerify the sub-plan.\n\n## Verdict\nWrite verdict.\n";
-    let conf = "allow .\n";
-    let specification = "# Spec\nBuild a widget that does X.\n";
-
-    fs::write(loop_dir.join("saga-protocol.md"), saga_protocol).unwrap();
-    fs::write(loop_dir.join("protocol.md"), protocol).unwrap();
-    fs::write(loop_dir.join("judge.md"), judge).unwrap();
-    fs::write(loop_dir.join("yoke.conf"), conf).unwrap();
-    fs::write(loop_dir.join("specification.md"), specification).unwrap();
-    fs::write(loop_dir.join("saga-notes.md"), "").unwrap();
-    fs::write(loop_dir.join("decisions.md"), "").unwrap();
-    fs::write(loop_dir.join("sub-plan.md"), "").unwrap();
-    fs::write(loop_dir.join("notes.md"), "").unwrap();
-    fs::write(loop_dir.join("verdict.md"), "").unwrap();
-    fs::write(loop_dir.join("guard-results.md"), "").unwrap();
-
-    // Mock OMP: scoper writes STATUS: DONE to saga-notes.md immediately.
-    // Critically: notes.md is left empty — if yoke checks notes.md instead of
-    // saga-notes.md, it would NOT see DONE and would spin forever.
-    let mock_bin_dir = project.join("mock-bin");
-    fs::create_dir(&mock_bin_dir).unwrap();
-
-    let mock_omp = r#"#!/usr/bin/env bash
-set -euo pipefail
-PROMPT=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -p) PROMPT="$2"; shift 2 ;;
-        *)  shift ;;
-    esac
-done
-
-if echo "$PROMPT" | grep -q "saga-protocol.md"; then
-    # Scoper: signal DONE via saga-notes.md
-    printf 'STATUS: DONE\n\nAll chunks complete.\n' > .loop/saga-notes.md
-fi
-exit 0
-"#;
-    let mock_path = mock_bin_dir.join("omp");
-    fs::write(&mock_path, mock_omp).unwrap();
-    fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let test_path = format!("{}:{}", mock_bin_dir.display(), original_path);
-
-    let output = Command::new(&yoke)
-        .args(["run", "--no-sandbox"])
-        .current_dir(project)
-        .env("PATH", &test_path)
-        .output()
-        .expect("yoke run");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // yoke should exit 0 — is_status_done(SAGA_NOTES_PATH) found DONE
-    assert!(
-        output.status.success(),
-        "yoke should exit 0 when scoper signals DONE in saga-notes.md.\n\
-         Exit code: {:?}\nStderr:\n{}",
-        output.status.code(),
-        stderr,
-    );
-
-    // Verify the "saga complete" message appears
-    assert!(
-        stderr.contains("saga complete"),
-        "stderr should contain 'saga complete', got:\n{}",
-        stderr,
-    );
-
-    // notes.md should still be empty — confirms yoke checked saga-notes.md, not notes.md
-    let notes = fs::read_to_string(loop_dir.join("notes.md")).unwrap();
-    assert!(
-        notes.is_empty(),
-        "notes.md should be empty (saga checks saga-notes.md), got: {:?}",
-        notes,
-    );
-}
-
-// ── Test 5: guard results file written correctly after output field removal ──
+// ── Test 4: guard results file written correctly after output field removal ──
 
 /// The cleaner removed the `output` field from `GuardResult`. If the guard
 /// results markdown file writing was accidentally broken by this change,
@@ -592,7 +487,9 @@ guard  echo SENTINEL_GUARD_OUTPUT && exit 1
     fs::write(loop_dir.join("protocol.md"), protocol).unwrap();
     fs::write(loop_dir.join("yoke.conf"), conf).unwrap();
     fs::write(loop_dir.join("plan.md"), plan).unwrap();
+    fs::write(loop_dir.join("judge.md"), "# Judge\nVerify the change.\n").unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
+    fs::write(loop_dir.join("verdict.md"), "").unwrap();
     fs::write(loop_dir.join("guard-results.md"), "").unwrap();
 
     // Dry-run: no OMP invocation, but guards still execute
@@ -930,15 +827,15 @@ fn stash_records_correct_mode_after_extraction() {
     let home = project.join("home");
     git_init(project);
 
-    // Initialize brute mode
+    // Initialize the loop
     let out = Command::new(&yoke)
-        .args(["init", "brute"])
+        .args(["init"])
         .current_dir(project)
         .output()
-        .expect("yoke init brute");
+        .expect("yoke init");
     assert!(
         out.status.success(),
-        "yoke init brute failed: {}",
+        "yoke init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
