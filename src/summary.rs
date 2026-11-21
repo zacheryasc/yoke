@@ -2,23 +2,22 @@
 //!
 //! The main worker's NDJSON stream is split into content blocks: one per
 //! text block, thinking block, or executed tool call. Every `summary-every`
-//! blocks, the raw JSONL for those blocks is handed to a separate cheap OMP
-//! invocation. Its freeform answer is written as one NDJSON record to the
-//! summary side stream (an inherited file descriptor), never to stdout,
-//! stderr, or the run artifacts.
+//! blocks, the human-readable transcript goes to a separate cheap OMP
+//! invocation. Its answer is written as one NDJSON record to the summary
+//! side stream (an inherited file descriptor), never to stdout, stderr,
+//! or the run artifacts.
 //!
 //! A single queue drains batches in order. `pending()` includes the batch
 //! currently being summarized, so backpressure pauses the worker until the
 //! queue is fully drained.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,108 +27,54 @@ use crate::config::{Config, Thinking};
 use crate::stream_omp;
 use crate::{log, log_error};
 
-#[derive(Debug, Clone)]
 struct SummarySettings {
-    every: u32,
     model: String,
     thinking: Thinking,
 }
 
-/// A batch of raw blocks, already joined into one JSONL string per block.
+/// A batch of rendered blocks, one string per block.
 type Batch = Vec<String>;
 
-struct Queue {
-    pending: Mutex<VecDeque<Batch>>,
-    cv: Condvar,
+#[derive(Default)]
+struct QueueState {
     outstanding: AtomicUsize,
     stopped: AtomicBool,
-}
-
-impl Queue {
-    fn new() -> Self {
-        Self {
-            pending: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            outstanding: AtomicUsize::new(0),
-            stopped: AtomicBool::new(false),
-        }
-    }
-
-    fn push(&self, batch: Batch) {
-        self.outstanding.fetch_add(1, Ordering::SeqCst);
-        self.pending
-            .lock()
-            .expect("summary queue lock")
-            .push_back(batch);
-        self.cv.notify_one();
-    }
-
-    fn pop(&self) -> Option<Batch> {
-        let mut pending = self.pending.lock().expect("summary queue lock");
-        loop {
-            if self.stopped.load(Ordering::SeqCst) {
-                return None;
-            }
-            if let Some(batch) = pending.pop_front() {
-                return Some(batch);
-            }
-            pending = self.cv.wait(pending).expect("summary queue wait");
-        }
-    }
-
-    fn complete(&self) {
-        self.outstanding.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn pending(&self) -> usize {
-        self.outstanding.load(Ordering::SeqCst)
-    }
-
-    fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        self.cv.notify_all();
-    }
 }
 
 #[derive(Default)]
 struct BlockTracker {
     current: String,
     completed: Vec<String>,
-    blocks_since_batch: u32,
     in_block: bool,
 }
 
 impl BlockTracker {
     #[cfg(test)]
     fn observe(&mut self, line: &str) -> bool {
-        let (started, ended) = block_transition(line);
-        self.observe_with(line, started, ended)
+        let frame = serde_json::from_str(line).unwrap_or(Value::Null);
+        self.observe_with(Some(line), block_transition(line, &frame))
     }
 
-    fn observe_with(&mut self, display: &str, started: bool, ended: bool) -> bool {
-        if !display.is_empty() {
+    fn observe_with(&mut self, display: Option<&str>, transition: Option<Boundary>) -> bool {
+        if let Some(display) = display.filter(|display| !display.is_empty()) {
             if !self.current.is_empty() {
                 self.current.push('\n');
             }
             self.current.push_str(display);
         }
-        if started {
-            self.in_block = true;
-        }
-        if ended {
-            self.in_block = false;
+        let Some(transition) = transition else {
+            return false;
+        };
+        self.in_block = transition == Boundary::Start;
+        if !self.in_block && display.is_some() {
             self.completed.push(std::mem::take(&mut self.current));
-            self.blocks_since_batch += 1;
         }
-        ended
+        !self.in_block
     }
 
     fn take_batch(&mut self, every: u32) -> Option<Batch> {
-        if every == 0 || self.blocks_since_batch < every {
-            return None;
-        }
-        self.blocks_since_batch = 0;
-        Some(std::mem::take(&mut self.completed))
+        (every != 0 && self.completed.len() >= every as usize)
+            .then(|| std::mem::take(&mut self.completed))
     }
 
     /// Flush a partially streamed block plus any completed blocks that did
@@ -139,35 +84,24 @@ impl BlockTracker {
         if !self.current.is_empty() {
             self.completed.push(std::mem::take(&mut self.current));
         }
-        self.blocks_since_batch = 0;
-        if self.completed.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.completed))
-        }
+        (!self.completed.is_empty()).then(|| std::mem::take(&mut self.completed))
     }
 }
 
-fn event_type(value: &Value) -> Option<&str> {
-    value.get("type").and_then(Value::as_str)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    Start,
+    End,
 }
 
-fn assistant_event_type(value: &Value) -> Option<&str> {
-    value
-        .get("assistantMessageEvent")
-        .and_then(|event| event.get("type"))
-        .and_then(Value::as_str)
-}
-
-/// Return `(started, ended)` for the block lifecycle event on this line.
+/// Identify the block lifecycle event on this line.
 /// A streamed text/thinking block or an executing tool call is open from
 /// start to end; pause waits for the end so no block is split. `toolcall_end`
 /// is not a boundary because the tool call's proposal and execution belong to
 /// one block.
 ///
-/// Most stream lines are deltas. The substring gate avoids parsing those as
-/// JSON on the worker's hot path.
-fn block_transition(line: &str) -> (bool, bool) {
+/// The substring gate preserves the boundaries recognized in raw JSONL.
+fn block_transition(line: &str, frame: &Value) -> Option<Boundary> {
     let relevant = [
         "text_start",
         "text_end",
@@ -179,36 +113,28 @@ fn block_transition(line: &str) -> (bool, bool) {
     .iter()
     .any(|name| line.contains(name));
     if !relevant {
-        return (false, false);
+        return None;
     }
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return (false, false);
-    };
-    let started = match event_type(&value) {
-        Some("tool_execution_start") => true,
-        Some("message_update") => matches!(
-            assistant_event_type(&value),
-            Some("text_start" | "thinking_start")
-        ),
-        _ => false,
-    };
-    let ended = match event_type(&value) {
-        Some("tool_execution_end") => true,
-        Some("message_update") => matches!(
-            assistant_event_type(&value),
-            Some("text_end" | "thinking_end")
-        ),
-        _ => false,
-    };
-    (started, ended)
+    let event = frame.get("type")?.as_str()?;
+    match event {
+        "tool_execution_start" => Some(Boundary::Start),
+        "tool_execution_end" => Some(Boundary::End),
+        "message_update" => match frame.get("assistantMessageEvent")?.get("type")?.as_str()? {
+            "text_start" | "thinking_start" => Some(Boundary::Start),
+            "text_end" | "thinking_end" => Some(Boundary::End),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub struct SummaryEngine {
-    settings: Option<SummarySettings>,
+    every: Option<u32>,
     tracker: BlockTracker,
     human: stream_omp::HumanStream,
-    queue: Arc<Queue>,
-    writer: Arc<Mutex<Option<File>>>,
+    queue: Arc<QueueState>,
+    sender: Option<mpsc::Sender<Batch>>,
+    writer: Option<Arc<Mutex<File>>>,
     worker: Option<JoinHandle<()>>,
     run_id: String,
     artifacts: PathBuf,
@@ -220,18 +146,13 @@ impl SummaryEngine {
     /// descriptor was supplied, `summary-every` is non-zero, and a cheap
     /// `summary-model` is configured.
     pub fn start(config: &Config, run_id: &str, artifacts: &Path, fd: Option<i32>) -> Self {
-        let settings = config.summary_model.as_ref().map(|model| SummarySettings {
-            every: config.summary_every,
-            model: model.clone(),
-            thinking: config.summary_thinking,
-        });
-
         let mut engine = Self {
-            settings: None,
+            every: None,
             tracker: BlockTracker::default(),
             human: stream_omp::HumanStream::new(),
-            queue: Arc::new(Queue::new()),
-            writer: Arc::new(Mutex::new(None)),
+            queue: Arc::default(),
+            sender: None,
+            writer: None,
             worker: None,
             run_id: run_id.to_string(),
             artifacts: artifacts.to_path_buf(),
@@ -250,16 +171,20 @@ impl SummaryEngine {
             return engine;
         };
 
-        engine.writer = Arc::new(Mutex::new(Some(file)));
-        engine.write_record(json!({
-            "type": "run_start",
-            "run_id": run_id,
-            "artifacts": engine.artifacts,
-            "summary_every": settings.as_ref().map(|s| s.every),
-            "cwd": std::env::current_dir().ok(),
-        }));
+        let writer = Arc::new(Mutex::new(file));
+        write_record(
+            &writer,
+            json!({
+                "type": "run_start",
+                "run_id": run_id,
+                "artifacts": engine.artifacts,
+                "summary_every": config.summary_model.as_ref().map(|_| config.summary_every),
+                "cwd": std::env::current_dir().ok(),
+            }),
+        );
+        engine.writer = Some(Arc::clone(&writer));
 
-        let Some(settings) = settings else {
+        let Some(model) = config.summary_model.as_ref() else {
             if config.summary_every > 0 {
                 log_error(
                     "summary side stream is open but summary-model is not set; summaries disabled",
@@ -267,26 +192,30 @@ impl SummaryEngine {
             }
             return engine;
         };
-        if settings.every == 0 {
+        if config.summary_every == 0 {
             return engine;
         }
         let queue = Arc::clone(&engine.queue);
-        let writer = Arc::clone(&engine.writer);
-        let thread_settings = settings.clone();
+        let settings = SummarySettings {
+            model: model.clone(),
+            thinking: config.summary_thinking,
+        };
+        let (sender, receiver) = mpsc::channel();
+        engine.sender = Some(sender);
         engine.worker = Some(thread::spawn(move || {
-            summary_worker(thread_settings, queue, writer)
+            summary_worker(settings, queue, writer, receiver)
         }));
-        engine.settings = Some(settings);
+        engine.every = Some(config.summary_every);
         engine
     }
 
     pub fn enabled(&self) -> bool {
-        self.settings.is_some()
+        self.every.is_some()
     }
 
     /// Number of batches queued or currently being summarized.
     pub fn pending(&self) -> usize {
-        self.queue.pending()
+        self.queue.outstanding.load(Ordering::SeqCst)
     }
 
     /// True when no text/thinking/tool block is currently streaming, so a
@@ -295,32 +224,36 @@ impl SummaryEngine {
         !self.tracker.in_block
     }
 
-    /// Feed one raw OMP line. Returns true when the line completed a block.
-    pub fn observe(&mut self, line: &str) -> bool {
-        let (started, ended) = block_transition(line);
-        if self.settings.is_none() {
-            if started {
-                self.tracker.in_block = true;
-            }
-            if ended {
-                self.tracker.in_block = false;
-            }
-            return ended;
-        }
-        let Some(settings) = self.settings.as_ref() else {
-            return ended;
-        };
-        let display = self.human.line(line);
-        self.tracker.observe_with(&display, started, ended);
-        if ended && let Some(batch) = self.tracker.take_batch(settings.every) {
+    /// Observe a worker frame without reparsing JSON already read by RPC.
+    pub fn observe(&mut self, line: &str, frame: &Value) {
+        let transition = block_transition(line, frame);
+        let display = self.every.map(|_| self.human.line(line));
+        let ended = self.tracker.observe_with(display.as_deref(), transition);
+        if ended
+            && let Some(every) = self.every
+            && let Some(batch) = self.tracker.take_batch(every)
+        {
             log(&format!(
                 "summary queued: {} blocks ({} outstanding)",
                 batch.len(),
-                self.queue.pending() + 1
+                self.pending() + 1
             ));
-            self.queue.push(batch);
+            self.enqueue(batch);
         }
-        ended
+    }
+
+    fn enqueue(&self, batch: Batch) {
+        self.queue.outstanding.fetch_add(1, Ordering::SeqCst);
+        let _ = self
+            .sender
+            .as_ref()
+            .expect("summary worker started")
+            .send(batch);
+    }
+
+    fn stop_queue(&mut self) {
+        self.queue.stopped.store(true, Ordering::SeqCst);
+        self.sender.take();
     }
 
     /// Wait for outstanding summaries, then write the terminal record and
@@ -330,15 +263,15 @@ impl SummaryEngine {
             return;
         }
         self.finished = true;
-        if self.writer.lock().is_ok_and(|writer| writer.is_none()) {
+        let Some(writer) = &self.writer else {
             return;
-        }
-        if self.settings.is_some() {
+        };
+        if self.enabled() {
             if let Some(batch) = self.tracker.take_partial() {
-                self.queue.push(batch);
+                self.enqueue(batch);
             }
             let started = Instant::now();
-            while self.queue.pending() > 0 {
+            while self.pending() > 0 {
                 thread::sleep(Duration::from_millis(20));
                 if started.elapsed() > Duration::from_secs(600) {
                     log_error("timed out waiting for summary queue to drain");
@@ -346,24 +279,18 @@ impl SummaryEngine {
                 }
             }
         }
-        self.write_record(json!({
-            "type": "run_end",
-            "run_id": self.run_id,
-            "outcome": outcome,
-            "artifacts": self.artifacts,
-        }));
-        self.queue.stop();
+        write_record(
+            writer,
+            json!({
+                "type": "run_end",
+                "run_id": self.run_id,
+                "outcome": outcome,
+                "artifacts": self.artifacts,
+            }),
+        );
+        self.stop_queue();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
-        }
-    }
-
-    fn write_record(&self, record: Value) {
-        if let Ok(mut writer) = self.writer.lock()
-            && let Some(file) = writer.as_mut()
-        {
-            let _ = writeln!(file, "{}", record);
-            let _ = file.flush();
         }
     }
 }
@@ -373,44 +300,62 @@ impl Drop for SummaryEngine {
         // A summarizer call can still be in flight on an aborted run. Stop
         // the queue and detach: process teardown closes the side stream; a
         // normal run joins in `finish`.
-        self.queue.stop();
-        self.worker.take();
+        self.stop_queue();
     }
 }
 
-fn summary_worker(settings: SummarySettings, queue: Arc<Queue>, writer: Arc<Mutex<Option<File>>>) {
-    while let Some(batch) = queue.pop() {
+fn write_record(writer: &Mutex<File>, record: Value) {
+    if let Ok(mut file) = writer.lock() {
+        let _ = writeln!(file, "{}", record);
+        let _ = file.flush();
+    }
+}
+
+fn summary_worker(
+    settings: SummarySettings,
+    queue: Arc<QueueState>,
+    writer: Arc<Mutex<File>>,
+    receiver: mpsc::Receiver<Batch>,
+) {
+    for batch in receiver {
+        if queue.stopped.load(Ordering::SeqCst) {
+            break;
+        }
         let text = summarize(&settings, &batch);
-        if let Ok(mut writer) = writer.lock()
-            && let Some(file) = writer.as_mut()
-        {
-            let record = json!({
+        write_record(
+            &writer,
+            json!({
                 "type": "summary",
                 "blocks": batch.len(),
                 "text": text,
-            });
-            let _ = writeln!(file, "{}", record);
-            let _ = file.flush();
-        }
-        queue.complete();
+            }),
+        );
+        queue.outstanding.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
-    let mut raw = batch.join("\n\n");
+fn summary_prompt(batch: &[String]) -> String {
     const MAX_RAW_BYTES: usize = 8_000;
-    if raw.len() > MAX_RAW_BYTES {
-        let mut cut = MAX_RAW_BYTES;
-        while !raw.is_char_boundary(cut) {
-            cut -= 1;
+    let mut prompt = String::from("Summarize this OMP worker transcript in under 12 lines:\n\n");
+    let limit = prompt.len() + MAX_RAW_BYTES;
+    for piece in batch
+        .iter()
+        .flat_map(|block| ["\n\n", block.as_str()])
+        .skip(1)
+    {
+        let remaining = limit - prompt.len();
+        if piece.len() <= remaining {
+            prompt.push_str(piece);
+        } else {
+            prompt.push_str(&piece[..piece.floor_char_boundary(remaining)]);
+            prompt.push_str("\n...[truncated]");
+            break;
         }
-        raw.truncate(cut);
-        raw.push_str("\n...[truncated]");
     }
-    let prompt = format!(
-        "Summarize this OMP worker transcript in under 12 lines:\n\n{}",
-        raw
-    );
+    prompt
+}
+
+fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
     // Raw block batches can exceed ARG_MAX. Pass the prompt as an @file
     // attachment instead of one enormous argv entry.
     let stamp = SystemTime::now()
@@ -419,7 +364,7 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
         .unwrap_or(0);
     let prompt_path =
         std::env::temp_dir().join(format!("yoke-summary-{}-{}.md", std::process::id(), stamp));
-    if let Err(e) = std::fs::write(&prompt_path, prompt) {
+    if let Err(e) = std::fs::write(&prompt_path, summary_prompt(batch)) {
         return format!("(summary unavailable: failed to write prompt: {})", e);
     }
     let prompt_arg = format!("@{}", prompt_path.display());
@@ -458,11 +403,12 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
 
     match output {
         Ok(output) => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let text = stdout.trim();
             if text.is_empty() {
                 format!("(summary unavailable: summarizer exited {})", output.status)
             } else {
-                text
+                text.to_owned()
             }
         }
         Err(e) => format!("(summary unavailable: failed to run omp: {})", e),
@@ -496,37 +442,21 @@ unsafe fn open_inherited_fd(fd: i32) -> Option<File> {
 mod tests {
     use super::*;
 
-    fn text_end() -> String {
-        json!({
-            "type": "message_update",
-            "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": "ok"}
-        })
-        .to_string()
-    }
-
-    fn thinking_end() -> String {
-        json!({
-            "type": "message_update",
-            "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": "hm"}
-        })
-        .to_string()
-    }
-
-    fn tool_end() -> String {
-        json!({"type": "tool_execution_end", "toolName": "bash", "toolCallId": "t1"}).to_string()
-    }
+    const TEXT_END: &str = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"ok"}}"#;
+    const THINKING_END: &str = r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0,"content":"hm"}}"#;
+    const TOOL_END: &str = r#"{"type":"tool_execution_end","toolName":"bash","toolCallId":"t1"}"#;
 
     #[test]
     fn text_thinking_and_tool_calls_are_blocks() {
         let mut tracker = BlockTracker::default();
         assert!(!tracker.observe(r#"{"type":"turn_start"}"#));
-        assert!(tracker.observe(&text_end()));
-        assert!(tracker.observe(&thinking_end()));
+        assert!(tracker.observe(TEXT_END));
+        assert!(tracker.observe(THINKING_END));
         assert!(!tracker.observe(
             r#"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end"}}"#
         ));
-        assert!(tracker.observe(&tool_end()));
-        assert_eq!(tracker.blocks_since_batch, 3);
+        assert!(tracker.observe(TOOL_END));
+        assert_eq!(tracker.completed.len(), 3);
     }
 
     #[test]
@@ -539,12 +469,12 @@ mod tests {
         tracker
             .observe(r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta"}}"#);
         assert!(tracker.in_block, "deltas keep the block open");
-        tracker.observe(&text_end());
+        tracker.observe(TEXT_END);
         assert!(!tracker.in_block, "text_end closes the block");
 
         tracker.observe(r#"{"type":"tool_execution_start","toolName":"read"}"#);
         assert!(tracker.in_block, "tool execution opens a block");
-        tracker.observe(&tool_end());
+        tracker.observe(TOOL_END);
         assert!(!tracker.in_block, "tool_execution_end closes the block");
     }
 
@@ -552,13 +482,13 @@ mod tests {
     fn batches_fill_every_n_blocks() {
         let mut tracker = BlockTracker::default();
         tracker.observe(r#"{"type":"turn_start"}"#);
-        tracker.observe(&text_end());
-        tracker.observe(&thinking_end());
+        tracker.observe(TEXT_END);
+        tracker.observe(THINKING_END);
         assert!(tracker.take_batch(2).is_some());
-        assert_eq!(tracker.blocks_since_batch, 0);
+        assert!(tracker.completed.is_empty());
         assert!(tracker.take_batch(2).is_none());
 
-        tracker.observe(&tool_end());
+        tracker.observe(TOOL_END);
         let batch = tracker.take_batch(1).expect("one block batch");
         assert_eq!(batch.len(), 1);
         assert!(batch[0].contains("tool_execution_end"));
@@ -568,12 +498,36 @@ mod tests {
     fn partial_batch_is_flushed() {
         let mut tracker = BlockTracker::default();
         tracker.observe(r#"{"type":"turn_start"}"#);
-        tracker.observe(&text_end());
+        tracker.observe(TEXT_END);
         tracker
             .observe(r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta"}}"#);
         let batch = tracker.take_partial().expect("partial batch");
         assert_eq!(batch.len(), 2);
         assert!(batch[1].contains("text_delta"));
         assert!(tracker.take_partial().is_none());
+    }
+
+    #[test]
+    fn disabled_tracking_respects_boundaries_without_buffering() {
+        let mut tracker = BlockTracker::default();
+        assert!(!tracker.observe_with(None, Some(Boundary::Start)));
+        assert!(tracker.in_block);
+        assert!(tracker.observe_with(None, Some(Boundary::End)));
+        assert!(!tracker.in_block);
+        assert!(tracker.take_partial().is_none());
+        assert!(tracker.observe_with(Some(""), Some(Boundary::End)));
+        assert_eq!(tracker.take_batch(1).unwrap(), [""]);
+    }
+
+    #[test]
+    fn prompt_caps_transcript_without_splitting_utf8() {
+        let first = "x".repeat(7997);
+        let prompt = summary_prompt(&[first.clone(), "é".to_owned()]);
+        assert_eq!(
+            prompt,
+            format!(
+                "Summarize this OMP worker transcript in under 12 lines:\n\n{first}\n\n\n...[truncated]"
+            )
+        );
     }
 }

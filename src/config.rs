@@ -76,26 +76,29 @@ fn cfg_err(path: &Path, line_num: usize, msg: &str) -> String {
     format!("{}:{}: {}", path.display(), line_num, msg)
 }
 
+fn parse_number<T: std::str::FromStr>(
+    value: &str,
+    path: &Path,
+    line_num: usize,
+    label: &str,
+) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| cfg_err(path, line_num, &format!("invalid {label} value '{value}'")))
+}
+
 fn parse_positive_u32(
     value: &str,
     path: &Path,
     line_num: usize,
     label: &str,
 ) -> Result<u32, String> {
-    let n = value.parse::<u32>().map_err(|_| {
-        cfg_err(
-            path,
-            line_num,
-            &format!("invalid {} value '{}'", label, value),
-        )
-    })?;
-    if n == 0 {
-        return Err(cfg_err(path, line_num, &format!("{} must be > 0", label)));
+    match parse_number(value, path, line_num, label)? {
+        0 => Err(cfg_err(path, line_num, &format!("{label} must be > 0"))),
+        n => Ok(n),
     }
-    Ok(n)
 }
 
-#[allow(clippy::string_slice)]
 fn parse_thinking(value: &str, path: &Path, line_num: usize) -> Result<Thinking, String> {
     match value.trim() {
         "off" => Ok(Thinking::Off),
@@ -117,16 +120,11 @@ fn parse_thinking(value: &str, path: &Path, line_num: usize) -> Result<Thinking,
 
 fn parse_periodic(value: &str, path: &Path, line_num: usize) -> Result<Periodic, String> {
     let trimmed = value.trim();
-    let split_pos = trimmed
-        .rfind(char::is_whitespace)
+    let (ppath, cadence) = trimmed
+        .rsplit_once(char::is_whitespace)
         .ok_or_else(|| cfg_err(path, line_num, "periodic requires '<path> <cadence>'"))?;
-    let ppath = trimmed[..split_pos].trim();
-    let cadence = parse_positive_u32(
-        trimmed[split_pos..].trim(),
-        path,
-        line_num,
-        "periodic cadence",
-    )?;
+    let ppath = ppath.trim();
+    let cadence = parse_positive_u32(cadence.trim(), path, line_num, "periodic cadence")?;
     let name = Path::new(ppath)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -146,27 +144,7 @@ fn parse_periodic(value: &str, path: &Path, line_num: usize) -> Result<Periodic,
     })
 }
 
-#[allow(clippy::string_slice)]
-fn parse_guard_after(
-    value: &str,
-    path: &Path,
-    line_num: usize,
-) -> Result<(String, String, usize), String> {
-    let trimmed = value.trim();
-    let split_pos = trimmed.find(char::is_whitespace).ok_or_else(|| {
-        cfg_err(
-            path,
-            line_num,
-            "guard-after requires '<periodic-name> <command>'",
-        )
-    })?;
-    let pname = trimmed[..split_pos].trim().to_string();
-    let cmd = trimmed[split_pos..].trim().to_string();
-    Ok((pname, cmd, line_num))
-}
-
 impl Config {
-    #[allow(clippy::string_slice)]
     fn parse_line(
         &mut self,
         directive: &str,
@@ -174,41 +152,22 @@ impl Config {
         path: &Path,
         line_num: usize,
     ) -> Result<(), String> {
-        if self.set_plain_field(directive, value) {
-            return Ok(());
-        }
         match directive {
-            "max-tail" => {
-                self.max_tail = value.parse::<usize>().map_err(|_| {
-                    cfg_err(
-                        path,
-                        line_num,
-                        &format!("invalid max-tail value '{}'", value),
-                    )
-                })?
-            }
+            "max-tail" => self.max_tail = parse_number(value, path, line_num, directive)?,
             "thinking" => self.thinking = Some(parse_thinking(value, path, line_num)?),
             "judge-every" => {
-                self.judge_every = Some(parse_positive_u32(value, path, line_num, "judge-every")?)
+                self.judge_every = Some(parse_positive_u32(value, path, line_num, directive)?)
             }
             "max-judge-failures" => {
-                self.max_judge_failures =
-                    parse_positive_u32(value, path, line_num, "max-judge-failures")?
+                self.max_judge_failures = parse_positive_u32(value, path, line_num, directive)?
             }
             "periodic" => self.periodics.push(parse_periodic(value, path, line_num)?),
             "summary-every" => {
-                self.summary_every = value.trim().parse::<u32>().map_err(|_| {
-                    cfg_err(
-                        path,
-                        line_num,
-                        &format!("invalid summary-every value '{}'", value),
-                    )
-                })?
+                self.summary_every = parse_number(value.trim(), path, line_num, directive)?
             }
             "summary-thinking" => self.summary_thinking = parse_thinking(value, path, line_num)?,
             "summary-queue-limit" => {
-                self.summary_queue_limit =
-                    parse_positive_u32(value, path, line_num, "summary-queue-limit")?
+                self.summary_queue_limit = parse_positive_u32(value, path, line_num, directive)?
             }
             "metrics" => {
                 self.metrics_enabled = match value.trim() {
@@ -223,24 +182,9 @@ impl Config {
                     }
                 }
             }
-            other => {
-                return Err(cfg_err(
-                    path,
-                    line_num,
-                    &format!("unknown directive '{}'", other),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Directives whose value is stored verbatim. Returns false when the
-    /// directive isn't one of them.
-    fn set_plain_field(&mut self, directive: &str, value: &str) -> bool {
-        match directive {
-            "log-dir" => self.log_dir = Some(value.to_string()),
-            "image" => self.image = Some(value.to_string()),
-            "model" => self.model = Some(value.to_string()),
+            "log-dir" => self.log_dir = Some(value.to_owned()),
+            "image" => self.image = Some(value.to_owned()),
+            "model" => self.model = Some(value.to_owned()),
             "allow" | "add-only" | "no-modify" => {
                 let tag = match directive {
                     "allow" => ScopeTag::Allow,
@@ -249,16 +193,22 @@ impl Config {
                 };
                 self.scope_rules.push(ScopeRule {
                     tag,
-                    prefix: value.to_string(),
+                    prefix: value.to_owned(),
                 });
             }
-            "guard" => self.guards.push(value.to_string()),
-            "hook" => self.hooks.push(value.to_string()),
-            "summary-model" => self.summary_model = Some(value.to_string()),
+            "guard" => self.guards.push(value.to_owned()),
+            "hook" => self.hooks.push(value.to_owned()),
+            "summary-model" => self.summary_model = Some(value.to_owned()),
             "metrics-dir" => self.metrics_dir = crate::metrics::expand_tilde(value),
-            _ => return false,
+            _ => {
+                return Err(cfg_err(
+                    path,
+                    line_num,
+                    &format!("unknown directive '{directive}'"),
+                ));
+            }
         }
-        true
+        Ok(())
     }
 }
 
@@ -287,52 +237,57 @@ impl Default for Config {
 }
 
 impl Config {
-    #[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
     pub fn load(path: &Path) -> Result<Config, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {}", path.display(), e))?;
 
         let mut config = Config::default();
-        let mut pending_guard_afters: Vec<(String, String, usize)> = Vec::new();
+        let mut pending_guard_afters = Vec::new();
         for (line_num, raw_line) in content.lines().enumerate() {
-            let line = match raw_line.find('#') {
-                Some(pos) => &raw_line[..pos],
-                None => raw_line,
-            };
-            let line = line.trim();
+            let line = raw_line
+                .split_once('#')
+                .map_or(raw_line, |(line, _)| line)
+                .trim();
             if line.is_empty() {
                 continue;
             }
 
-            let (directive, value) = match line.find(char::is_whitespace) {
-                Some(pos) => (&line[..pos], line[pos..].trim_start()),
-                None => {
-                    return Err(cfg_err(
-                        path,
-                        line_num + 1,
-                        &format!("directive '{}' has no value", line),
-                    ));
-                }
-            };
+            let (directive, value) = line.split_once(char::is_whitespace).ok_or_else(|| {
+                cfg_err(
+                    path,
+                    line_num + 1,
+                    &format!("directive '{line}' has no value"),
+                )
+            })?;
+            let value = value.trim_start();
 
             if directive == "guard-after" {
-                pending_guard_afters.push(parse_guard_after(value, path, line_num + 1)?);
+                let (name, cmd) = value.split_once(char::is_whitespace).ok_or_else(|| {
+                    cfg_err(
+                        path,
+                        line_num + 1,
+                        "guard-after requires '<periodic-name> <command>'",
+                    )
+                })?;
+                pending_guard_afters.push((name, cmd.trim(), line_num + 1));
             } else {
                 config.parse_line(directive, value, path, line_num + 1)?;
             }
         }
 
         for (name, cmd, line) in pending_guard_afters {
-            match config.periodics.iter_mut().find(|p| p.name == name) {
-                Some(periodic) => periodic.guards.push(cmd),
-                None => {
-                    return Err(cfg_err(
+            let periodic = config
+                .periodics
+                .iter_mut()
+                .find(|p| p.name == name)
+                .ok_or_else(|| {
+                    cfg_err(
                         path,
                         line,
-                        &format!("guard-after references unknown periodic '{}'", name),
-                    ));
-                }
-            }
+                        &format!("guard-after references unknown periodic '{name}'"),
+                    )
+                })?;
+            periodic.guards.push(cmd.to_owned());
         }
         Ok(config)
     }
@@ -340,25 +295,14 @@ impl Config {
     /// Resolve the most-specific scope tag for a file path.
     /// Returns None if no rule matches.
     pub fn resolve_tag(&self, file: &str) -> Option<&ScopeTag> {
-        let mut best_tag: Option<&ScopeTag> = None;
-        let mut best_len: usize = 0;
-
-        for rule in &self.scope_rules {
-            let matches = if rule.prefix == "." {
-                true
-            } else {
-                file.starts_with(&rule.prefix)
-            };
-
-            if matches && rule.prefix.len() > best_len {
-                best_len = rule.prefix.len();
-                best_tag = Some(&rule.tag);
-            }
-        }
-
-        // "." has length 1 but should match everything — already handled above.
-        // If only "." matched, best_len is 1, which is correct.
-        best_tag
+        self.scope_rules
+            .iter()
+            .filter(|rule| {
+                !rule.prefix.is_empty() && (rule.prefix == "." || file.starts_with(&rule.prefix))
+            })
+            .rev()
+            .max_by_key(|rule| rule.prefix.len())
+            .map(|rule| &rule.tag)
     }
 }
 
@@ -366,23 +310,23 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn load_with_thinking(value: &str) -> Result<Config, String> {
+    fn load_fixture(content: &str) -> Result<Config, String> {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("yoke.conf");
-        fs::write(&path, format!("allow .\nthinking {value}\n")).unwrap();
+        fs::write(&path, content).unwrap();
         Config::load(&path)
     }
 
     #[test]
     fn thinking_max_parses_and_forwards() {
-        let config = load_with_thinking("max").expect("thinking max should parse");
+        let config = load_fixture("allow .\nthinking max\n").expect("thinking max should parse");
         assert_eq!(config.thinking, Some(Thinking::Max));
         assert_eq!(config.thinking.unwrap().as_omp_arg(), "max");
     }
 
     #[test]
     fn thinking_rejects_unknown_level() {
-        let err = load_with_thinking("ultra").expect_err("unknown level should fail");
+        let err = load_fixture("allow .\nthinking ultra\n").expect_err("unknown level should fail");
         assert!(
             err.contains("thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max'"),
             "error should list valid levels, got: {err}"
@@ -391,7 +335,7 @@ mod tests {
 
     #[test]
     fn summary_defaults_are_twelve_blocks_and_four_queued() {
-        let config = load_with_thinking("off").expect("config loads");
+        let config = load_fixture("allow .\nthinking off\n").expect("config loads");
         assert_eq!(config.summary_every, 12);
         assert_eq!(config.summary_queue_limit, 4);
         assert_eq!(config.summary_model, None);
@@ -400,14 +344,9 @@ mod tests {
 
     #[test]
     fn summary_settings_parse() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("yoke.conf");
-        fs::write(
-            &path,
+        let config = load_fixture(
             "allow .\nsummary-every 0\nsummary-model cheap/model\nsummary-thinking low\nsummary-queue-limit 2\n",
-        )
-        .unwrap();
-        let config = Config::load(&path).expect("summary config");
+        ).expect("summary config");
         assert_eq!(config.summary_every, 0);
         assert_eq!(config.summary_model.as_deref(), Some("cheap/model"));
         assert_eq!(config.summary_thinking, Thinking::Low);
@@ -416,10 +355,8 @@ mod tests {
 
     #[test]
     fn summary_queue_limit_rejects_zero() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("yoke.conf");
-        fs::write(&path, "allow .\nsummary-queue-limit 0\n").unwrap();
-        let err = Config::load(&path).expect_err("zero limit should fail");
+        let err =
+            load_fixture("allow .\nsummary-queue-limit 0\n").expect_err("zero limit should fail");
         assert!(err.contains("summary-queue-limit must be > 0"), "{err}");
     }
 }

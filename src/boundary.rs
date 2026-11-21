@@ -23,42 +23,20 @@ fn collect_changes() -> Result<(Vec<String>, Vec<String>, Vec<String>), String> 
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        let mut parts = line.trim().split('\t');
+        let (Some(status), Some(file)) = (parts.next(), parts.next()) else {
             continue;
-        }
-
-        let mut parts = line.split('\t');
-        let status = match parts.next() {
-            Some(s) => s,
-            None => continue,
         };
-        let file = match parts.next() {
-            Some(f) => f.to_string(),
-            None => continue,
-        };
+        changed.push(file.to_owned());
 
         match status {
-            "D" => {
-                deleted.push(file.clone());
-                changed.push(file);
-            }
-            "M" => {
-                modified.push(file.clone());
-                changed.push(file);
-            }
+            "D" => deleted.push(file.to_owned()),
+            "M" => modified.push(file.to_owned()),
             s if s.starts_with('R') => {
-                // Rename: old path treated as delete, new path as add
-                deleted.push(file.clone());
-                changed.push(file);
-                if let Some(new_file) = parts.next() {
-                    changed.push(new_file.to_string());
-                }
+                deleted.push(file.to_owned());
+                changed.extend(parts.next().map(str::to_owned));
             }
-            _ => {
-                // A (added) or other statuses
-                changed.push(file);
-            }
+            _ => {}
         }
     }
 
@@ -68,13 +46,13 @@ fn collect_changes() -> Result<(Vec<String>, Vec<String>, Vec<String>), String> 
         .output()
         .map_err(|e| format!("failed to run git ls-files: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let file = line.trim();
-        if !file.is_empty() {
-            changed.push(file.to_string());
-        }
-    }
+    changed.extend(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|file| !file.is_empty())
+            .map(str::to_owned),
+    );
 
     Ok((changed, deleted, modified))
 }
@@ -85,18 +63,11 @@ fn has_removed_lines(file: &str) -> bool {
         .args(["diff", "HEAD", "--", file])
         .output();
 
-    match output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            for line in stdout.lines() {
-                if line.starts_with('-') && !line.starts_with("---") {
-                    return true;
-                }
-            }
-            false
-        }
-        Err(_) => false,
-    }
+    output.is_ok_and(|out| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.starts_with('-') && !line.starts_with("---"))
+    })
 }
 
 /// Run the diff boundary check against the config's scope rules.
@@ -121,31 +92,18 @@ pub fn check(config: &Config) -> BoundaryResult {
             continue;
         }
 
-        let tag = config.resolve_tag(file);
-
-        match tag {
-            None => {
-                violations.push(format!("DENY: {} (no matching rule)", file));
+        let reason = match config.resolve_tag(file) {
+            None => format!("DENY: {file} (no matching rule)"),
+            Some(ScopeTag::NoModify) => format!("NO-MODIFY: {file} (protected by no-modify)"),
+            Some(ScopeTag::AddOnly) if deleted.contains(file) => {
+                format!("ADD-ONLY: {file} (deletion not allowed)")
             }
-            Some(ScopeTag::NoModify) => {
-                violations.push(format!("NO-MODIFY: {} (protected by no-modify)", file));
+            Some(ScopeTag::AddOnly) if modified.contains(file) && has_removed_lines(file) => {
+                format!("ADD-ONLY: {file} (removed lines detected)")
             }
-            Some(ScopeTag::AddOnly) => {
-                // Deleted files are never add-only safe
-                if deleted.iter().any(|d| d == file) {
-                    violations.push(format!("ADD-ONLY: {} (deletion not allowed)", file));
-                    continue;
-                }
-                // Modified tracked files: check for removed lines
-                if modified.iter().any(|m| m == file) && has_removed_lines(file) {
-                    violations.push(format!("ADD-ONLY: {} (removed lines detected)", file));
-                }
-                // New/untracked files are purely additive — always OK
-            }
-            Some(ScopeTag::Allow) => {
-                // anything goes
-            }
-        }
+            _ => continue,
+        };
+        violations.push(reason);
     }
 
     BoundaryResult {

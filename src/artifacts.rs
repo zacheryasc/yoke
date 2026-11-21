@@ -84,7 +84,7 @@ impl RunArtifacts {
             }
         }
 
-        artifacts.write_manifest(None, 0);
+        artifacts.write_manifest(None);
         log(&format!("Run artifacts: {}", artifacts.dir.display()));
         artifacts
     }
@@ -157,16 +157,12 @@ impl RunArtifacts {
             "guards": guards,
             "vcs": self.current_vcs(),
         });
-        if let Err(e) = write_json(&iter_dir.join("meta.json"), &meta) {
-            log_error(&e);
-        }
+        write_json(&iter_dir.join("meta.json"), &meta);
 
-        copy_if_exists(
-            Path::new(GUARD_RESULTS_PATH),
-            &iter_dir.join("guard-results.md"),
-        );
-        copy_if_exists(Path::new(NOTES_PATH), &iter_dir.join("notes.md"));
-        copy_if_exists(Path::new(VERDICT_PATH), &iter_dir.join("verdict.md"));
+        for path in [GUARD_RESULTS_PATH, NOTES_PATH, VERDICT_PATH] {
+            let src = Path::new(path);
+            copy_if_exists(src, &iter_dir.join(src.file_name().unwrap()));
+        }
         self.capture_diff(&iter_dir.join("diff.patch"), &iter_dir.join("diffstat.txt"));
     }
 
@@ -185,9 +181,7 @@ impl RunArtifacts {
             "pass": pass,
             "vcs": self.current_vcs(),
         });
-        if let Err(e) = write_json(&self.dir.join("judge").join(format!("{stem}.json")), &meta) {
-            log_error(&e);
-        }
+        write_json(&self.dir.join("judge").join(format!("{stem}.json")), &meta);
     }
 
     /// Capture the final patch/state and close the run manifest.
@@ -203,7 +197,7 @@ impl RunArtifacts {
         copy_if_exists(Path::new(NOTES_PATH), &self.dir.join("final-notes.md"));
         copy_dir(Path::new(".loop/archive"), &self.dir.join("archive"));
 
-        self.write_manifest(Some(outcome), self.sequence);
+        self.write_manifest(Some(outcome));
         if let Err(e) = write_summary(self, outcome) {
             log_error(&e);
         }
@@ -294,7 +288,7 @@ impl RunArtifacts {
         Ok(())
     }
 
-    fn write_manifest(&self, outcome: Option<&str>, iterations: u32) {
+    fn write_manifest(&self, outcome: Option<&str>) {
         let ended_at = outcome.map(|_| metrics::unix_now());
         let mut vcs = self.current_vcs();
         if let (Some(git), Some(obj)) = (&self.git, vcs.as_object_mut()) {
@@ -310,13 +304,11 @@ impl RunArtifacts {
             "started_at": self.started_at,
             "ended_at": ended_at,
             "outcome": outcome,
-            "iterations": iterations,
+            "iterations": self.sequence,
             "artifacts": self.dir,
             "vcs": vcs,
         });
-        if let Err(e) = write_json(&self.dir.join("run.json"), &manifest) {
-            log_error(&e);
-        }
+        write_json(&self.dir.join("run.json"), &manifest);
     }
 }
 
@@ -349,16 +341,28 @@ fn write_summary(artifacts: &RunArtifacts, outcome: &str) -> Result<(), String> 
     fs::write(&path, body).map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
-    let data = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("failed to serialize {}: {}", path.display(), e))?;
-    fs::write(path, format!("{}\n", data))
-        .map_err(|e| format!("failed to write {}: {}", path.display(), e))
+fn write_json(path: &Path, value: &serde_json::Value) {
+    let mut data = match serde_json::to_string_pretty(value) {
+        Ok(data) => data,
+        Err(e) => {
+            log_error(&format!("failed to serialize {}: {}", path.display(), e));
+            return;
+        }
+    };
+    data.push('\n');
+    if let Err(e) = fs::write(path, data) {
+        log_error(&format!("failed to write {}: {}", path.display(), e));
+    }
 }
 
 fn copy_if_exists(src: &Path, dest: &Path) {
-    if src.is_file()
-        && let Some(parent) = dest.parent()
+    if src.is_file() {
+        copy_file(src, dest);
+    }
+}
+
+fn copy_file(src: &Path, dest: &Path) {
+    if let Some(parent) = dest.parent()
         && let Err(e) = fs::create_dir_all(parent).and_then(|_| fs::copy(src, dest))
     {
         log_error(&format!(
@@ -382,15 +386,8 @@ fn copy_dir(src: &Path, dest: &Path) {
         let target = dest.join(entry.file_name());
         if path.is_dir() {
             copy_dir(&path, &target);
-        } else if let Some(parent) = target.parent()
-            && let Err(e) = fs::create_dir_all(parent).and_then(|_| fs::copy(&path, &target))
-        {
-            log_error(&format!(
-                "failed to copy {} to {}: {}",
-                path.display(),
-                target.display(),
-                e
-            ));
+        } else {
+            copy_file(&path, &target);
         }
     }
 }

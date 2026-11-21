@@ -9,6 +9,7 @@ name = "yoke"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std", "preserve_order"] }
 
 [dev-dependencies]

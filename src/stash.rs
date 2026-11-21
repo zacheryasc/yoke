@@ -20,16 +20,23 @@ fn generate_stash_hash(timestamp: &str, files: &[(String, Vec<u8>)]) -> String {
     format!("{:07x}", hasher.finish() & 0x0FFF_FFFF)
 }
 
-/// Collect regular files under `dir`, storing paths relative to `.loop/`.
-fn collect_regular_files(files: &mut Vec<(String, Vec<u8>)>, dir: &Path, prefix: &str) {
+/// Collect files relative to `dir`. At the loop root only `archive/` is
+/// traversed; stash entries and the archive are read recursively.
+fn collect_regular_files(
+    files: &mut Vec<(String, Vec<u8>)>,
+    dir: &Path,
+    prefix: &str,
+    loop_root: bool,
+) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || (loop_root && name.starts_with("backups-")) {
                 continue;
             }
             let rel = if prefix.is_empty() {
-                name
+                name.into_owned()
             } else {
                 format!("{}/{}", prefix, name)
             };
@@ -38,8 +45,8 @@ fn collect_regular_files(files: &mut Vec<(String, Vec<u8>)>, dir: &Path, prefix:
                 if let Ok(contents) = fs::read(&path) {
                     files.push((rel, contents));
                 }
-            } else if path.is_dir() {
-                collect_regular_files(files, &path, &rel);
+            } else if (!loop_root || rel == "archive") && path.is_dir() {
+                collect_regular_files(files, &path, &rel, false);
             }
         }
     }
@@ -51,24 +58,9 @@ fn collect_regular_files(files: &mut Vec<(String, Vec<u8>)>, dir: &Path, prefix:
 /// under `.loop/archive/`, so it is included recursively without pulling in
 /// unrelated log/checkpoint directories.
 /// Returns sorted `(relative path, contents)` pairs for deterministic hashing.
-pub(crate) fn collect_stashable_files() -> Vec<(String, Vec<u8>)> {
+fn collect_stashable_files() -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(".loop") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.starts_with("backups-") {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(contents) = fs::read(&path) {
-                    files.push((name, contents));
-                }
-            } else if name == "archive" && path.is_dir() {
-                collect_regular_files(&mut files, &path, "archive");
-            }
-        }
-    }
+    collect_regular_files(&mut files, Path::new(".loop"), "", true);
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
@@ -88,23 +80,16 @@ fn stash_base_dir() -> PathBuf {
 /// Parse `~/.yoke/stash/<project-slug>/index` into a list of stash entries (oldest first).
 pub(crate) fn parse_stash_index() -> Vec<StashEntry> {
     let index_path = stash_base_dir().join("index");
-    let content = match fs::read_to_string(&index_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    let content = fs::read_to_string(index_path).unwrap_or_default();
     content
         .lines()
-        .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() < 4 {
-                return None;
-            }
+            let mut parts = line.splitn(4, '|');
             Some(StashEntry {
-                hash: parts[0].to_string(),
-                timestamp: parts[1].to_string(),
-                mode: parts[2].to_string(),
-                files: parts[3].split(',').map(|s| s.to_string()).collect(),
+                hash: parts.next()?.to_string(),
+                timestamp: parts.next()?.to_string(),
+                mode: parts.next()?.to_string(),
+                files: parts.next()?.split(',').map(str::to_owned).collect(),
             })
         })
         .collect()
@@ -114,22 +99,18 @@ pub(crate) fn parse_stash_index() -> Vec<StashEntry> {
 
 /// Snapshot all stashable files in `.loop/` to a new log entry.
 /// Returns `Ok(hash)` on success.
-pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
-    let files = collect_stashable_files();
+fn stash_snapshot(mode: &str, files: &[(String, Vec<u8>)]) -> Result<String, String> {
     if files.is_empty() {
         return Err("no files to stash in .loop/".to_string());
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = metrics::unix_now();
     let timestamp = {
         let (y, m, d, h, min, s) = metrics::unix_to_utc(now);
         format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, h, min, s)
     };
 
-    let mut hash = generate_stash_hash(&timestamp, &files);
+    let mut hash = generate_stash_hash(&timestamp, files);
 
     // Collision handling: rehash with counter suffix
     let stash_base = stash_base_dir();
@@ -142,7 +123,7 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
         if attempt == 99 {
             return Err("hash collision after 100 attempts".to_string());
         }
-        hash = generate_stash_hash(&format!("{}{}", timestamp, attempt + 1), &files);
+        hash = generate_stash_hash(&format!("{}{}", timestamp, attempt + 1), files);
     }
 
     let entry_dir = stash_base.join(&hash);
@@ -151,7 +132,7 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
 
     let file_names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
 
-    for (name, contents) in &files {
+    for (name, contents) in files {
         let dest = entry_dir.join(name);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
@@ -180,14 +161,7 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
 /// Snapshot `.loop/` to a new stash log entry. Returns file count for `clean()`.
 pub(crate) fn stash_working_files(mode: &str) -> usize {
     let files = collect_stashable_files();
-    if files.is_empty() {
-        return 0;
-    }
-    let count = files.len();
-    match stash_snapshot(mode) {
-        Ok(_) => count,
-        Err(_) => 0,
-    }
+    stash_snapshot(mode, &files).map_or(0, |_| files.len())
 }
 
 /// `yoke stash` — create a new stash entry and print the hash.
@@ -196,7 +170,7 @@ pub(crate) fn stash_create(mode: &str) -> i32 {
         log_error(".loop/ directory not found");
         return 1;
     }
-    match stash_snapshot(mode) {
+    match stash_snapshot(mode, &collect_stashable_files()) {
         Ok(hash) => {
             for (name, _) in &collect_stashable_files() {
                 let _ = fs::remove_file(Path::new(".loop").join(name));
@@ -236,17 +210,16 @@ pub(crate) fn stash_log_cmd() -> i32 {
 
 /// Resolve a hash prefix to a single stash entry. Returns the entry or logs an error.
 fn resolve_stash_entry<'a>(entries: &'a [StashEntry], target_hash: &str) -> Option<&'a StashEntry> {
-    let matches: Vec<&StashEntry> = entries
+    let mut matches = entries
         .iter()
-        .filter(|e| e.hash == target_hash || e.hash.starts_with(target_hash))
-        .collect();
-
-    match matches.len() {
+        .filter(|entry| entry.hash.starts_with(target_hash));
+    let first = matches.next();
+    match matches.count() + usize::from(first.is_some()) {
         0 => {
             log_error(&format!("no stash entry matching '{}'", target_hash));
             None
         }
-        1 => Some(matches[0]),
+        1 => first,
         n => {
             log_error(&format!(
                 "ambiguous hash '{}' — matches {} entries",
@@ -261,7 +234,7 @@ fn resolve_stash_entry<'a>(entries: &'a [StashEntry], target_hash: &str) -> Opti
 fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
     let current_files = collect_stashable_files();
     if !current_files.is_empty() {
-        let hash = stash_snapshot(mode)?;
+        let hash = stash_snapshot(mode, &current_files)?;
         log(&format!(
             "auto-stashed current state → {}{}{}",
             BLUE, hash, RESET
@@ -273,7 +246,7 @@ fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
     }
 
     let mut restored_files = Vec::new();
-    collect_regular_files(&mut restored_files, entry_dir, "");
+    collect_regular_files(&mut restored_files, entry_dir, "", false);
     for (name, contents) in restored_files {
         let dest = Path::new(".loop").join(&name);
         if let Some(parent) = dest.parent() {
@@ -332,35 +305,18 @@ pub(crate) fn stash_pop(mode: &str) -> i32 {
 
 pub(crate) fn print_stash_help() {
     eprintln!(
-        "{}{}[yoke stash]{} snapshot and restore .loop/ state",
-        ORANGE, BOLD, RESET
+        "{ORANGE}{BOLD}[yoke stash]{RESET} snapshot and restore .loop/ state\n\n\
+         {BOLD}USAGE:{RESET} yoke stash [subcommand]\n\n\
+         {BOLD}SUBCOMMANDS:{RESET}\n  \
+         {BOLD}(none){RESET}           Snapshot .loop/ files to stash, then clear the directory\n  \
+         {BOLD}log{RESET}              List all stash entries (hash, timestamp, mode, files)\n  \
+         {BOLD}checkout <hash>{RESET}  Auto-stash current state, then restore target entry\n  \
+         {BOLD}pop{RESET}              Alias for checkout of the most recent entry\n\n\
+         Storage: ~/.yoke/stash/<project-slug>/\n\n\
+         {BOLD}EXAMPLES:{RESET}\n  \
+         yoke stash                   # snapshot current .loop/ files\n  \
+         yoke stash log               # show all stash entries\n  \
+         yoke stash checkout a1b2c3d  # restore a specific snapshot\n  \
+         yoke stash pop               # restore the most recent snapshot"
     );
-    eprintln!();
-    eprintln!("{}USAGE:{} yoke stash [subcommand]", BOLD, RESET);
-    eprintln!();
-    eprintln!("{}SUBCOMMANDS:{}", BOLD, RESET);
-    eprintln!(
-        "  {}(none){}           Snapshot .loop/ files to stash, then clear the directory",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}log{}              List all stash entries (hash, timestamp, mode, files)",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}checkout <hash>{}  Auto-stash current state, then restore target entry",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}pop{}              Alias for checkout of the most recent entry",
-        BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("Storage: ~/.yoke/stash/<project-slug>/");
-    eprintln!();
-    eprintln!("{}EXAMPLES:{}", BOLD, RESET);
-    eprintln!("  yoke stash                   # snapshot current .loop/ files");
-    eprintln!("  yoke stash log               # show all stash entries");
-    eprintln!("  yoke stash checkout a1b2c3d  # restore a specific snapshot");
-    eprintln!("  yoke stash pop               # restore the most recent snapshot");
 }

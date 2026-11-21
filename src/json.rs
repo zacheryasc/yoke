@@ -8,75 +8,39 @@ pub fn unescape_json(s: &str) -> String {
 /// Returns `None` if the key is not found or the value is not a string.
 #[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
 pub fn extract_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let needle = {
-        let mut pat = String::with_capacity(key.len() + 3);
-        pat.push('"');
-        pat.push_str(key);
-        pat.push('"');
-        pat
-    };
-
-    let mut search_from = 0;
-    loop {
-        let rel_pos = line[search_from..].find(&needle)?;
-        let key_start = search_from + rel_pos;
-        let after_key = key_start + needle.len();
-        let rest = &line[after_key..];
-
-        // Skip whitespace and colon
-        let rest = rest.trim_start();
-        let rest = match rest.strip_prefix(':') {
-            Some(r) => r,
-            None => {
-                // This was a value, not a key — advance and retry
-                search_from = after_key;
-                continue;
+    let needle = format!("\"{key}\"");
+    for (pos, _) in line.match_indices(&needle) {
+        let rest = &line[pos + needle.len()..];
+        if let Some(quoted) = after_colon(rest).and_then(|s| s.strip_prefix('"')) {
+            let mut bytes = quoted.bytes().enumerate();
+            while let Some((end, byte)) = bytes.next() {
+                match byte {
+                    b'\\' => {
+                        bytes.next();
+                    }
+                    b'"' => return Some(&quoted[..end]),
+                    _ => {}
+                }
             }
-        };
-        let rest = rest.trim_start();
-
-        // Expect opening quote
-        let rest = match rest.strip_prefix('"') {
-            Some(r) => r,
-            None => {
-                search_from = after_key;
-                continue;
-            }
-        };
-
-        // Find closing quote (handle escaped quotes)
-        let mut end = 0;
-        let bytes = rest.as_bytes();
-        while end < bytes.len() {
-            if bytes[end] == b'\\' {
-                end += 2;
-            } else if bytes[end] == b'"' {
-                return Some(&rest[..end]);
-            } else {
-                end += 1;
-            }
+            return None;
         }
-
-        return None;
     }
+    None
+}
+
+fn after_colon(rest: &str) -> Option<&str> {
+    Some(rest.trim_start().strip_prefix(':')?.trim_start())
+}
+
+fn first_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    after_colon(line.split_once(&needle)?.1)
 }
 
 /// Extract a boolean value for a given key from a flat JSON line.
 /// Looks for `"key": true` or `"key": false`.
-#[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
 pub fn extract_bool(line: &str, key: &str) -> Option<bool> {
-    let needle = {
-        let mut pat = String::with_capacity(key.len() + 3);
-        pat.push('"');
-        pat.push_str(key);
-        pat.push('"');
-        pat
-    };
-
-    let key_start = line.find(&needle)?;
-    let after_key = key_start + needle.len();
-    let rest = line[after_key..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = first_value(line, key)?;
 
     if rest.starts_with("true") {
         Some(true)
@@ -92,34 +56,10 @@ pub fn extract_bool(line: &str, key: &str) -> Option<bool> {
 /// Returns `None` if the key is not found or the value is not a number.
 #[allow(clippy::string_slice)] // all slices at ASCII delimiter positions from .find()
 pub fn extract_num(line: &str, key: &str) -> Option<f64> {
-    let needle = {
-        let mut pat = String::with_capacity(key.len() + 3);
-        pat.push('"');
-        pat.push_str(key);
-        pat.push('"');
-        pat
-    };
-
-    let key_start = line.find(&needle)?;
-    let after_key = key_start + needle.len();
-    let rest = &line[after_key..];
-
-    // Skip whitespace and colon
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix(':')?;
-    let rest = rest.trim_start();
-
-    // Collect numeric chars: digits, '.', '-', '+', 'e', 'E'
+    let rest = first_value(line, key)?;
     let num_end = rest
-        .find(|c: char| {
-            !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
-        })
+        .find(|c: char| !c.is_ascii_digit() && !matches!(c, '.' | '-' | '+' | 'e' | 'E'))
         .unwrap_or(rest.len());
-
-    if num_end == 0 {
-        return None;
-    }
-
     rest[..num_end].parse::<f64>().ok()
 }
 

@@ -9,17 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
-
-#[derive(Debug, Clone)]
-pub struct GuardRow {
-    pub name: String,
-    pub passed: bool,
-    pub skipped: bool,
-    pub elapsed_secs: f64,
-}
-
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 pub struct IterationMetrics {
     pub run_id: String,
     pub project_slug: String,
@@ -44,13 +34,13 @@ pub struct IterationMetrics {
     pub tool_counts: BTreeMap<String, u32>,
     pub tool_durations_secs: BTreeMap<String, f64>,
 
-    pub guards: Vec<GuardRow>,
+    pub guards: Vec<crate::guard::GuardResult>,
 
     pub guards_passed: bool,
     pub status_done: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 pub struct RunMetrics {
     pub run_id: String,
     pub project_slug: String,
@@ -67,107 +57,77 @@ pub struct RunMetrics {
     pub total_cost_usd: f64,
 }
 
-/// Run-scoped state that travels with the loop: identifies the run, knows
-/// where to write, and tells the loop whether persistence is enabled.
-#[derive(Debug, Clone)]
-pub struct MetricsContext {
-    pub run_id: String,
-    pub project_slug: String,
-    pub mode: &'static str,
-    pub root_dir: PathBuf,
-    pub enabled: bool,
-}
-
-impl MetricsContext {
-    pub fn new(root_dir: PathBuf, mode: &'static str, enabled: bool) -> Self {
-        Self {
-            run_id: new_run_id(),
-            project_slug: project_slug(),
-            mode,
-            root_dir,
-            enabled,
-        }
-    }
-
-    pub fn iteration_path(&self) -> PathBuf {
-        self.root_dir
-            .join(&self.project_slug)
-            .join(format!("{}.ndjson", self.run_id))
-    }
-}
-
-/// Accumulates per-iteration totals and writes a final `RunMetrics` row
-/// on Drop.  Drop runs on normal exit, on early-return, and on the first
-/// SIGINT (which sets the interrupted flag and lets the loop unwind).  A
-/// second SIGINT calls `_exit` directly and bypasses Drop — accepted
-/// tradeoff for a panic-button.
+/// Accumulates iteration totals and writes the run row on Drop, including
+/// on the first SIGINT. A second SIGINT exits without unwinding.
+///
+/// `output_dir` is `None` when metrics are disabled; totals are still kept
+/// for the terminal summary.
 pub struct RunRecorder {
-    pub ctx: MetricsContext,
-    started_at: u64,
+    pub row: RunMetrics,
+    output_dir: Option<PathBuf>,
     wall_start: std::time::Instant,
-    iterations: u32,
-    total_agent_secs: f64,
-    total_thinking_secs: f64,
-    total_guards_secs: f64,
-    total_cost_usd: f64,
-    pub outcome: &'static str,
     /// Finalized-run callback: lets the caller render an end-of-run summary
     /// table without making Drop know about ANSI rendering.
     pub on_finalize: Option<fn(&RunMetrics)>,
 }
 
 impl RunRecorder {
-    pub fn new(ctx: MetricsContext) -> Self {
+    pub fn new(root_dir: Option<&Path>, mode: &'static str) -> Self {
+        let project_slug = project_slug();
+        let output_dir = root_dir.map(|dir| dir.join(&project_slug));
         Self {
-            ctx,
-            started_at: unix_now(),
+            row: RunMetrics {
+                run_id: new_run_id(),
+                project_slug,
+                mode,
+                started_at: unix_now(),
+                ended_at: 0,
+                total_wall_secs: 0.0,
+                iterations: 0,
+                total_agent_secs: 0.0,
+                total_thinking_secs: 0.0,
+                total_guards_secs: 0.0,
+                total_cost_usd: 0.0,
+                // Default to "interrupt" so an unwinding stack still records
+                // something meaningful — clean exit paths override this.
+                outcome: "interrupt",
+            },
+            output_dir,
             wall_start: std::time::Instant::now(),
-            iterations: 0,
-            total_agent_secs: 0.0,
-            total_thinking_secs: 0.0,
-            total_guards_secs: 0.0,
-            total_cost_usd: 0.0,
-            // Default to "interrupt" so an unwinding stack still records
-            // something meaningful — clean exit paths override this.
-            outcome: "interrupt",
             on_finalize: None,
         }
     }
 
     /// Write the iteration row and accumulate its totals in one step.
     pub fn record_iteration(&mut self, m: &IterationMetrics) {
-        write_iteration_row(&self.ctx, m);
-        self.iterations += 1;
-        self.total_agent_secs += m.agent_secs;
-        self.total_thinking_secs += m.thinking_secs;
-        self.total_guards_secs += m.guards_secs;
-        self.total_cost_usd += m.cost_usd;
+        if let Some(path) = self.iteration_path() {
+            append_line(&path, serialize_row(m));
+        }
+        self.row.iterations += 1;
+        self.row.total_agent_secs += m.agent_secs;
+        self.row.total_thinking_secs += m.thinking_secs;
+        self.row.total_guards_secs += m.guards_secs;
+        self.row.total_cost_usd += m.cost_usd;
     }
 
-    fn finalize(&mut self) -> RunMetrics {
-        RunMetrics {
-            run_id: self.ctx.run_id.clone(),
-            project_slug: self.ctx.project_slug.clone(),
-            mode: self.ctx.mode,
-            started_at: self.started_at,
-            ended_at: unix_now(),
-            iterations: self.iterations,
-            outcome: self.outcome,
-            total_wall_secs: self.wall_start.elapsed().as_secs_f64(),
-            total_agent_secs: self.total_agent_secs,
-            total_thinking_secs: self.total_thinking_secs,
-            total_guards_secs: self.total_guards_secs,
-            total_cost_usd: self.total_cost_usd,
-        }
+    pub fn iteration_path(&self) -> Option<PathBuf> {
+        Some(
+            self.output_dir
+                .as_ref()?
+                .join(format!("{}.ndjson", self.row.run_id)),
+        )
     }
 }
 
 impl Drop for RunRecorder {
     fn drop(&mut self) {
-        let run = self.finalize();
-        write_run_row(&self.ctx, &run);
+        self.row.ended_at = unix_now();
+        self.row.total_wall_secs = self.wall_start.elapsed().as_secs_f64();
+        if let Some(dir) = &self.output_dir {
+            append_line(&dir.join("runs.ndjson"), serialize_row(&self.row));
+        }
         if let Some(cb) = self.on_finalize.take() {
-            cb(&run);
+            cb(&self.row);
         }
     }
 }
@@ -205,11 +165,7 @@ pub(crate) fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let ss = (tod % 60) as u32;
 
     let z = days + 719468;
-    let era = if z >= 0 {
-        z / 146097
-    } else {
-        (z - 146096) / 146097
-    };
+    let era = z / 146097;
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;
@@ -227,7 +183,7 @@ pub(crate) fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 /// different slugs.
 pub fn project_slug() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let abs = cwd.canonicalize().unwrap_or(cwd.clone());
+    let abs = cwd.canonicalize().unwrap_or(cwd);
     let base: String = abs
         .file_name()
         .and_then(|s| s.to_str())
@@ -269,40 +225,22 @@ pub fn default_metrics_dir() -> PathBuf {
     expand_tilde("~/.yoke/metrics")
 }
 
-pub fn write_iteration_row(ctx: &MetricsContext, m: &IterationMetrics) {
-    if !ctx.enabled {
+fn append_line(path: &Path, mut line: String) {
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "[yoke] WARNING: cannot create metrics dir {}: {}",
+            parent.display(),
+            e
+        );
         return;
-    }
-    append_line(&ctx.iteration_path(), &serialize_iteration(m));
-}
-
-pub fn write_run_row(ctx: &MetricsContext, r: &RunMetrics) {
-    if !ctx.enabled {
-        return;
-    }
-    append_line(
-        &ctx.root_dir.join(&ctx.project_slug).join("runs.ndjson"),
-        &serialize_run(r),
-    );
-}
-
-fn append_line(path: &Path, line: &str) {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!(
-                "[yoke] WARNING: cannot create metrics dir {}: {}",
-                parent.display(),
-                e
-            );
-            return;
-        }
     }
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
             // Single write_all keeps the row atomic on POSIX for small lines.
-            let mut buf = line.to_string();
-            buf.push('\n');
-            if let Err(e) = f.write_all(buf.as_bytes()) {
+            line.push('\n');
+            if let Err(e) = f.write_all(line.as_bytes()) {
                 eprintln!("[yoke] WARNING: failed to write metrics row: {}", e);
             }
         }
@@ -318,61 +256,8 @@ fn append_line(path: &Path, line: &str) {
 
 // ─── JSON emission ────────────────────────────────────────────────────────
 
-fn serialize_iteration(m: &IterationMetrics) -> String {
-    let guards: Vec<serde_json::Value> = m
-        .guards
-        .iter()
-        .map(|g| {
-            json!({
-                "name": g.name,
-                "passed": g.passed,
-                "skipped": g.skipped,
-                "elapsed_secs": g.elapsed_secs,
-            })
-        })
-        .collect();
-    json!({
-        "run_id": m.run_id,
-        "project_slug": m.project_slug,
-        "mode": m.mode,
-        "iteration": m.iteration,
-        "started_at": m.started_at,
-        "wall_secs": m.wall_secs,
-        "restore_ms": m.restore_ms,
-        "agent_secs": m.agent_secs,
-        "guards_secs": m.guards_secs,
-        "periodics_secs": m.periodics_secs,
-        "hooks_secs": m.hooks_secs,
-        "judge_secs": m.judge_secs,
-        "agent_reported_secs": m.agent_reported_secs,
-        "cost_usd": m.cost_usd,
-        "num_turns": m.num_turns,
-        "thinking_secs": m.thinking_secs,
-        "tool_counts": m.tool_counts,
-        "tool_durations_secs": m.tool_durations_secs,
-        "guards": guards,
-        "guards_passed": m.guards_passed,
-        "status_done": m.status_done,
-    })
-    .to_string()
-}
-
-fn serialize_run(r: &RunMetrics) -> String {
-    json!({
-        "run_id": r.run_id,
-        "project_slug": r.project_slug,
-        "mode": r.mode,
-        "started_at": r.started_at,
-        "ended_at": r.ended_at,
-        "iterations": r.iterations,
-        "outcome": r.outcome,
-        "total_wall_secs": r.total_wall_secs,
-        "total_agent_secs": r.total_agent_secs,
-        "total_thinking_secs": r.total_thinking_secs,
-        "total_guards_secs": r.total_guards_secs,
-        "total_cost_usd": r.total_cost_usd,
-    })
-    .to_string()
+fn serialize_row(row: &impl serde::Serialize) -> String {
+    serde_json::to_string(row).expect("metrics row is JSON-serializable")
 }
 
 // ─── Read side: parse rows for `yoke stats` ──────────────────────────────
@@ -418,12 +303,9 @@ pub fn read_iterations(file: &Path) -> Vec<IterRow> {
 }
 
 fn read_ndjson<T>(path: &Path, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    content
+    fs::read_to_string(path)
+        .unwrap_or_default()
         .lines()
-        .filter(|line| !line.trim().is_empty())
         .filter_map(parse)
         .collect()
 }
@@ -510,7 +392,7 @@ mod tests {
             total_guards_secs: 3.2,
             total_cost_usd: 0.84,
         };
-        let serialized = serialize_run(&original);
+        let serialized = serialize_row(&original);
         let parsed = parse_run_row(&serialized).expect("parse should succeed");
         assert_eq!(parsed.run_id, original.run_id);
         assert_eq!(parsed.mode, original.mode);
@@ -545,7 +427,7 @@ mod tests {
             guards_passed: true,
             status_done: false,
         };
-        let line = serialize_iteration(&m);
+        let line = serialize_row(&m);
         let row = parse_iter_row(&line).expect("parse iter row");
         assert_eq!(row.iteration, 7);
         assert_eq!(row.mode, "loop");
@@ -580,7 +462,7 @@ mod tests {
             tool_durations_secs: [("Edit".to_string(), 1.8), ("Bash".to_string(), 12.3)]
                 .into_iter()
                 .collect(),
-            guards: vec![GuardRow {
+            guards: vec![crate::guard::GuardResult {
                 name: "cargo test".to_string(),
                 passed: true,
                 skipped: false,
@@ -589,7 +471,7 @@ mod tests {
             guards_passed: true,
             status_done: false,
         };
-        let s = serialize_iteration(&m);
+        let s = serialize_row(&m);
         assert!(s.starts_with('{') && s.ends_with('}'));
         assert!(s.contains("\"run_id\":\"20260101T000000-abcd\""));
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");

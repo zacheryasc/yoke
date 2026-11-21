@@ -33,13 +33,14 @@ const DEFAULT_JUDGE: &str = include_str!("templates/brute/judge.md");
 
 const BRIEFING_PATH: &str = ".loop/briefing.md";
 
-/// Parse the plan file and notes.md to determine stage progress.
-/// Returns `Some((completed, total))` if the plan has parseable `## Stage` headers.
-fn stage_progress(plan_path: &str) -> Option<(usize, usize)> {
-    let plan = fs::read_to_string(plan_path).ok()?;
+/// Render stage progress when the plan contains stage headers.
+fn render_stage_progress() {
+    let Ok(plan) = fs::read_to_string(PLAN_PATH) else {
+        return;
+    };
     let total = plan.lines().filter(|l| l.starts_with("## Stage")).count();
     if total == 0 {
-        return None;
+        return;
     }
 
     let notes = fs::read_to_string(NOTES_PATH).unwrap_or_default();
@@ -52,23 +53,12 @@ fn stage_progress(plan_path: &str) -> Option<(usize, usize)> {
         })
         .count();
 
-    Some((completed, total))
-}
-
-/// Render a compact progress bar like `▐████░░░░▌ 3/7 stages`.
-fn format_progress_bar(completed: usize, total: usize) -> String {
-    let bar_width = 10;
-    let filled = if total > 0 {
-        ((completed * bar_width + total / 2) / total).min(bar_width)
-    } else {
-        0
-    };
-    let empty = bar_width - filled;
-    let bar: String = "█".repeat(filled) + &"░".repeat(empty);
-    format!(
-        "{}{}  ▐{}▌ {}/{} stages{}",
-        DIM, GREEN, bar, completed, total, RESET
-    )
+    let filled = ((completed * 10 + total / 2) / total).min(10);
+    let empty = 10 - filled;
+    eprintln!(
+        "{DIM}{GREEN}  ▐{:█>filled$}{:░>empty$}▌ {completed}/{total} stages{RESET}",
+        "", ""
+    );
 }
 
 use ansi::{BLUE, BOLD, DIM, GREEN, ORANGE, RED, RESET};
@@ -101,6 +91,11 @@ fn get_layer(name: &str) -> Option<(&'static str, &'static str)> {
 
 /// Print usage or per-command help.
 fn show_help(topic: &str) {
+    match topic {
+        "stash" => return stash::print_stash_help(),
+        "pause" | "resume" | "stop" => return eprintln!("{BOLD}USAGE:{RESET} yoke {topic}"),
+        _ => {}
+    }
     if topic == "inject" {
         eprint!(
             "[yoke inject] steer an active run\n\n\
@@ -226,11 +221,6 @@ fn ensure_archive_dir() {
     }
 }
 
-/// Check that required loop files exist, create notes if missing.
-///
-/// The previous attempt's guard feedback is preserved so the worker can
-/// read it on the next iteration.
-
 /// Copy protected files into an existing backup directory. Used both at run
 /// start and when a paused run resumes, so paused edits become the new
 /// restore point instead of being clobbered by the next iteration.
@@ -323,41 +313,39 @@ fn container_home(image: &str) -> String {
             "-c",
             "echo $HOME",
         ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if h.is_empty() {
-                "/home/sandbox".to_string()
-            } else {
-                h
-            }
-        }
-        _ => "/home/sandbox".to_string(),
-    }
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    let home = output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stdout));
+    home.as_deref()
+        .map(str::trim)
+        .filter(|home| !home.is_empty())
+        .unwrap_or("/home/sandbox")
+        .to_owned()
 }
 
 fn should_forward_env(key: &str) -> bool {
-    key.starts_with("OMP_")
-        || key.starts_with("PI_")
-        || key.starts_with("ANTHROPIC_")
-        || key.starts_with("OPENAI_")
-        || key.starts_with("GEMINI_")
-        || key.starts_with("OPENROUTER_")
-        || key.starts_with("CLAUDE_CODE_")
-        || key.starts_with("FOUNDRY_")
-        || key == "NODE_EXTRA_CA_CERTS"
-        || key.ends_with("_API_KEY")
-        || key.ends_with("_OAUTH_TOKEN")
-        || key.ends_with("_ACCESS_TOKEN")
+    const PREFIXES: &[&str] = &[
+        "OMP_",
+        "PI_",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "GEMINI_",
+        "OPENROUTER_",
+        "CLAUDE_CODE_",
+        "FOUNDRY_",
+    ];
+    const SUFFIXES: &[&str] = &["_API_KEY", "_OAUTH_TOKEN", "_ACCESS_TOKEN"];
+    key == "NODE_EXTRA_CA_CERTS"
+        || PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+        || SUFFIXES.iter().any(|suffix| key.ends_with(suffix))
 }
 
 /// Build a docker command that runs OMP inside a container.
-pub(crate) fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Command {
-    let workdir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .to_string_lossy()
-        .to_string();
+fn build_docker_omp_command(image: &str) -> Command {
+    let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let container_home = container_home(image);
 
@@ -371,7 +359,8 @@ pub(crate) fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Comm
         "--cap-add=NET_RAW",
     ]);
     c.args(["--entrypoint", "omp"]);
-    c.arg("-v").arg(format!("{}:/workspace", workdir));
+    c.arg("-v")
+        .arg(format!("{}:/workspace", workdir.to_string_lossy()));
     c.arg("-w").arg("/workspace");
 
     // Mount Docker socket for Docker-outside-of-Docker
@@ -391,8 +380,7 @@ pub(crate) fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Comm
     }
 
     if let Some(home) = std::env::var_os("HOME") {
-        let home_path = PathBuf::from(&home);
-        let omp_dir = home_path.join(".omp");
+        let omp_dir = PathBuf::from(home).join(".omp");
         if omp_dir.exists() {
             c.arg("-v")
                 .arg(format!("{}:{}/.omp", omp_dir.display(), container_home));
@@ -400,53 +388,23 @@ pub(crate) fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Comm
     }
 
     c.arg(image);
-    c.args(omp_args);
     c
 }
 
-/// Build the OMP option list shared by print/json and RPC modes.
-pub(crate) fn omp_args(config: &Config, mode: &str) -> Vec<String> {
-    let mut args = vec![
-        "--mode".to_string(),
-        mode.to_string(),
-        "--auto-approve".to_string(),
-    ];
+/// Build the shared native or container command for OMP's JSON and RPC modes.
+pub(crate) fn omp_command(config: &Config, mode: &str) -> Command {
+    let mut command = match config.image.as_deref() {
+        Some(image) => build_docker_omp_command(image),
+        None => Command::new("omp"),
+    };
+    command.args(["--mode", mode, "--auto-approve"]);
     if let Some(model) = config.model.as_deref() {
-        args.push("--model".to_string());
-        args.push(model.to_string());
+        command.args(["--model", model]);
     }
     if let Some(thinking) = config.thinking {
-        args.push("--thinking".to_string());
-        args.push(thinking.as_omp_arg().to_string());
+        command.args(["--thinking", thinking.as_omp_arg()]);
     }
-    args
-}
-
-/// Build a Command for invoking OMP, in a container when configured.
-pub(crate) fn omp_command(config: &Config, omp_args: &[String]) -> Command {
-    match &config.image {
-        Some(image) => build_docker_omp_command(image, omp_args),
-        None => {
-            let mut c = Command::new("omp");
-            c.args(omp_args);
-            c
-        }
-    }
-}
-
-/// Build a print-mode Command for invoking OMP.
-///
-/// `resume` carries an OMP session id when the harness wants to continue the
-/// previous round's conversation. `None` produces a fresh session.
-fn build_command(config: &Config, prompt: &str, resume: Option<&str>) -> Command {
-    let mut args = omp_args(config, "json");
-    if let Some(sid) = resume {
-        args.push("--resume".to_string());
-        args.push(sid.to_string());
-    }
-    args.push("-p".to_string());
-    args.push(prompt.to_string());
-    omp_command(config, &args)
+    command
 }
 
 /// Wall-clock + stream summary for one agent invocation.
@@ -456,10 +414,7 @@ pub(crate) struct AgentRunStats {
     pub stream: stream::StreamSummary,
 }
 
-/// Spawn an agent process, stream its output, kill it when streaming ends,
-/// and wait for exit.  Returns an `AgentRunStats` carrying success, the
-/// yoke-measured wall clock around the whole spawn+stream+wait, and the
-/// stream-derived summary (cost, thinking, per-tool durations).
+/// Spawn a judge or periodic agent and stream its output.
 ///
 /// The child is stored in `runner` for cleanup-on-drop safety.
 /// After `filter_stream` returns (normally, broken pipe, or interrupt)
@@ -472,26 +427,20 @@ fn invoke_process(
     label: &str,
     log_prefix: &str,
     iteration: u32,
-    prior_total: f64,
-    resume: Option<&str>,
-) -> AgentRunStats {
+) -> bool {
     let in_container = config.image.is_some();
-    let wall_start = std::time::Instant::now();
 
     log(&format!(
-        "Launching {} {}(iteration {}){}...",
+        "Launching {} {}(iteration {})...",
         label,
         if in_container { "in container " } else { "" },
-        iteration,
-        match resume {
-            Some(sid) => format!(" [resume {}…]", sid.chars().take(8).collect::<String>()),
-            None => String::new(),
-        }
+        iteration
     ));
 
-    let mut cmd = build_command(config, prompt, resume);
+    let mut cmd = omp_command(config, "json");
 
     let mut child = match cmd
+        .args(["-p", prompt])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -499,17 +448,12 @@ fn invoke_process(
     {
         Ok(c) => c,
         Err(e) => {
-            let bin = if config.image.is_some() {
-                "docker"
-            } else {
-                "omp"
-            };
-            log_error(&format!("failed to spawn '{}': {}", bin, e));
-            return AgentRunStats {
-                success: false,
-                wall_secs: wall_start.elapsed().as_secs_f64(),
-                stream: stream::StreamSummary::default(),
-            };
+            log_error(&format!(
+                "failed to spawn '{}': {}",
+                cmd.get_program().to_string_lossy(),
+                e
+            ));
+            return false;
         }
     };
 
@@ -520,45 +464,26 @@ fn invoke_process(
         .as_ref()
         .map(|dir| PathBuf::from(dir).join(format!("{}-{}.jsonl", log_prefix, iteration)));
 
-    let mut summary = stream::StreamSummary::default();
-    if let Some(stdout) = child.stdout.take() {
-        runner.child = Some(child);
-        summary = stream_omp::filter_stream(stdout, log_path.as_deref(), prior_total);
+    let stdout = child.stdout.take();
+    runner.child = Some(child);
+    let child = runner.child.as_mut().unwrap();
+    if let Some(stdout) = stdout {
+        stream_omp::filter_stream(stdout, log_path.as_deref());
         // Kill the child after streaming ends — prevents deadlock if it
         // ignores SIGPIPE and keeps writing.  No-op if already exited.
-        if let Some(ch) = &mut runner.child {
-            let _ = ch.kill();
-        }
+        let _ = child.kill();
         if signal::interrupted() {
-            return AgentRunStats {
-                success: false,
-                wall_secs: wall_start.elapsed().as_secs_f64(),
-                stream: summary,
-            };
+            return false;
         }
-    } else {
-        runner.child = Some(child);
     }
 
-    let status = if let Some(child) = &mut runner.child {
-        match child.wait() {
-            Ok(s) => {
-                if signal::interrupted() {
-                    return AgentRunStats {
-                        success: false,
-                        wall_secs: wall_start.elapsed().as_secs_f64(),
-                        stream: summary,
-                    };
-                }
-                s.success()
-            }
-            Err(e) => {
-                log_error(&format!("failed to wait on {} process: {}", label, e));
-                false
-            }
+    let status = match child.wait() {
+        Ok(_) if signal::interrupted() => return false,
+        Ok(status) => status.success(),
+        Err(e) => {
+            log_error(&format!("failed to wait on {} process: {}", label, e));
+            false
         }
-    } else {
-        false
     };
 
     signal::set_child_pid(0);
@@ -569,76 +494,29 @@ fn invoke_process(
         label,
         if status { "success" } else { "failure" }
     ));
-    AgentRunStats {
-        success: status,
-        wall_secs: wall_start.elapsed().as_secs_f64(),
-        stream: summary,
-    }
-}
-
-/// Invoke the agent, piping stdout through the stream filter.
-fn invoke_agent(
-    supervisor: &mut runtime::RunSupervisor,
-    config: &Config,
-    iteration: u32,
-    prior_total: f64,
-) -> AgentRunStats {
-    let prompt = "Read .loop/protocol.md and follow its instructions.";
-    supervisor.invoke_worker(config, prompt, "OMP", "iteration", iteration, prior_total)
-}
-
-/// Invoke a periodic agent with its protocol file.
-/// Returns true if the invocation succeeded.
-///
-/// Periodic agents always run in a fresh session: they have a different
-/// protocol than the main worker.
-fn invoke_periodic(
-    runner: &mut LoopRunner,
-    config: &Config,
-    periodic: &Periodic,
-    iteration: u32,
-) -> bool {
-    let prompt = format!("Read {} and follow its instructions.", periodic.path);
-    let stats = invoke_process(
-        runner,
-        config,
-        &prompt,
-        &periodic.name,
-        &format!("periodic-{}", periodic.name),
-        iteration,
-        0.0,
-        None,
-    );
-    stats.success
+    status
 }
 
 /// Render a box-drawn iteration banner to stderr.
 /// Uses double borders (╔/║/╚) at top level, single borders (┌/│/└) when nested.
 fn render_iteration_banner(label: &str, iteration: u32, nested: bool) {
-    let content = format!("{} {:>4}", label, iteration);
-    // Pad content to fill inner width of 38 characters
-    let inner = format!("{:^38}", content);
-    if nested {
-        eprintln!(
-            "{}{}┌──────────────────────────────────────┐{}",
-            BOLD, ORANGE, RESET
-        );
-        eprintln!("{}{}│{}│{}", BOLD, ORANGE, inner, RESET);
-        eprintln!(
-            "{}{}└──────────────────────────────────────┘{}",
-            BOLD, ORANGE, RESET
-        );
+    let (top, side, bottom) = if nested {
+        (
+            "┌──────────────────────────────────────┐",
+            '│',
+            "└──────────────────────────────────────┘",
+        )
     } else {
-        eprintln!(
-            "{}{}╔══════════════════════════════════════╗{}",
-            BOLD, ORANGE, RESET
-        );
-        eprintln!("{}{}║{}║{}", BOLD, ORANGE, inner, RESET);
-        eprintln!(
-            "{}{}╚══════════════════════════════════════╝{}",
-            BOLD, ORANGE, RESET
-        );
-    }
+        (
+            "╔══════════════════════════════════════╗",
+            '║',
+            "╚══════════════════════════════════════╝",
+        )
+    };
+    let content = format!("{label} {iteration:>4}");
+    eprintln!("{BOLD}{ORANGE}{top}{RESET}");
+    eprintln!("{BOLD}{ORANGE}{side}{content:^38}{side}{RESET}");
+    eprintln!("{BOLD}{ORANGE}{bottom}{RESET}");
 }
 
 /// Render a named section banner to stderr (for judge, periodic, etc.).
@@ -689,33 +567,22 @@ fn run_periodic_guards(periodic: &Periodic, max_tail: usize) {
         return;
     }
     let results_path = PathBuf::from(format!(".loop/periodic-{}-results.md", periodic.name));
-    let results = guard::run_guards(&periodic.guards, max_tail, &results_path);
+    let results = guard::run_guards(&periodic.guards, max_tail, &results_path, "");
 
     render_guard_table(&results);
 
-    let all_passed = results.iter().all(|r| r.passed);
-    if !all_passed {
+    if results.iter().any(|r| !r.passed) {
         log(&format!(
             "{}WARNING: periodic '{}' guard(s) failed — results in {}{}",
             ORANGE,
             periodic.name,
-            format!(".loop/periodic-{}-results.md", periodic.name),
+            results_path.display(),
             RESET
         ));
     }
 }
 
-/// Render a full-width box-drawn banner for the judge verdict.
-/// Includes the first ~2 lines of the verdict reason text.
-///
-/// ```text
-/// ╔══════════════════════════════════════╗
-/// ║        JUDGE VERDICT: PASS          ║
-/// ╠══════════════════════════════════════╣
-/// ║  "Tests pass and all features are   ║
-/// ║   present in the source code"       ║
-/// ╚══════════════════════════════════════╝
-/// ```
+/// Render the verdict and up to two non-empty lines of its reason.
 fn render_judge_banner(pass: bool, content: &str) {
     let (label, color) = if pass { ("PASS", GREEN) } else { ("FAIL", RED) };
     eprintln!("\n{}{}  Judge verdict: {}  {}", BOLD, color, label, RESET);
@@ -750,17 +617,7 @@ VERDICT: FAIL
 <what you tested, what went wrong, and what the correct behavior should be>";
 
     // Judge is always a fresh session — independence per behavioral-specification §2.1.
-    let stats = invoke_process(
-        runner,
-        config,
-        judge_prompt,
-        "judge",
-        "judge",
-        iteration,
-        0.0,
-        None,
-    );
-    if !stats.success {
+    if !invoke_process(runner, config, judge_prompt, "judge", "judge", iteration) {
         return false;
     }
 
@@ -775,16 +632,6 @@ VERDICT: FAIL
             log_error(&format!("failed to read {}: {}", VERDICT_PATH, e));
             false
         }
-    }
-}
-
-/// Render boundary violations as a compact file tree with colored markers.
-/// Violations are strings like "DENY: src/foo.rs (no matching rule)".
-/// Allowed-scope files get a green ✓, violations get a red ✗.
-#[allow(clippy::string_slice)] // slices at ASCII delimiter positions from .find()
-fn render_violation_tree(violations: &[String]) {
-    for violation in violations {
-        eprintln!("  {}{}{}", RED, violation, RESET);
     }
 }
 
@@ -812,13 +659,11 @@ fn run_all_guards(config: &Config) -> GuardOutcome {
             boundary.violations.len(),
             RESET
         ));
-        render_violation_tree(&boundary.violations);
-
         // Write boundary failure to guard results, mark configured guards as skipped
-        let mut md = String::new();
-        md.push_str("## diff boundary check \u{2014} FAIL\n\n```\n");
-        for v in &boundary.violations {
-            md.push_str(v);
+        let mut md = String::from("## diff boundary check — FAIL\n\n```\n");
+        for violation in &boundary.violations {
+            eprintln!("  {RED}{violation}{RESET}");
+            md.push_str(violation);
             md.push('\n');
         }
         md.push_str("```\n\n");
@@ -833,18 +678,12 @@ fn run_all_guards(config: &Config) -> GuardOutcome {
         };
     }
 
-    // Boundary passed — write that to results then run configured guards
     let results_path = Path::new(GUARD_RESULTS_PATH);
-
     let boundary_md = "## diff boundary check \u{2014} PASS\n\n```\nAll changed files are within allowed boundaries.\n```\n\n";
 
     log("Running configured guards...");
-    let guard_results = guard::run_guards(&config.guards, config.max_tail, results_path);
-
-    // Prepend boundary result to whatever guard::run_guards wrote
-    let existing = fs::read_to_string(results_path).unwrap_or_default();
-    let combined = format!("{}{}", boundary_md, existing);
-    let _ = fs::write(results_path, combined);
+    let guard_results =
+        guard::run_guards(&config.guards, config.max_tail, results_path, boundary_md);
 
     let all_passed = guard_results.iter().all(|r| r.passed);
 
@@ -948,17 +787,11 @@ fn init() -> i32 {
     0
 }
 
-/// Outcome of a plan loop run.
-enum PlanLoopOutcome {
-    /// STATUS: DONE + guards pass (no embedded judge).
-    Done,
-    /// STATUS: DONE + guards pass + embedded judge PASS (judge-every mode).
-    JudgePass,
-    /// Consecutive judge failures hit max-judge-failures.
-    JudgeBailout,
-    /// User interrupted (SIGINT).
+/// Terminal outcome of the run (as opposed to a plan waiting for its judge).
+enum RunOutcome {
+    Pass,
+    Bailout,
     Interrupt,
-    /// Hard error (spawn failure, missing files, etc.).
     Error,
 }
 
@@ -978,16 +811,6 @@ fn is_judge_bailout(consecutive: u32, max: u32) -> bool {
     }
 }
 
-/// Result of evaluating judge-every logic within a plan loop iteration.
-enum JudgeEveryAction {
-    /// Judge passed on DONE — exit loop.
-    Pass,
-    /// Consecutive failures hit threshold — bail out.
-    Bailout,
-    /// Continue to the next iteration.
-    Continue,
-}
-
 /// Evaluate judge-every logic: fire judge when worker signals DONE or at cadence checkpoints.
 /// On firing, records wall time into `judge_secs_out` for the metrics row.
 fn evaluate_judge_every(
@@ -998,53 +821,48 @@ fn evaluate_judge_every(
     consecutive_judge_failures: &mut u32,
     judge_every: u32,
     judge_secs_out: &mut Option<f64>,
-) -> JudgeEveryAction {
-    if guards_passed && is_status_done(NOTES_PATH) {
-        // Always fire judge when a status-driven worker signals DONE.
-        eprintln!();
-        render_section_banner("Judge (DONE)", "Worker DONE — invoking judge", BLUE);
-        let judge_start = std::time::Instant::now();
-        let pass = invoke_judge(runner, config, iteration);
-        *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
-        if pass {
-            return JudgeEveryAction::Pass;
-        }
-        *consecutive_judge_failures += 1;
-        if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
-            return JudgeEveryAction::Bailout;
-        }
-        log(&format!(
-            "{}Judge FAIL ({}/{}) \u{2014} resetting STATUS for retry{}",
-            ORANGE, *consecutive_judge_failures, config.max_judge_failures, RESET
-        ));
-        reset_notes_status();
-        return JudgeEveryAction::Continue;
+) -> Option<RunOutcome> {
+    if !guards_passed {
+        return None;
+    }
+    let done = is_status_done(NOTES_PATH);
+    if !done && iteration % judge_every != 0 {
+        return None;
     }
 
-    if guards_passed && iteration % judge_every == 0 {
-        // Cadenced quality checkpoint.
-        eprintln!();
+    eprintln!();
+    if done {
+        render_section_banner("Judge (DONE)", "Worker DONE — invoking judge", BLUE);
+    } else {
         render_section_banner(
             "Mid-loop Judge",
             &format!("Quality checkpoint (iteration {:>4})", iteration),
             BLUE,
         );
-        let judge_start = std::time::Instant::now();
-        let pass = invoke_judge(runner, config, iteration);
-        *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
-        if pass {
-            *consecutive_judge_failures = 0;
-            return JudgeEveryAction::Continue;
+    }
+    let judge_start = std::time::Instant::now();
+    let pass = invoke_judge(runner, config, iteration);
+    *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
+    if pass {
+        if done {
+            return Some(RunOutcome::Pass);
         }
-
-        *consecutive_judge_failures += 1;
-        if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
-            return JudgeEveryAction::Bailout;
-        }
-        return JudgeEveryAction::Continue;
+        *consecutive_judge_failures = 0;
+        return None;
     }
 
-    JudgeEveryAction::Continue
+    *consecutive_judge_failures += 1;
+    if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
+        return Some(RunOutcome::Bailout);
+    }
+    if done {
+        log(&format!(
+            "{}Judge FAIL ({}/{}) \u{2014} resetting STATUS for retry{}",
+            ORANGE, *consecutive_judge_failures, config.max_judge_failures, RESET
+        ));
+        reset_notes_status();
+    }
+    None
 }
 
 /// Validate config preconditions for the plan loop. Exits on failure.
@@ -1087,8 +905,15 @@ fn fire_periodic_agents(runner: &mut LoopRunner, config: &Config, iteration: u32
                 &format!("Periodic agent (iteration {:>4})", iteration),
                 "\x1b[38;5;207m",
             );
-            let ok = invoke_periodic(runner, config, periodic, iteration);
-            if !ok {
+            let prompt = format!("Read {} and follow its instructions.", periodic.path);
+            if !invoke_process(
+                runner,
+                config,
+                &prompt,
+                &periodic.name,
+                &format!("periodic-{}", periodic.name),
+                iteration,
+            ) {
                 log(&format!(
                     "{}WARNING: periodic '{}' invocation failed — continuing{}",
                     ORANGE, periodic.name, RESET
@@ -1143,115 +968,78 @@ struct IterationStepStats {
     guard_results: Vec<guard::GuardResult>,
 }
 
-/// Result of running the worker + guards for a single plan-loop iteration.
-enum IterationStepResult {
-    /// Worker + guards succeeded, loop should continue.
-    Continue(IterationStepStats),
-    /// Terminal outcome — return immediately from the loop.
-    Terminal(PlanLoopOutcome),
-}
-
-/// Run the worker invocation, interrupt check, and guard evaluation for one iteration.
-/// Returns `Continue` with guard results when the loop should proceed, or `Terminal`
-/// when an early exit is needed.
+/// Run one worker turn, restore protected files and run the guards.
 fn run_iteration_step(
-    runner: &mut LoopRunner,
+    backup_dir: &Path,
     supervisor: &mut runtime::RunSupervisor,
     config: &Config,
     iteration: u32,
     prior_total: f64,
-    dry_run: bool,
     protected: &[&str],
-) -> IterationStepResult {
-    if dry_run {
-        log("(dry-run) Skipping OMP invocation");
-    } else {
-        let stats = invoke_agent(supervisor, config, iteration, prior_total);
-        if !stats.success {
-            if signal::interrupted() {
-                log("Interrupted \u{2014} shutting down");
-                return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
-            }
-            if supervisor.shutdown_requested {
-                restore_files(&runner.backup_dir, protected);
-                log("Shutdown steering handled — stopping run");
-                return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
-            }
-            log_error("OMP invocation failed — aborting loop");
-            return IterationStepResult::Terminal(PlanLoopOutcome::Error);
-        }
-        if signal::interrupted() {
-            log("Interrupted \u{2014} shutting down");
-            return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
-        }
-        if supervisor.shutdown_requested {
-            restore_files(&runner.backup_dir, protected);
-            log("Shutdown steering handled — stopping run");
-            return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
-        }
-        restore_files(&runner.backup_dir, protected);
-        let guards_start = std::time::Instant::now();
-        let guard_outcome = run_all_guards(config);
-        let guards_secs = guards_start.elapsed().as_secs_f64();
-        if guard_outcome.passed {
-            log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
-        } else {
-            log(&format!(
-                "{}Some guards failed \u{2014} OMP will see results next iteration{}",
-                ORANGE, RESET
-            ));
-        }
-        return IterationStepResult::Continue(IterationStepStats {
-            guards_passed: guard_outcome.passed,
-            agent_secs: stats.wall_secs,
-            stream: stats.stream,
-            guards_secs,
-            guard_results: guard_outcome.guard_results,
-        });
+) -> Result<IterationStepStats, RunOutcome> {
+    let stats = supervisor.invoke_worker(
+        config,
+        "Read .loop/protocol.md and follow its instructions.",
+        iteration,
+        prior_total,
+    );
+    if signal::interrupted() {
+        log("Interrupted \u{2014} shutting down");
+        return Err(RunOutcome::Interrupt);
+    }
+    if supervisor.shutdown_requested {
+        restore_files(backup_dir, protected);
+        log("Shutdown steering handled — stopping run");
+        return Err(RunOutcome::Interrupt);
+    }
+    if !stats.success {
+        log_error("OMP invocation failed — aborting loop");
+        return Err(RunOutcome::Error);
     }
 
-    // Dry-run path: run guards and exit after one iteration.
-    restore_files(&runner.backup_dir, protected);
+    restore_files(backup_dir, protected);
+    let guards_start = std::time::Instant::now();
     let guard_outcome = run_all_guards(config);
+    let guards_secs = guards_start.elapsed().as_secs_f64();
     if guard_outcome.passed {
         log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
-        log("(dry-run) Guards passed \u{2014} exiting after one iteration");
-        IterationStepResult::Terminal(PlanLoopOutcome::Done)
     } else {
-        log(&format!("{}Some guards failed{}", ORANGE, RESET));
-        log("(dry-run) Exiting after one iteration");
-        IterationStepResult::Terminal(PlanLoopOutcome::Error)
+        log(&format!(
+            "{}Some guards failed \u{2014} OMP will see results next iteration{}",
+            ORANGE, RESET
+        ));
     }
+    Ok(IterationStepStats {
+        guards_passed: guard_outcome.passed,
+        agent_secs: stats.wall_secs,
+        stream: stats.stream,
+        guards_secs,
+        guard_results: guard_outcome.guard_results,
+    })
 }
 
 /// Core plan-loop runner used by the brute loop.
 ///
 /// - `config`: already-loaded Config
-/// - `dry_run`: if true, skip OMP invocation (one iteration only)
 /// - `recorder`: metrics recorder carrying run_id + project + output dir
 fn run_plan_loop(
     config: &Config,
-    dry_run: bool,
     recorder: &mut metrics::RunRecorder,
     run_artifacts: &mut artifacts::RunArtifacts,
     supervisor: &mut runtime::RunSupervisor,
-) -> PlanLoopOutcome {
-    if !dry_run {
-        if let Err(e) = supervisor.ensure_control_started() {
-            log_error(&e);
-            return PlanLoopOutcome::Error;
-        }
-        supervisor.reset_worker_session();
-    }
+) -> Option<RunOutcome> {
+    supervisor.reset_worker_session();
 
     let mut protected: Vec<&str> = vec![PROTOCOL_PATH, PLAN_PATH, CONF_PATH];
     if Path::new(JUDGE_PATH).exists() {
         protected.push(JUDGE_PATH);
     }
-    let periodic_paths: Vec<String> = config.periodics.iter().map(|p| p.path.clone()).collect();
-    for pp in &periodic_paths {
-        protected.push(pp.as_str());
-    }
+    protected.extend(
+        config
+            .periodics
+            .iter()
+            .map(|periodic| periodic.path.as_str()),
+    );
 
     let backup_dir = backup_files(&protected);
     log(&format!("Backups in {}", backup_dir.display()));
@@ -1265,7 +1053,7 @@ fn run_plan_loop(
     loop {
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return PlanLoopOutcome::Interrupt;
+            return Some(RunOutcome::Interrupt);
         }
         iteration += 1;
         let iter_started_at = metrics::unix_now();
@@ -1274,25 +1062,22 @@ fn run_plan_loop(
         eprintln!();
         render_iteration_banner("Plan Iteration", iteration, true);
 
-        if let Some((completed, total)) = stage_progress(PLAN_PATH) {
-            eprintln!("{}", format_progress_bar(completed, total));
-        }
+        render_stage_progress();
 
         let restore_start = std::time::Instant::now();
         restore_files(&runner.backup_dir, &protected);
         let restore_ms = restore_start.elapsed().as_millis() as u64;
 
         let step_stats = match run_iteration_step(
-            &mut runner,
+            &runner.backup_dir,
             supervisor,
             config,
             iteration,
             total_cost,
-            dry_run,
             &protected,
         ) {
-            IterationStepResult::Continue(s) => s,
-            IterationStepResult::Terminal(outcome) => return outcome,
+            Ok(stats) => stats,
+            Err(outcome) => return Some(outcome),
         };
         total_cost += step_stats.stream.cost_usd;
 
@@ -1304,10 +1089,9 @@ fn run_plan_loop(
         run_hooks(config, iteration);
         let hooks_secs = hooks_start.elapsed().as_secs_f64();
 
-        let mut judge_secs: Option<f64> = None;
-        let mut early_return: Option<PlanLoopOutcome> = None;
-        if let Some(judge_every) = config.judge_every {
-            match evaluate_judge_every(
+        let mut judge_secs = None;
+        let early_return = config.judge_every.and_then(|judge_every| {
+            evaluate_judge_every(
                 &mut runner,
                 config,
                 iteration,
@@ -1315,21 +1099,17 @@ fn run_plan_loop(
                 &mut consecutive_judge_failures,
                 judge_every,
                 &mut judge_secs,
-            ) {
-                JudgeEveryAction::Pass => early_return = Some(PlanLoopOutcome::JudgePass),
-                JudgeEveryAction::Bailout => early_return = Some(PlanLoopOutcome::JudgeBailout),
-                JudgeEveryAction::Continue => {}
-            }
-        }
+            )
+        });
 
         let status_done = step_stats.guards_passed && is_status_done(NOTES_PATH);
 
         // Build & flush iteration metrics row before any return path so
         // every completed iteration is recorded.
         let iter_metrics = metrics::IterationMetrics {
-            run_id: recorder.ctx.run_id.clone(),
-            project_slug: recorder.ctx.project_slug.clone(),
-            mode: recorder.ctx.mode,
+            run_id: recorder.row.run_id.clone(),
+            project_slug: recorder.row.project_slug.clone(),
+            mode: recorder.row.mode,
             iteration,
             started_at: iter_started_at,
             wall_secs: iter_wall_start.elapsed().as_secs_f64(),
@@ -1343,18 +1123,9 @@ fn run_plan_loop(
             cost_usd: step_stats.stream.cost_usd,
             num_turns: step_stats.stream.num_turns,
             thinking_secs: step_stats.stream.thinking_secs,
-            tool_counts: step_stats.stream.tool_counts.clone(),
-            tool_durations_secs: step_stats.stream.tool_durations_secs.clone(),
-            guards: step_stats
-                .guard_results
-                .iter()
-                .map(|g| metrics::GuardRow {
-                    name: g.name.clone(),
-                    passed: g.passed,
-                    skipped: g.skipped,
-                    elapsed_secs: g.elapsed_secs,
-                })
-                .collect(),
+            tool_counts: step_stats.stream.tool_counts,
+            tool_durations_secs: step_stats.stream.tool_durations_secs,
+            guards: step_stats.guard_results,
             guards_passed: step_stats.guards_passed,
             status_done,
         };
@@ -1362,7 +1133,7 @@ fn run_plan_loop(
         run_artifacts.record_iteration(&iter_metrics);
 
         if let Some(outcome) = early_return {
-            return outcome;
+            return Some(outcome);
         }
 
         if status_done {
@@ -1372,7 +1143,7 @@ fn run_plan_loop(
                 GREEN, BOLD, RESET
             );
             eprintln!();
-            return PlanLoopOutcome::Done;
+            return None;
         }
     }
 }
@@ -1410,22 +1181,10 @@ fn render_run_summary(r: &metrics::RunMetrics) {
     eprintln!();
 }
 
-/// Result of a brute loop run.
-enum BruteResult {
-    /// Judge said PASS — feature is complete.
-    Pass,
-    /// 3 consecutive judge FAILs — bailing out for re-scoping.
-    Bailout,
-    /// User interrupted (SIGINT).
-    Interrupt,
-    /// Hard error (spawn failure, missing files, etc.).
-    Error,
-}
-
 /// Protected files for the brute runner.
 const BRUTE_PROTECTED_FILES: &[&str] = &[PROTOCOL_PATH, PLAN_PATH, JUDGE_PATH, CONF_PATH];
 
-fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> BruteResult {
+fn run_brute(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> i32 {
     // Load config
     let config = match Config::load(Path::new(CONF_PATH)) {
         Ok(c) => c,
@@ -1450,7 +1209,7 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
     ));
 
     // Preflight: required files, notes/archive, and non-empty judge spec.
-    for path in &[PROTOCOL_PATH, PLAN_PATH, JUDGE_PATH, CONF_PATH] {
+    for path in BRUTE_PROTECTED_FILES {
         if !Path::new(path).exists() {
             log_error(&format!("required file not found: {}", path));
             process::exit(1);
@@ -1476,22 +1235,25 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
     log("Preflight OK");
     if !dry_run && let Err(e) = supervisor.ensure_control_started() {
         log_error(&e);
-        return BruteResult::Error;
+        return 1;
     }
 
-    let mctx =
-        metrics::MetricsContext::new(config.metrics_dir.clone(), "brute", config.metrics_enabled);
-    if mctx.enabled {
+    let mut recorder = metrics::RunRecorder::new(
+        config
+            .metrics_enabled
+            .then_some(config.metrics_dir.as_path()),
+        "brute",
+    );
+    if let Some(path) = recorder.iteration_path() {
         log(&format!(
             "Metrics: run_id={}, file={}",
-            mctx.run_id,
-            mctx.iteration_path().display()
+            recorder.row.run_id,
+            path.display()
         ));
     }
-    let mut recorder = metrics::RunRecorder::new(mctx);
     recorder.on_finalize = Some(render_run_summary);
 
-    let mut run_artifacts = artifacts::RunArtifacts::start(&recorder.ctx.run_id, "brute");
+    let mut run_artifacts = artifacts::RunArtifacts::start(&recorder.row.run_id, "brute");
     for path in [
         CONF_PATH,
         PROTOCOL_PATH,
@@ -1512,16 +1274,16 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
         &mut run_artifacts,
         supervisor,
     );
-    let outcome = match result {
-        BruteResult::Pass => "judge_pass",
-        BruteResult::Bailout => "bailout",
-        BruteResult::Interrupt => "interrupt",
-        BruteResult::Error => "error",
+    let (outcome, code) = match result {
+        RunOutcome::Pass => ("judge_pass", 0),
+        RunOutcome::Bailout => ("bailout", 1),
+        RunOutcome::Interrupt => ("interrupt", 130),
+        RunOutcome::Error => ("error", 1),
     };
-    recorder.outcome = outcome;
+    recorder.row.outcome = outcome;
     supervisor.finish_summary(outcome);
     run_artifacts.finish(outcome);
-    result
+    code
 }
 
 /// Core brute loop logic.
@@ -1536,7 +1298,7 @@ fn run_brute_core(
     recorder: &mut metrics::RunRecorder,
     run_artifacts: &mut artifacts::RunArtifacts,
     supervisor: &mut runtime::RunSupervisor,
-) -> BruteResult {
+) -> RunOutcome {
     // Backup protected files
     let backup_dir = backup_files(BRUTE_PROTECTED_FILES);
     log(&format!("Backups in {}", backup_dir.display()));
@@ -1548,7 +1310,7 @@ fn run_brute_core(
     loop {
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return BruteResult::Interrupt;
+            return RunOutcome::Interrupt;
         }
         iteration += 1;
         eprintln!();
@@ -1557,43 +1319,29 @@ fn run_brute_core(
         // Restore protected files
         restore_files(&runner.backup_dir, BRUTE_PROTECTED_FILES);
 
-        // NOTE: Do NOT clear verdict.md or guard-results.md here.
-        // On retry after judge FAIL, the worker needs to see the previous
-        // verdict and guard feedback. Both files are cleared once in
-        // run_brute_inner() (first attempt) and overwritten by the judge /
-        // guards each iteration.
+        // Preserve verdict.md and guard-results.md so the worker sees retry feedback.
 
         if dry_run {
             log("(dry-run) Skipping worker invocation");
         } else {
             log("Using plan runner as worker...");
-            match run_plan_loop(config, false, recorder, run_artifacts, supervisor) {
-                PlanLoopOutcome::JudgePass => {
-                    // Embedded judge already passed — skip standalone judge
-                    log("Plan runner completed with embedded judge PASS");
-                    return BruteResult::Pass;
+            match run_plan_loop(config, recorder, run_artifacts, supervisor) {
+                Some(outcome) => {
+                    match outcome {
+                        RunOutcome::Pass => log("Plan runner completed with embedded judge PASS"),
+                        RunOutcome::Interrupt => log("Interrupted — shutting down"),
+                        RunOutcome::Error => log_error("Plan runner failed — aborting brute loop"),
+                        RunOutcome::Bailout => {}
+                    }
+                    return outcome;
                 }
-                PlanLoopOutcome::Done => {
-                    // No embedded judge — fall through to standalone judge
-                    log("Plan runner completed successfully");
-                }
-                PlanLoopOutcome::JudgeBailout => {
-                    return BruteResult::Bailout;
-                }
-                PlanLoopOutcome::Interrupt => {
-                    log("Interrupted \u{2014} shutting down");
-                    return BruteResult::Interrupt;
-                }
-                PlanLoopOutcome::Error => {
-                    log_error("Plan runner failed — aborting brute loop");
-                    return BruteResult::Error;
-                }
+                None => log("Plan runner completed successfully"),
             }
         }
 
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return BruteResult::Interrupt;
+            return RunOutcome::Interrupt;
         }
 
         // Run guards (skip when not dry-run — the plan loop already ran them)
@@ -1602,11 +1350,11 @@ fn run_brute_core(
             if !outcome.passed {
                 log(&format!("{}Guards failed{}", ORANGE, RESET));
                 log("(dry-run) Exiting after one iteration");
-                return BruteResult::Error;
+                return RunOutcome::Error;
             }
             log(&format!("{}{}All guards passed{}", GREEN, BOLD, RESET));
             log("(dry-run) Guards passed \u{2014} exiting after one iteration");
-            return BruteResult::Pass;
+            return RunOutcome::Pass;
         }
 
         // Guards passed — invoke judge
@@ -1621,7 +1369,7 @@ fn run_brute_core(
 
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
-            return BruteResult::Interrupt;
+            return RunOutcome::Interrupt;
         }
 
         if pass {
@@ -1631,7 +1379,7 @@ fn run_brute_core(
                 GREEN, BOLD, RESET
             );
             eprintln!();
-            return BruteResult::Pass;
+            return RunOutcome::Pass;
         }
 
         consecutive_failures += 1;
@@ -1650,7 +1398,7 @@ fn run_brute_core(
         ));
 
         if is_judge_bailout(consecutive_failures, max_failures) {
-            return BruteResult::Bailout;
+            return RunOutcome::Bailout;
         }
 
         // Reset STATUS to IN_PROGRESS so the plan runner re-executes on the
@@ -1659,22 +1407,8 @@ fn run_brute_core(
     }
 }
 
-/// Top-level brute runner that maps BruteResult to an exit code.
-fn run_brute(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> i32 {
-    match run_brute_inner(dry_run, supervisor) {
-        BruteResult::Pass => 0,
-        BruteResult::Bailout => 1,
-        BruteResult::Interrupt => 130,
-        BruteResult::Error => 1,
-    }
-}
-
 /// Run a command that takes no arguments beyond `--help`.
 fn cmd_simple(args: &[String], topic: &str, run: fn() -> i32) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        show_help(topic);
-        process::exit(0);
-    }
     if let Some(arg) = args.get(2) {
         log_error(&format!("unexpected argument '{}'", arg));
         show_help(topic);
@@ -1684,103 +1418,69 @@ fn cmd_simple(args: &[String], topic: &str, run: fn() -> i32) -> ! {
 }
 
 fn cmd_stash(args: &[String]) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        stash::print_stash_help();
-        process::exit(0);
-    }
     let mode = "brute";
-    match args.get(2).map(|a| a.as_str()) {
-        None => {
-            process::exit(stash::stash_create(mode));
-        }
-        Some("log") => {
-            process::exit(stash::stash_log_cmd());
-        }
+    let code = match args.get(2).map(String::as_str) {
+        None => stash::stash_create(mode),
+        Some("log") => stash::stash_log_cmd(),
         Some("checkout") => match args.get(3) {
-            Some(hash) => process::exit(stash::stash_checkout(hash, mode)),
+            Some(hash) => stash::stash_checkout(hash, mode),
             None => {
                 log_error("missing hash — usage: yoke stash checkout <hash>");
-                process::exit(2);
+                2
             }
         },
-        Some("pop") => {
-            process::exit(stash::stash_pop(mode));
-        }
+        Some("pop") => stash::stash_pop(mode),
         Some(other) => {
             log_error(&format!("unknown subcommand '{}'", other));
             stash::print_stash_help();
-            process::exit(2);
+            2
         }
-    }
+    };
+    process::exit(code);
 }
 
 fn cmd_layer(args: &[String]) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        show_help("layer");
-        process::exit(0);
-    }
     if args.get(2).is_some_and(|a| a == "--list") {
         println!("  repl");
         process::exit(0);
     }
     let names_arg = match args.get(2) {
-        Some(a) => a.clone(),
+        Some(a) => a,
         None => {
             log_error("missing layer name");
             show_help("layer");
             process::exit(2);
         }
     };
-    process::exit(apply_layers(&names_arg));
+    process::exit(apply_layers(names_arg));
 }
 
-/// Resolve the metrics root directory, preferring an existing yoke.conf
-/// (so `metrics-dir` overrides apply) and falling back to the default
-/// `~/.yoke/metrics/` when no config is present.
-fn resolve_metrics_dir() -> PathBuf {
-    if Path::new(CONF_PATH).exists() {
-        if let Ok(c) = Config::load(Path::new(CONF_PATH)) {
-            return c.metrics_dir;
-        }
-    }
-    metrics::default_metrics_dir()
-}
-
-/// Read the value following `args[*i]` and advance past it.
-fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> &'a str {
-    match args.get(*i + 1) {
-        Some(value) => {
-            *i += 2;
-            value
-        }
-        None => {
-            log_error(&format!("{flag} requires a value"));
-            process::exit(2);
-        }
-    }
+fn usage_error(message: &str) -> ! {
+    log_error(message);
+    process::exit(2);
 }
 
 fn cmd_stats(args: &[String]) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        show_help("stats");
-        process::exit(0);
-    }
-
     let mut last: Option<usize> = None;
-    let mut project: Option<String> = None;
-    let mut run_id: Option<String> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--last" => {
-                let v = take_value(args, &mut i, "--last");
-                last = Some(v.parse().unwrap_or_else(|_| {
-                    log_error(&format!("--last expects an integer, got '{v}'"));
-                    process::exit(2)
-                }));
+    let mut project = None;
+    let mut run_id = None;
+    let mut args = args[2..].iter().map(String::as_str);
+    while let Some(flag) = args.next() {
+        match flag {
+            "--last" | "--project" | "--run" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| usage_error(&format!("{flag} requires a value")));
+                match flag {
+                    "--last" => {
+                        last = Some(value.parse().unwrap_or_else(|_| {
+                            usage_error(&format!("--last expects an integer, got '{value}'"))
+                        }))
+                    }
+                    "--project" => project = Some(value),
+                    _ => run_id = Some(value),
+                }
             }
-            "--project" => project = Some(take_value(args, &mut i, "--project").to_string()),
-            "--run" => run_id = Some(take_value(args, &mut i, "--run").to_string()),
             other => {
                 log_error(&format!("unknown flag '{}'", other));
                 show_help("stats");
@@ -1789,15 +1489,22 @@ fn cmd_stats(args: &[String]) -> ! {
         }
     }
 
-    let metrics_dir = resolve_metrics_dir();
-    let slug = project.unwrap_or_else(metrics::project_slug);
-    let slug_dir = metrics_dir.join(&slug);
+    let metrics_dir = Config::load(Path::new(CONF_PATH))
+        .map_or_else(|_| metrics::default_metrics_dir(), |c| c.metrics_dir);
+    let current_project;
+    let slug = match project {
+        Some(slug) => slug,
+        None => {
+            current_project = metrics::project_slug();
+            &current_project
+        }
+    };
+    let slug_dir = metrics_dir.join(slug);
 
-    if let Some(rid) = run_id {
-        process::exit(stats_show_run(&slug_dir, &rid, &slug));
-    } else {
-        process::exit(stats_list_runs(&slug_dir, &slug, last));
-    }
+    process::exit(match run_id {
+        Some(id) => stats_show_run(&slug_dir, id, slug),
+        None => stats_list_runs(&slug_dir, slug, last),
+    });
 }
 
 fn stats_list_runs(slug_dir: &Path, slug: &str, last: Option<usize>) -> i32 {
@@ -1882,13 +1589,8 @@ fn stats_show_run(slug_dir: &Path, run_id: &str, slug: &str) -> i32 {
 }
 
 fn cmd_inject(args: &[String]) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        show_help("inject");
-        process::exit(0);
-    }
-
     let mut shutdown = false;
-    let mut message: Option<String> = None;
+    let mut message = None;
     for arg in &args[2..] {
         match arg.as_str() {
             "--shutdown" => shutdown = true,
@@ -1903,7 +1605,7 @@ fn cmd_inject(args: &[String]) -> ! {
                     show_help("inject");
                     process::exit(2);
                 }
-                message = Some(other.to_string());
+                message = Some(other);
             }
         }
     }
@@ -1923,7 +1625,7 @@ fn cmd_inject(args: &[String]) -> ! {
     } else {
         runtime::InjectionKind::Normal
     };
-    control_result(runtime::send_inject_command(kind, &message), "injection");
+    control_result(runtime::send_inject_command(kind, message), "injection");
 }
 
 /// Log the outcome of a control request and exit with its status code.
@@ -1952,10 +1654,6 @@ fn control_result(response: Result<serde_json::Value, String>, label: &str) -> !
 }
 
 fn cmd_control(args: &[String], action: &str) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        eprintln!("{}USAGE:{} yoke {action}", BOLD, RESET);
-        process::exit(0);
-    }
     if let Some(arg) = args.get(2) {
         log_error(&format!("unexpected argument '{}'", arg));
         process::exit(2);
@@ -1964,43 +1662,28 @@ fn cmd_control(args: &[String], action: &str) -> ! {
 }
 
 fn cmd_run(args: &[String]) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        show_help("run");
-        process::exit(0);
-    }
     let mut dry_run = false;
-    let mut _no_sandbox = false;
     let mut summary_fd: Option<i32> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--dry-run" => {
-                dry_run = true;
-                i += 1;
-            }
-            "--no-sandbox" => {
-                _no_sandbox = true;
-                i += 1;
-            }
+    let mut flags = args[2..].iter().map(String::as_str);
+    while let Some(flag) = flags.next() {
+        match flag {
+            "--dry-run" => dry_run = true,
+            "--no-sandbox" => {}
             "--summary-fd" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value,
-                    None => {
-                        log_error("--summary-fd requires a file descriptor");
-                        process::exit(2);
-                    }
-                };
-                summary_fd = Some(match value.parse::<i32>() {
-                    Ok(fd) if fd >= 0 => fd,
-                    _ => {
-                        log_error(&format!(
-                            "--summary-fd expects a non-negative integer, got '{}'",
-                            value
-                        ));
-                        process::exit(2);
-                    }
-                });
-                i += 2;
+                let value = flags
+                    .next()
+                    .unwrap_or_else(|| usage_error("--summary-fd requires a file descriptor"));
+                summary_fd = Some(
+                    value
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|&fd| fd >= 0)
+                        .unwrap_or_else(|| {
+                            usage_error(&format!(
+                                "--summary-fd expects a non-negative integer, got '{value}'"
+                            ))
+                        }),
+                );
             }
             other => {
                 log_error(&format!("unknown flag '{}'", other));
@@ -2009,16 +1692,7 @@ fn cmd_run(args: &[String]) -> ! {
             }
         }
     }
-    if summary_fd.is_none()
-        && let Ok(raw) = std::env::var("YOKE_SUMMARY_FD")
-        && let Ok(fd) = raw.parse::<i32>()
-    {
-        summary_fd = Some(fd);
-    }
-    if let Err(e) = Config::load(Path::new(CONF_PATH)) {
-        log_error(&e);
-        process::exit(1);
-    }
+    let summary_fd = summary_fd.or_else(|| std::env::var("YOKE_SUMMARY_FD").ok()?.parse().ok());
     let mut supervisor = runtime::RunSupervisor::new(summary_fd);
     let code = run_brute(dry_run, &mut supervisor);
     drop(supervisor);
@@ -2034,16 +1708,33 @@ fn main() {
         process::exit(2);
     }
 
-    match args[1].as_str() {
+    let command = args[1].as_str();
+    if matches!(args.get(2).map(String::as_str), Some("--help" | "-h"))
+        && matches!(
+            command,
+            "init"
+                | "clean"
+                | "stash"
+                | "layer"
+                | "run"
+                | "inject"
+                | "pause"
+                | "resume"
+                | "stop"
+                | "stats"
+        )
+    {
+        show_help(command);
+        return;
+    }
+    match command {
         "init" => cmd_simple(&args, "init", init),
         "clean" => cmd_simple(&args, "clean", clean),
         "stash" => cmd_stash(&args),
         "layer" => cmd_layer(&args),
         "run" => cmd_run(&args),
         "inject" => cmd_inject(&args),
-        "pause" => cmd_control(&args, "pause"),
-        "resume" => cmd_control(&args, "resume"),
-        "stop" => cmd_control(&args, "stop"),
+        action @ ("pause" | "resume" | "stop") => cmd_control(&args, action),
         "stats" => cmd_stats(&args),
         "--help" | "-h" | "help" => {
             show_help("");
