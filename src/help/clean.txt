@@ -1,0 +1,14 @@
+[yoke clean] reset .loop/ working files
+
+USAGE: yoke clean
+
+Clears working files back to a blank slate:
+  plan.md, notes.md, verdict.md, guard-results.md  ->  emptied
+  archive/*.md                                    ->  removed
+  judge.md                                        ->  reset to default template
+
+Structural files are left untouched:
+  protocol.md, yoke.conf, briefing.md, .loop/runs/ (run artifacts)
+
+Non-empty working files are auto-stashed to ~/.yoke/stash/<project-slug>/ before wiping.
+Browse with: yoke stash log   Recover with: yoke stash pop

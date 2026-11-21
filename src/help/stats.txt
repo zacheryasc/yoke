@@ -1,0 +1,9 @@
+[yoke stats] inspect persisted run metrics
+
+USAGE:
+  yoke stats                       List recent runs for the current project
+  yoke stats --last N              Limit to last N runs
+  yoke stats --project <slug>      Target a different project
+  yoke stats --run <run-id>        Show per-iteration rows for one run
+
+Reads NDJSON from ~/.yoke/metrics/<project-slug>/ (or `metrics-dir` from yoke.conf).

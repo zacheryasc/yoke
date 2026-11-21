@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -193,33 +193,24 @@ fn handle_control_client(
             injection.reply = Some(reply_tx);
             log(&format!("accepted {} steering {}", kind.as_str(), id));
             match tx.send(ControlCommand::Inject(injection)) {
-                Ok(()) => match reply_rx.recv_timeout(INJECT_RESPONSE_TIMEOUT) {
-                    Ok(DeliveryStatus::Delivered) => json!({
-                        "ok": true,
-                        "status": "delivered",
+                Ok(()) => {
+                    let (ok, status, error) = match reply_rx.recv_timeout(INJECT_RESPONSE_TIMEOUT) {
+                        Ok(DeliveryStatus::Delivered) => (true, "delivered", None),
+                        Ok(DeliveryStatus::Failed(error)) => (false, "failed", Some(error)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                        | Err(mpsc::RecvTimeoutError::Disconnected) => (true, "accepted", None),
+                    };
+                    let mut response = json!({
+                        "ok": ok,
+                        "status": status,
                         "id": id,
                         "kind": kind.as_str(),
-                    }),
-                    Ok(DeliveryStatus::Failed(error)) => json!({
-                        "ok": false,
-                        "status": "failed",
-                        "id": id,
-                        "kind": kind.as_str(),
-                        "error": error,
-                    }),
-                    Err(mpsc::RecvTimeoutError::Timeout) => json!({
-                        "ok": true,
-                        "status": "accepted",
-                        "id": id,
-                        "kind": kind.as_str(),
-                    }),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => json!({
-                        "ok": true,
-                        "status": "accepted",
-                        "id": id,
-                        "kind": kind.as_str(),
-                    }),
-                },
+                    });
+                    if let Some(error) = error {
+                        response["error"] = json!(error);
+                    }
+                    response
+                }
                 Err(_) => json!({
                     "ok": false,
                     "status": "failed",
@@ -329,11 +320,19 @@ fn append_injection_audit(injection: &Injection) {
     }
 }
 
+fn failed_run(start: std::time::Instant) -> AgentRunStats {
+    AgentRunStats {
+        success: false,
+        wall_secs: start.elapsed().as_secs_f64(),
+        stream: stream::StreamSummary::default(),
+    }
+}
+
 pub(crate) struct RunSupervisor {
     control: Option<ControlServer>,
     worker: Option<OmpRpcWorker>,
     queued: VecDeque<Injection>,
-    shutdown_requested: bool,
+    pub(crate) shutdown_requested: bool,
     paused: bool,
     pause_explicit: bool,
     pause_backpressure: bool,
@@ -344,7 +343,7 @@ pub(crate) struct RunSupervisor {
 }
 
 impl RunSupervisor {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(summary_fd: Option<i32>) -> Self {
         Self {
             control: None,
             worker: None,
@@ -354,7 +353,7 @@ impl RunSupervisor {
             pause_explicit: false,
             pause_backpressure: false,
             summary: None,
-            summary_fd: None,
+            summary_fd,
             backup_dir: None,
             protected: Vec::new(),
         }
@@ -365,10 +364,6 @@ impl RunSupervisor {
             self.control = Some(ControlServer::start(YOKE_SOCKET_PATH)?);
         }
         Ok(())
-    }
-
-    pub(crate) fn set_summary_fd(&mut self, fd: Option<i32>) {
-        self.summary_fd = fd;
     }
 
     /// Start the summary side stream for one run. No-op when summaries are
@@ -400,15 +395,13 @@ impl RunSupervisor {
     }
 
     pub(crate) fn reset_worker_session(&mut self) {
-        self.stop_worker();
+        if let Some(mut worker) = self.worker.take() {
+            worker.stop();
+        };
         self.shutdown_requested = false;
         self.paused = false;
         self.pause_explicit = false;
         self.pause_backpressure = false;
-    }
-
-    pub(crate) fn shutdown_requested(&self) -> bool {
-        self.shutdown_requested
     }
 
     pub(crate) fn invoke_worker(
@@ -431,11 +424,7 @@ impl RunSupervisor {
 
         if let Err(e) = self.ensure_worker(config) {
             log_error(&e);
-            return AgentRunStats {
-                success: false,
-                wall_secs: wall_start.elapsed().as_secs_f64(),
-                stream: stream::StreamSummary::default(),
-            };
+            return failed_run(wall_start);
         }
 
         let log_path = config
@@ -444,17 +433,13 @@ impl RunSupervisor {
             .map(|dir| PathBuf::from(dir).join(format!("{}-{}.jsonl", log_prefix, iteration)));
 
         let worker = self.worker.as_mut().expect("worker just ensured");
-        signal::set_child_pid(-(worker.child_id() as i32));
+        signal::set_child_pid(-(worker.child.id() as i32));
 
         let prompt_id = worker.next_id("prompt");
-        if let Err(e) = worker.send_prompt(&prompt_id, prompt) {
+        if let Err(e) = worker.send_message_command("prompt", &prompt_id, prompt) {
             log_error(&format!("failed to send OMP RPC prompt: {}", e));
             signal::set_child_pid(0);
-            return AgentRunStats {
-                success: false,
-                wall_secs: wall_start.elapsed().as_secs_f64(),
-                stream: stream::StreamSummary::default(),
-            };
+            return failed_run(wall_start);
         }
 
         let mut formatter = stream_omp::OmpStreamProcessor::new(log_path.as_deref(), prior_total);
@@ -471,48 +456,16 @@ impl RunSupervisor {
                 &mut self.shutdown_requested,
             );
 
-            if self.paused {
-                if self.shutdown_requested {
-                    // Stop wins over pause: thaw the worker so it can accept
-                    // the graceful shutdown steering.
-                    self.resume_worker();
-                } else {
-                    let backpressure_drained = !self.pause_backpressure
-                        || self
-                            .summary
-                            .as_ref()
-                            .is_none_or(|summary| summary.pending() == 0);
-                    if backpressure_drained && !self.pause_explicit {
-                        self.pause_backpressure = false;
-                        self.resume_worker();
-                    } else if let Ok(Some(status)) =
-                        self.worker.as_mut().expect("worker").try_wait()
-                    {
-                        log_error(&format!("OMP RPC process exited while paused: {}", status));
-                        success = false;
-                        break;
-                    } else {
-                        thread::sleep(RPC_EVENT_POLL);
-                        continue;
-                    }
+            match self.maintain_pause() {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    log_error(&e);
+                    success = false;
+                    break;
                 }
             }
-
-            if let Some(summary) = self.summary.as_ref()
-                && summary.enabled()
-            {
-                if summary.pending() == 0 {
-                    self.pause_backpressure = false;
-                } else if summary.pending() >= config.summary_queue_limit as usize {
-                    if !self.pause_backpressure {
-                        log(&format!(
-                            "summary backlog reached {}; pausing at the next block boundary",
-                            summary.pending()
-                        ));
-                    }
-                    self.pause_backpressure = true;
-                }
-            }
+            self.update_backpressure(config.summary_queue_limit as usize);
 
             deliver_queued(
                 self.worker.as_mut().expect("worker"),
@@ -549,15 +502,9 @@ impl RunSupervisor {
                     }
                 }
                 Ok(None) => {
-                    if let Ok(Some(status)) = self.worker.as_mut().expect("worker").try_wait() {
-                        log_error(&format!("OMP RPC process exited early: {}", status));
+                    if self.idle_poll() {
                         success = false;
                         break;
-                    }
-                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
-                    if at_boundary && (self.pause_explicit || self.pause_backpressure) {
-                        self.pause_worker();
-                        continue;
                     }
                 }
                 Err(e) => {
@@ -587,6 +534,73 @@ impl RunSupervisor {
         }
     }
 
+    /// Handle a poll that produced no stream line. Returns true when the
+    /// worker has exited and the turn should be treated as failed.
+    fn idle_poll(&mut self) -> bool {
+        if let Ok(Some(status)) = self.worker.as_mut().expect("worker").child.try_wait() {
+            log_error(&format!("OMP RPC process exited early: {}", status));
+            return true;
+        }
+        false
+    }
+
+    /// Hold the worker while paused. Returns Ok(true) when the caller should
+    /// skip to the next poll iteration, Ok(false) when the loop should
+    /// proceed, and Err when the paused worker died.
+    fn maintain_pause(&mut self) -> Result<bool, String> {
+        if !self.paused {
+            return Ok(false);
+        }
+        if self.shutdown_requested {
+            // Stop wins over pause: thaw the worker so it can accept the
+            // graceful shutdown steering.
+            self.resume_worker();
+            return Ok(false);
+        }
+        let drained = !self.pause_backpressure
+            || self
+                .summary
+                .as_ref()
+                .is_none_or(|summary| summary.pending() == 0);
+        if drained && !self.pause_explicit {
+            self.pause_backpressure = false;
+            self.resume_worker();
+            return Ok(false);
+        }
+        match self.worker.as_mut().expect("worker").child.try_wait() {
+            Ok(Some(status)) => Err(format!("OMP RPC process exited while paused: {}", status)),
+            _ => {
+                thread::sleep(RPC_EVENT_POLL);
+                Ok(true)
+            }
+        }
+    }
+
+    fn update_backpressure(&mut self, limit: usize) {
+        let Some(summary) = self.summary.as_ref().filter(|s| s.enabled()) else {
+            return;
+        };
+        let pending = summary.pending();
+        if pending == 0 {
+            self.pause_backpressure = false;
+        } else if pending >= limit {
+            if !self.pause_backpressure {
+                log(&format!(
+                    "summary backlog reached {}; pausing at the next block boundary",
+                    pending
+                ));
+            }
+            self.pause_backpressure = true;
+        }
+    }
+
+    fn ensure_worker(&mut self, config: &Config) -> Result<(), String> {
+        if self.worker.is_none() {
+            self.worker = Some(OmpRpcWorker::start(config)?);
+        }
+        Ok(())
+    }
+
     fn pause_worker(&mut self) {
         if self.paused {
             return;
@@ -594,14 +608,14 @@ impl RunSupervisor {
         let Some(worker) = self.worker.as_ref() else {
             return;
         };
-        let pgid = -(worker.child_id() as i32);
+        let pgid = -(worker.child.id() as i32);
         if signal::stop_child(pgid) {
             self.paused = true;
             log("worker paused at block boundary");
         } else {
             log_error(&format!(
                 "failed to pause worker process {}",
-                worker.child_id()
+                worker.child.id()
             ));
         }
     }
@@ -617,35 +631,16 @@ impl RunSupervisor {
             self.paused = false;
             return;
         };
-        let pgid = -(worker.child_id() as i32);
+        let pgid = -(worker.child.id() as i32);
         if signal::continue_child(pgid) {
             self.paused = false;
             log("worker resumed; protected files re-snapshotted");
         } else {
             log_error(&format!(
                 "failed to resume worker process {}",
-                worker.child_id()
+                worker.child.id()
             ));
         }
-    }
-
-    fn ensure_worker(&mut self, config: &Config) -> Result<(), String> {
-        if self.worker.is_none() {
-            self.worker = Some(OmpRpcWorker::start(config)?);
-        }
-        Ok(())
-    }
-
-    fn stop_worker(&mut self) {
-        if let Some(mut worker) = self.worker.take() {
-            worker.stop();
-        }
-    }
-}
-
-impl Drop for RunSupervisor {
-    fn drop(&mut self) {
-        self.stop_worker();
     }
 }
 
@@ -703,13 +698,10 @@ fn deliver_queued(
 ) {
     while let Some(injection) = queued.pop_front() {
         let rpc_id = worker.next_id("steer");
-        let command = if injection.kind == InjectionKind::Shutdown {
+        if injection.kind == InjectionKind::Shutdown {
             *shutdown_requested = true;
-            "steer"
-        } else {
-            "steer"
-        };
-        match worker.send_message_command(command, &rpc_id, &injection.worker_message()) {
+        }
+        match worker.send_message_command("steer", &rpc_id, &injection.worker_message()) {
             Ok(()) => {
                 log(&format!(
                     "delivering {} steering {} to OMP RPC",
@@ -825,7 +817,7 @@ struct OmpRpcWorker {
 
 impl OmpRpcWorker {
     fn start(config: &Config) -> Result<Self, String> {
-        let mut cmd = build_rpc_command(config);
+        let mut cmd = crate::omp_command(config, &crate::omp_args(config, "rpc"));
         // Own process group: pause can freeze tool children along with the
         // RPC process, and Ctrl+C can terminate the whole tree.
         cmd.process_group(0);
@@ -878,10 +870,6 @@ impl OmpRpcWorker {
         Ok(worker)
     }
 
-    fn child_id(&self) -> u32 {
-        self.child.id()
-    }
-
     fn wait_ready(&mut self) -> Result<(), String> {
         let deadline = std::time::Instant::now() + RPC_READY_TIMEOUT;
         loop {
@@ -917,10 +905,6 @@ impl OmpRpcWorker {
         format!("yoke-{}-{}", prefix, self.next_id)
     }
 
-    fn send_prompt(&mut self, id: &str, message: &str) -> io::Result<()> {
-        self.send_message_command("prompt", id, message)
-    }
-
     fn send_message_command(&mut self, command: &str, id: &str, message: &str) -> io::Result<()> {
         let request = json!({
             "type": command,
@@ -942,10 +926,6 @@ impl OmpRpcWorker {
         }
     }
 
-    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
-    }
-
     fn stop(&mut self) {
         signal::terminate_group(-(self.child.id() as i32));
         let _ = self.child.kill();
@@ -962,42 +942,9 @@ impl Drop for OmpRpcWorker {
     }
 }
 
-fn build_rpc_args(config: &Config) -> Vec<String> {
-    let mut args = vec![
-        "--mode".to_string(),
-        "rpc".to_string(),
-        "--auto-approve".to_string(),
-    ];
-    if let Some(model) = config.model.as_deref() {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
-    if let Some(thinking) = config.thinking {
-        args.push("--thinking".to_string());
-        args.push(thinking.as_omp_arg().to_string());
-    }
-    args
-}
-
-fn build_rpc_command(config: &Config) -> Command {
-    let args = build_rpc_args(config);
-    match &config.image {
-        Some(image) => crate::build_docker_omp_command(image, &args),
-        None => {
-            let mut c = Command::new("omp");
-            c.args(&args);
-            c
-        }
-    }
-}
-
-pub(crate) fn send_inject_command(
-    path: impl AsRef<Path>,
-    kind: InjectionKind,
-    message: &str,
-) -> Result<Value, String> {
+pub(crate) fn send_inject_command(kind: InjectionKind, message: &str) -> Result<Value, String> {
     send_control_command(
-        path,
+        YOKE_SOCKET_PATH,
         json!({
             "type": "inject",
             "kind": kind.as_str(),
@@ -1006,16 +953,9 @@ pub(crate) fn send_inject_command(
     )
 }
 
-pub(crate) fn send_pause_command(path: impl AsRef<Path>) -> Result<Value, String> {
-    send_control_command(path, json!({"type": "pause"}))
-}
-
-pub(crate) fn send_resume_command(path: impl AsRef<Path>) -> Result<Value, String> {
-    send_control_command(path, json!({"type": "resume"}))
-}
-
-pub(crate) fn send_stop_command(path: impl AsRef<Path>) -> Result<Value, String> {
-    send_control_command(path, json!({"type": "stop"}))
+/// Send a pause/resume/stop control request to the active run.
+pub(crate) fn send_command(action: &str) -> Result<Value, String> {
+    send_control_command(YOKE_SOCKET_PATH, json!({ "type": action }))
 }
 
 fn send_control_command(path: impl AsRef<Path>, request: Value) -> Result<Value, String> {

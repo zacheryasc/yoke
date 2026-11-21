@@ -72,27 +72,6 @@ pub struct Config {
     pub metrics_enabled: bool,
 }
 
-struct ConfigBuilder {
-    max_tail: usize,
-    log_dir: Option<String>,
-    image: Option<String>,
-    model: Option<String>,
-    thinking: Option<Thinking>,
-    scope_rules: Vec<ScopeRule>,
-    guards: Vec<String>,
-    judge_every: Option<u32>,
-    max_judge_failures: u32,
-    periodics: Vec<Periodic>,
-    pending_guard_afters: Vec<(String, String, usize)>,
-    hooks: Vec<String>,
-    summary_every: u32,
-    summary_model: Option<String>,
-    summary_thinking: Thinking,
-    summary_queue_limit: u32,
-    metrics_dir: Option<String>,
-    metrics_enabled: bool,
-}
-
 fn cfg_err(path: &Path, line_num: usize, msg: &str) -> String {
     format!("{}:{}: {}", path.display(), line_num, msg)
 }
@@ -186,30 +165,7 @@ fn parse_guard_after(
     Ok((pname, cmd, line_num))
 }
 
-impl ConfigBuilder {
-    fn new() -> Self {
-        Self {
-            max_tail: 200,
-            log_dir: None,
-            image: None,
-            model: None,
-            thinking: None,
-            scope_rules: Vec::new(),
-            guards: Vec::new(),
-            judge_every: None,
-            max_judge_failures: 3,
-            periodics: Vec::new(),
-            pending_guard_afters: Vec::new(),
-            hooks: Vec::new(),
-            summary_every: 12,
-            summary_model: None,
-            summary_thinking: Thinking::Off,
-            summary_queue_limit: 4,
-            metrics_dir: None,
-            metrics_enabled: true,
-        }
-    }
-
+impl Config {
     #[allow(clippy::string_slice)]
     fn parse_line(
         &mut self,
@@ -218,6 +174,9 @@ impl ConfigBuilder {
         path: &Path,
         line_num: usize,
     ) -> Result<(), String> {
+        if self.set_plain_field(directive, value) {
+            return Ok(());
+        }
         match directive {
             "max-tail" => {
                 self.max_tail = value.parse::<usize>().map_err(|_| {
@@ -226,25 +185,9 @@ impl ConfigBuilder {
                         line_num,
                         &format!("invalid max-tail value '{}'", value),
                     )
-                })?;
+                })?
             }
-            "log-dir" => self.log_dir = Some(value.to_string()),
-            "image" => self.image = Some(value.to_string()),
-            "model" => self.model = Some(value.to_string()),
             "thinking" => self.thinking = Some(parse_thinking(value, path, line_num)?),
-            "allow" => self.scope_rules.push(ScopeRule {
-                tag: ScopeTag::Allow,
-                prefix: value.to_string(),
-            }),
-            "add-only" => self.scope_rules.push(ScopeRule {
-                tag: ScopeTag::AddOnly,
-                prefix: value.to_string(),
-            }),
-            "no-modify" => self.scope_rules.push(ScopeRule {
-                tag: ScopeTag::NoModify,
-                prefix: value.to_string(),
-            }),
-            "guard" => self.guards.push(value.to_string()),
             "judge-every" => {
                 self.judge_every = Some(parse_positive_u32(value, path, line_num, "judge-every")?)
             }
@@ -253,10 +196,6 @@ impl ConfigBuilder {
                     parse_positive_u32(value, path, line_num, "max-judge-failures")?
             }
             "periodic" => self.periodics.push(parse_periodic(value, path, line_num)?),
-            "guard-after" => self
-                .pending_guard_afters
-                .push(parse_guard_after(value, path, line_num)?),
-            "hook" => self.hooks.push(value.to_string()),
             "summary-every" => {
                 self.summary_every = value.trim().parse::<u32>().map_err(|_| {
                     cfg_err(
@@ -264,28 +203,26 @@ impl ConfigBuilder {
                         line_num,
                         &format!("invalid summary-every value '{}'", value),
                     )
-                })?;
+                })?
             }
-            "summary-model" => self.summary_model = Some(value.to_string()),
-            "summary-thinking" => {
-                self.summary_thinking = parse_thinking(value, path, line_num)?;
-            }
+            "summary-thinking" => self.summary_thinking = parse_thinking(value, path, line_num)?,
             "summary-queue-limit" => {
                 self.summary_queue_limit =
                     parse_positive_u32(value, path, line_num, "summary-queue-limit")?
             }
-            "metrics-dir" => self.metrics_dir = Some(value.to_string()),
-            "metrics" => match value.trim() {
-                "on" => self.metrics_enabled = true,
-                "off" => self.metrics_enabled = false,
-                other => {
-                    return Err(cfg_err(
-                        path,
-                        line_num,
-                        &format!("metrics must be 'on' or 'off', got '{}'", other),
-                    ));
+            "metrics" => {
+                self.metrics_enabled = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        return Err(cfg_err(
+                            path,
+                            line_num,
+                            &format!("metrics must be 'on' or 'off', got '{}'", other),
+                        ));
+                    }
                 }
-            },
+            }
             other => {
                 return Err(cfg_err(
                     path,
@@ -297,43 +234,55 @@ impl ConfigBuilder {
         Ok(())
     }
 
-    fn build(self, path: &Path) -> Result<Config, String> {
-        let mut periodics = self.periodics;
-        for (pname, cmd, ln) in self.pending_guard_afters {
-            match periodics.iter_mut().find(|p| p.name == pname) {
-                Some(p) => p.guards.push(cmd),
-                None => {
-                    return Err(cfg_err(
-                        path,
-                        ln,
-                        &format!("guard-after references unknown periodic '{}'", pname),
-                    ));
-                }
+    /// Directives whose value is stored verbatim. Returns false when the
+    /// directive isn't one of them.
+    fn set_plain_field(&mut self, directive: &str, value: &str) -> bool {
+        match directive {
+            "log-dir" => self.log_dir = Some(value.to_string()),
+            "image" => self.image = Some(value.to_string()),
+            "model" => self.model = Some(value.to_string()),
+            "allow" | "add-only" | "no-modify" => {
+                let tag = match directive {
+                    "allow" => ScopeTag::Allow,
+                    "add-only" => ScopeTag::AddOnly,
+                    _ => ScopeTag::NoModify,
+                };
+                self.scope_rules.push(ScopeRule {
+                    tag,
+                    prefix: value.to_string(),
+                });
             }
+            "guard" => self.guards.push(value.to_string()),
+            "hook" => self.hooks.push(value.to_string()),
+            "summary-model" => self.summary_model = Some(value.to_string()),
+            "metrics-dir" => self.metrics_dir = crate::metrics::expand_tilde(value),
+            _ => return false,
         }
-        let metrics_dir = match self.metrics_dir {
-            Some(raw) => crate::metrics::expand_tilde(&raw),
-            None => crate::metrics::default_metrics_dir(),
-        };
-        Ok(Config {
-            max_tail: self.max_tail,
-            log_dir: self.log_dir,
-            image: self.image,
-            model: self.model,
-            thinking: self.thinking,
-            scope_rules: self.scope_rules,
-            guards: self.guards,
-            judge_every: self.judge_every,
-            max_judge_failures: self.max_judge_failures,
-            periodics,
-            hooks: self.hooks,
-            summary_every: self.summary_every,
-            summary_model: self.summary_model,
-            summary_thinking: self.summary_thinking,
-            summary_queue_limit: self.summary_queue_limit,
-            metrics_dir,
-            metrics_enabled: self.metrics_enabled,
-        })
+        true
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_tail: 200,
+            log_dir: None,
+            image: None,
+            model: None,
+            thinking: None,
+            scope_rules: Vec::new(),
+            guards: Vec::new(),
+            judge_every: None,
+            max_judge_failures: 3,
+            periodics: Vec::new(),
+            hooks: Vec::new(),
+            summary_every: 12,
+            summary_model: None,
+            summary_thinking: Thinking::Off,
+            summary_queue_limit: 4,
+            metrics_dir: crate::metrics::default_metrics_dir(),
+            metrics_enabled: true,
+        }
     }
 }
 
@@ -343,7 +292,8 @@ impl Config {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {}", path.display(), e))?;
 
-        let mut builder = ConfigBuilder::new();
+        let mut config = Config::default();
+        let mut pending_guard_afters: Vec<(String, String, usize)> = Vec::new();
         for (line_num, raw_line) in content.lines().enumerate() {
             let line = match raw_line.find('#') {
                 Some(pos) => &raw_line[..pos],
@@ -365,10 +315,26 @@ impl Config {
                 }
             };
 
-            builder.parse_line(directive, value, path, line_num + 1)?;
+            if directive == "guard-after" {
+                pending_guard_afters.push(parse_guard_after(value, path, line_num + 1)?);
+            } else {
+                config.parse_line(directive, value, path, line_num + 1)?;
+            }
         }
 
-        builder.build(path)
+        for (name, cmd, line) in pending_guard_afters {
+            match config.periodics.iter_mut().find(|p| p.name == name) {
+                Some(periodic) => periodic.guards.push(cmd),
+                None => {
+                    return Err(cfg_err(
+                        path,
+                        line,
+                        &format!("guard-after references unknown periodic '{}'", name),
+                    ));
+                }
+            }
+        }
+        Ok(config)
     }
 
     /// Resolve the most-specific scope tag for a file path.

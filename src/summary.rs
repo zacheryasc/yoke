@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -390,7 +390,16 @@ fn summary_worker(settings: SummarySettings, queue: Arc<Queue>, writer: Arc<Mute
 }
 
 fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
-    let raw = batch.join("\n\n");
+    let mut raw = batch.join("\n\n");
+    const MAX_RAW_BYTES: usize = 100_000;
+    if raw.len() > MAX_RAW_BYTES {
+        let mut cut = MAX_RAW_BYTES;
+        while !raw.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        raw.truncate(cut);
+        raw.push_str("\n...[truncated]");
+    }
     let prompt = format!(
         "You are a terse observer of a coding agent. Summarize the raw OMP worker blocks below \
          for the outer agent that is supervising this run. Report only what happened: work \
@@ -398,6 +407,18 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
          use tools or ask questions. Keep it under 12 lines.\n\n{}",
         raw
     );
+    // Raw block batches can exceed ARG_MAX. Pass the prompt as an @file
+    // attachment instead of one enormous argv entry.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let prompt_path =
+        std::env::temp_dir().join(format!("yoke-summary-{}-{}.md", std::process::id(), stamp));
+    if let Err(e) = std::fs::write(&prompt_path, prompt) {
+        return format!("(summary unavailable: failed to write prompt: {})", e);
+    }
+    let prompt_arg = format!("@{}", prompt_path.display());
     let output = Command::new("omp")
         .args([
             "--mode",
@@ -414,12 +435,13 @@ fn summarize(settings: &SummarySettings, batch: &[String]) -> String {
             "--thinking",
             settings.thinking.as_omp_arg(),
             "-p",
-            &prompt,
+            &prompt_arg,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output();
+    let _ = std::fs::remove_file(&prompt_path);
 
     match output {
         Ok(output) => {

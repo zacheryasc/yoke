@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::ChildStdout;
 use std::time::Instant;
@@ -298,19 +298,32 @@ pub fn filter_stream(
     log_path: Option<&Path>,
     prior_total: f64,
 ) -> StreamSummary {
-    let state = StreamState::new();
-    crate::stream::run_stream_loop(
-        stdout,
-        log_path,
-        state,
-        |out, line, st| process_line(out, line, st, prior_total),
-        |st| {
-            if st.turn_num > 0 {
-                Some(format_summary_strip(st))
-            } else {
-                None
-            }
-        },
-        |st| st.into_summary(),
-    )
+    let mut state = StreamState::new();
+    let mut log_file = log_path.and_then(|p| {
+        std::fs::create_dir_all(p.parent().unwrap_or(Path::new("."))).ok();
+        std::fs::File::create(p).ok()
+    });
+    let mut out = io::stdout().lock();
+    for line_result in BufReader::new(stdout).lines() {
+        if crate::signal::interrupted() {
+            break;
+        }
+        let Ok(line) = line_result else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(file) = &mut log_file {
+            let _ = writeln!(file, "{}", line);
+        }
+        if process_line(&mut out, &line, &mut state, prior_total).is_err() {
+            break;
+        }
+    }
+    if state.turn_num > 0 {
+        let _ = writeln!(out, "{}", format_summary_strip(&state));
+    }
+    let _ = out.flush();
+    state.into_summary()
 }

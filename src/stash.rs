@@ -6,27 +6,6 @@ use crate::{log, log_error, metrics};
 
 // ── Stash helpers ──────────────────────────────────────────────────────
 
-/// Format Unix epoch seconds as `YYYY-MM-DDThh:mm:ss` using Hinnant's algorithm.
-fn format_unix_timestamp(secs: u64) -> String {
-    let z = (secs / 86400) as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    let time_of_day = secs % 86400;
-    let h = time_of_day / 3600;
-    let min = (time_of_day % 3600) / 60;
-    let s = time_of_day % 60;
-
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, h, min, s)
-}
-
 /// SipHash timestamp + file names/contents → lower 28 bits → 7-char hex.
 fn generate_stash_hash(timestamp: &str, files: &[(String, Vec<u8>)]) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -145,7 +124,10 @@ pub(crate) fn stash_snapshot(mode: &str) -> Result<String, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let timestamp = format_unix_timestamp(now);
+    let timestamp = {
+        let (y, m, d, h, min, s) = metrics::unix_to_utc(now);
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, h, min, s)
+    };
 
     let mut hash = generate_stash_hash(&timestamp, &files);
 

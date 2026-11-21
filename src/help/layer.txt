@@ -1,0 +1,8 @@
+Usage: yoke layer <name>[,<name>,...]
+
+  Append judge layers to .loop/judge.md
+
+  --list   Show available layers
+
+Available layers:
+  repl

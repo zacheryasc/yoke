@@ -1,0 +1,22 @@
+[yoke] LLM loop harness
+
+USAGE: yoke <command> [options]
+
+COMMANDS:
+  init             Initialize .loop/ for the brute loop (plan stages + judge)
+  clean            Reset .loop/ working files to blank slate
+  stash            Snapshot .loop/ state (stash log, stash checkout <hash>)
+  layer            Append judge layers to .loop/judge.md
+  run              Launch the loop (invoke OMP, run guards, iterate)
+  run --dry-run    Single iteration: boundary check + guards only, no OMP
+  inject           Send human steering to an active yoke run
+  pause            Freeze an active run at the next block boundary
+  resume           Continue a paused run in place
+  stop             End an active run gracefully
+  stats            Inspect persisted run metrics (~/.yoke/metrics/)
+
+OPTIONS:
+  --help, -h       Show this help message
+
+CONFIG:  .loop/yoke.conf
+EXIT:   0=success  1=guard failure  2=usage error

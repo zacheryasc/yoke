@@ -1,0 +1,9 @@
+[yoke init] initialize .loop/ for the brute loop
+
+USAGE: yoke init
+
+Creates:
+  yoke.conf, protocol.md, briefing.md, plan.md, judge.md,
+  notes.md, archive/, verdict.md, guard-results.md
+
+Existing files are never overwritten.

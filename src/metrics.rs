@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::json;
+
 #[derive(Debug, Clone)]
 pub struct GuardRow {
     pub name: String,
@@ -92,10 +94,6 @@ impl MetricsContext {
             .join(&self.project_slug)
             .join(format!("{}.ndjson", self.run_id))
     }
-
-    pub fn runs_path(&self) -> PathBuf {
-        self.root_dir.join(&self.project_slug).join("runs.ndjson")
-    }
 }
 
 /// Accumulates per-iteration totals and writes a final `RunMetrics` row
@@ -112,11 +110,10 @@ pub struct RunRecorder {
     total_thinking_secs: f64,
     total_guards_secs: f64,
     total_cost_usd: f64,
-    outcome: &'static str,
-    /// Closure invoked with the finalized RunMetrics from Drop. Allows the
-    /// caller to render an end-of-run summary table without forcing Drop
-    /// to know about ANSI rendering or print to stderr unconditionally.
-    on_finalize: Option<Box<dyn FnMut(&RunMetrics) + Send>>,
+    pub outcome: &'static str,
+    /// Finalized-run callback: lets the caller render an end-of-run summary
+    /// table without making Drop know about ANSI rendering.
+    pub on_finalize: Option<fn(&RunMetrics)>,
 }
 
 impl RunRecorder {
@@ -137,13 +134,6 @@ impl RunRecorder {
         }
     }
 
-    pub fn on_finalize<F>(&mut self, cb: F)
-    where
-        F: FnMut(&RunMetrics) + Send + 'static,
-    {
-        self.on_finalize = Some(Box::new(cb));
-    }
-
     /// Write the iteration row and accumulate its totals in one step.
     pub fn record_iteration(&mut self, m: &IterationMetrics) {
         write_iteration_row(&self.ctx, m);
@@ -152,10 +142,6 @@ impl RunRecorder {
         self.total_thinking_secs += m.thinking_secs;
         self.total_guards_secs += m.guards_secs;
         self.total_cost_usd += m.cost_usd;
-    }
-
-    pub fn set_outcome(&mut self, outcome: &'static str) {
-        self.outcome = outcome;
     }
 
     fn finalize(&mut self) -> RunMetrics {
@@ -180,7 +166,7 @@ impl Drop for RunRecorder {
     fn drop(&mut self) {
         let run = self.finalize();
         write_run_row(&self.ctx, &run);
-        if let Some(mut cb) = self.on_finalize.take() {
+        if let Some(cb) = self.on_finalize.take() {
             cb(&run);
         }
     }
@@ -211,7 +197,7 @@ pub fn new_run_id() -> String {
 
 /// Convert unix-seconds-since-epoch (UTC) to (year, month, day, hour, minute, second).
 /// Howard Hinnant's date algorithm — integer-only, no leap-second handling.
-fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+pub(crate) fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let days = (secs / 86400) as i64;
     let tod = secs % 86400;
     let hh = (tod / 3600) as u32;
@@ -242,16 +228,11 @@ fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 pub fn project_slug() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let abs = cwd.canonicalize().unwrap_or(cwd.clone());
-    let base = abs
+    let base: String = abs
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("project");
-    let hash = fnv1a_32(abs.to_string_lossy().as_bytes());
-    format!("{}-{:08x}", sanitize(base), hash)
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars()
+        .unwrap_or("project")
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
@@ -259,16 +240,15 @@ fn sanitize(s: &str) -> String {
                 '_'
             }
         })
-        .collect()
-}
-
-fn fnv1a_32(bytes: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    for &b in bytes {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    h
+        .collect();
+    let hash = abs
+        .to_string_lossy()
+        .as_bytes()
+        .iter()
+        .fold(0x811c_9dc5u32, |h, &b| {
+            (h ^ b as u32).wrapping_mul(0x0100_0193)
+        });
+    format!("{}-{:08x}", base, hash)
 }
 
 /// Expand a leading `~` or `~/` against `$HOME`.  Returns the input
@@ -300,7 +280,10 @@ pub fn write_run_row(ctx: &MetricsContext, r: &RunMetrics) {
     if !ctx.enabled {
         return;
     }
-    append_line(&ctx.runs_path(), &serialize_run(r));
+    append_line(
+        &ctx.root_dir.join(&ctx.project_slug).join("runs.ndjson"),
+        &serialize_run(r),
+    );
 }
 
 fn append_line(path: &Path, line: &str) {
@@ -336,177 +319,60 @@ fn append_line(path: &Path, line: &str) {
 // ─── JSON emission ────────────────────────────────────────────────────────
 
 fn serialize_iteration(m: &IterationMetrics) -> String {
-    let mut s = String::with_capacity(512);
-    s.push('{');
-    push_str_field(&mut s, "run_id", &m.run_id, true);
-    push_str_field(&mut s, "project_slug", &m.project_slug, false);
-    push_str_field(&mut s, "mode", m.mode, false);
-    push_u32_field(&mut s, "iteration", m.iteration, false);
-    push_u64_field(&mut s, "started_at", m.started_at, false);
-    push_f64_field(&mut s, "wall_secs", m.wall_secs, false);
-    push_u64_field(&mut s, "restore_ms", m.restore_ms, false);
-    push_f64_field(&mut s, "agent_secs", m.agent_secs, false);
-    push_f64_field(&mut s, "guards_secs", m.guards_secs, false);
-    push_f64_field(&mut s, "periodics_secs", m.periodics_secs, false);
-    push_f64_field(&mut s, "hooks_secs", m.hooks_secs, false);
-    push_opt_f64_field(&mut s, "judge_secs", m.judge_secs);
-    push_opt_f64_field(&mut s, "agent_reported_secs", m.agent_reported_secs);
-    push_f64_field(&mut s, "cost_usd", m.cost_usd, false);
-    push_u32_field(&mut s, "num_turns", m.num_turns, false);
-    push_f64_field(&mut s, "thinking_secs", m.thinking_secs, false);
-    s.push_str(",\"tool_counts\":");
-    push_map_u32(&mut s, &m.tool_counts);
-    s.push_str(",\"tool_durations_secs\":");
-    push_map_f64(&mut s, &m.tool_durations_secs);
-    s.push_str(",\"guards\":[");
-    for (i, g) in m.guards.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push('{');
-        push_str_field(&mut s, "name", &g.name, true);
-        push_bool_field(&mut s, "passed", g.passed, false);
-        push_bool_field(&mut s, "skipped", g.skipped, false);
-        push_f64_field(&mut s, "elapsed_secs", g.elapsed_secs, false);
-        s.push('}');
-    }
-    s.push(']');
-    push_bool_field(&mut s, "guards_passed", m.guards_passed, false);
-    push_bool_field(&mut s, "status_done", m.status_done, false);
-    s.push('}');
-    s
+    let guards: Vec<serde_json::Value> = m
+        .guards
+        .iter()
+        .map(|g| {
+            json!({
+                "name": g.name,
+                "passed": g.passed,
+                "skipped": g.skipped,
+                "elapsed_secs": g.elapsed_secs,
+            })
+        })
+        .collect();
+    json!({
+        "run_id": m.run_id,
+        "project_slug": m.project_slug,
+        "mode": m.mode,
+        "iteration": m.iteration,
+        "started_at": m.started_at,
+        "wall_secs": m.wall_secs,
+        "restore_ms": m.restore_ms,
+        "agent_secs": m.agent_secs,
+        "guards_secs": m.guards_secs,
+        "periodics_secs": m.periodics_secs,
+        "hooks_secs": m.hooks_secs,
+        "judge_secs": m.judge_secs,
+        "agent_reported_secs": m.agent_reported_secs,
+        "cost_usd": m.cost_usd,
+        "num_turns": m.num_turns,
+        "thinking_secs": m.thinking_secs,
+        "tool_counts": m.tool_counts,
+        "tool_durations_secs": m.tool_durations_secs,
+        "guards": guards,
+        "guards_passed": m.guards_passed,
+        "status_done": m.status_done,
+    })
+    .to_string()
 }
 
 fn serialize_run(r: &RunMetrics) -> String {
-    let mut s = String::with_capacity(256);
-    s.push('{');
-    push_str_field(&mut s, "run_id", &r.run_id, true);
-    push_str_field(&mut s, "project_slug", &r.project_slug, false);
-    push_str_field(&mut s, "mode", r.mode, false);
-    push_u64_field(&mut s, "started_at", r.started_at, false);
-    push_u64_field(&mut s, "ended_at", r.ended_at, false);
-    push_u32_field(&mut s, "iterations", r.iterations, false);
-    push_str_field(&mut s, "outcome", r.outcome, false);
-    push_f64_field(&mut s, "total_wall_secs", r.total_wall_secs, false);
-    push_f64_field(&mut s, "total_agent_secs", r.total_agent_secs, false);
-    push_f64_field(&mut s, "total_thinking_secs", r.total_thinking_secs, false);
-    push_f64_field(&mut s, "total_guards_secs", r.total_guards_secs, false);
-    push_f64_field(&mut s, "total_cost_usd", r.total_cost_usd, false);
-    s.push('}');
-    s
-}
-
-fn push_str_field(s: &mut String, k: &str, v: &str, first: bool) {
-    if !first {
-        s.push(',');
-    }
-    s.push('"');
-    s.push_str(k);
-    s.push_str("\":\"");
-    escape_str_into(s, v);
-    s.push('"');
-}
-
-fn push_u32_field(s: &mut String, k: &str, v: u32, first: bool) {
-    if !first {
-        s.push(',');
-    }
-    s.push('"');
-    s.push_str(k);
-    s.push_str("\":");
-    s.push_str(&v.to_string());
-}
-
-fn push_u64_field(s: &mut String, k: &str, v: u64, first: bool) {
-    if !first {
-        s.push(',');
-    }
-    s.push('"');
-    s.push_str(k);
-    s.push_str("\":");
-    s.push_str(&v.to_string());
-}
-
-fn push_f64_field(s: &mut String, k: &str, v: f64, first: bool) {
-    if !first {
-        s.push(',');
-    }
-    s.push('"');
-    s.push_str(k);
-    s.push_str("\":");
-    push_f64_value(s, v);
-}
-
-fn push_opt_f64_field(s: &mut String, k: &str, v: Option<f64>) {
-    s.push(',');
-    s.push('"');
-    s.push_str(k);
-    s.push_str("\":");
-    match v {
-        Some(x) => push_f64_value(s, x),
-        None => s.push_str("null"),
-    }
-}
-
-fn push_f64_value(s: &mut String, v: f64) {
-    if v.is_finite() {
-        // 4 dp is more than enough for second-scale measurements
-        s.push_str(&format!("{:.4}", v));
-    } else {
-        s.push_str("null");
-    }
-}
-
-fn push_bool_field(s: &mut String, k: &str, v: bool, first: bool) {
-    if !first {
-        s.push(',');
-    }
-    s.push('"');
-    s.push_str(k);
-    s.push_str("\":");
-    s.push_str(if v { "true" } else { "false" });
-}
-
-fn escape_str_into(s: &mut String, v: &str) {
-    for c in v.chars() {
-        match c {
-            '"' => s.push_str("\\\""),
-            '\\' => s.push_str("\\\\"),
-            '\n' => s.push_str("\\n"),
-            '\r' => s.push_str("\\r"),
-            '\t' => s.push_str("\\t"),
-            c if (c as u32) < 0x20 => s.push_str(&format!("\\u{:04x}", c as u32)),
-            c => s.push(c),
-        }
-    }
-}
-
-fn push_map_u32(s: &mut String, m: &BTreeMap<String, u32>) {
-    s.push('{');
-    for (i, (k, v)) in m.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push('"');
-        escape_str_into(s, k);
-        s.push_str("\":");
-        s.push_str(&v.to_string());
-    }
-    s.push('}');
-}
-
-fn push_map_f64(s: &mut String, m: &BTreeMap<String, f64>) {
-    s.push('{');
-    for (i, (k, v)) in m.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push('"');
-        escape_str_into(s, k);
-        s.push_str("\":");
-        push_f64_value(s, *v);
-    }
-    s.push('}');
+    json!({
+        "run_id": r.run_id,
+        "project_slug": r.project_slug,
+        "mode": r.mode,
+        "started_at": r.started_at,
+        "ended_at": r.ended_at,
+        "iterations": r.iterations,
+        "outcome": r.outcome,
+        "total_wall_secs": r.total_wall_secs,
+        "total_agent_secs": r.total_agent_secs,
+        "total_thinking_secs": r.total_thinking_secs,
+        "total_guards_secs": r.total_guards_secs,
+        "total_cost_usd": r.total_cost_usd,
+    })
+    .to_string()
 }
 
 // ─── Read side: parse rows for `yoke stats` ──────────────────────────────
@@ -516,33 +382,23 @@ fn push_map_f64(s: &mut String, m: &BTreeMap<String, f64>) {
 // `String` fields and a separate row type.  Keeps both sides honest
 // without forcing one to bend to the other.
 
-/// One parsed row from `runs.ndjson`.  Some fields aren't shown in the
-/// current `yoke stats` output but are populated for callers that want
-/// to filter or aggregate.
-#[allow(dead_code)]
+/// One parsed row from `runs.ndjson`.
 #[derive(Debug, Clone)]
 pub struct RunRow {
     pub run_id: String,
-    pub project_slug: String,
     pub mode: String,
-    pub started_at: u64,
-    pub ended_at: u64,
     pub iterations: u32,
     pub outcome: String,
     pub total_wall_secs: f64,
-    pub total_agent_secs: f64,
-    pub total_thinking_secs: f64,
-    pub total_guards_secs: f64,
     pub total_cost_usd: f64,
 }
 
 /// One parsed row from `<run-id>.ndjson`.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IterRow {
     pub iteration: u32,
+    #[allow(dead_code)] // parsed for row completeness; used by unit tests
     pub mode: String,
-    pub started_at: u64,
     pub wall_secs: f64,
     pub agent_secs: f64,
     pub thinking_secs: f64,
@@ -554,54 +410,32 @@ pub struct IterRow {
 }
 
 pub fn read_runs(slug_dir: &Path) -> Vec<RunRow> {
-    let path = slug_dir.join("runs.ndjson");
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(r) = parse_run_row(line) {
-            out.push(r);
-        }
-    }
-    out
+    read_ndjson(&slug_dir.join("runs.ndjson"), parse_run_row)
 }
 
 pub fn read_iterations(file: &Path) -> Vec<IterRow> {
-    let content = match fs::read_to_string(file) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    read_ndjson(file, parse_iter_row)
+}
+
+fn read_ndjson<T>(path: &Path, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
     };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(r) = parse_iter_row(line) {
-            out.push(r);
-        }
-    }
-    out
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(parse)
+        .collect()
 }
 
 fn parse_run_row(line: &str) -> Option<RunRow> {
     use crate::json::{extract_num, extract_str};
     Some(RunRow {
         run_id: extract_str(line, "run_id")?.to_string(),
-        project_slug: extract_str(line, "project_slug")?.to_string(),
         mode: extract_str(line, "mode")?.to_string(),
-        started_at: extract_num(line, "started_at")? as u64,
-        ended_at: extract_num(line, "ended_at")? as u64,
         iterations: extract_num(line, "iterations")? as u32,
         outcome: extract_str(line, "outcome")?.to_string(),
         total_wall_secs: extract_num(line, "total_wall_secs").unwrap_or(0.0),
-        total_agent_secs: extract_num(line, "total_agent_secs").unwrap_or(0.0),
-        total_thinking_secs: extract_num(line, "total_thinking_secs").unwrap_or(0.0),
-        total_guards_secs: extract_num(line, "total_guards_secs").unwrap_or(0.0),
         total_cost_usd: extract_num(line, "total_cost_usd").unwrap_or(0.0),
     })
 }
@@ -611,7 +445,6 @@ fn parse_iter_row(line: &str) -> Option<IterRow> {
     Some(IterRow {
         iteration: extract_num(line, "iteration")? as u32,
         mode: extract_str(line, "mode").unwrap_or("").to_string(),
-        started_at: extract_num(line, "started_at").unwrap_or(0.0) as u64,
         wall_secs: extract_num(line, "wall_secs").unwrap_or(0.0),
         agent_secs: extract_num(line, "agent_secs").unwrap_or(0.0),
         thinking_secs: extract_num(line, "thinking_secs").unwrap_or(0.0),
@@ -759,7 +592,8 @@ mod tests {
         let s = serialize_iteration(&m);
         assert!(s.starts_with('{') && s.ends_with('}'));
         assert!(s.contains("\"run_id\":\"20260101T000000-abcd\""));
-        assert!(s.contains("\"thinking_secs\":4.1000"));
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(parsed["thinking_secs"].as_f64(), Some(4.1));
         assert!(s.contains("\"judge_secs\":null"));
         assert!(s.contains("\"tool_durations_secs\":{"));
     }

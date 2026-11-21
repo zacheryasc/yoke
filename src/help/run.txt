@@ -1,0 +1,21 @@
+[yoke run] execute the loop
+
+USAGE: yoke run [--dry-run] [--no-sandbox] [--summary-fd N]
+       yoke pause | resume | stop
+       yoke inject [--shutdown] <message>
+
+OPTIONS:
+  --dry-run       Run one iteration without invoking OMP
+                  (boundary check + configured guards only)
+  --no-sandbox    Accepted for compatibility; OMP runs locally when image is unset
+  --summary-fd N  Write summary NDJSON records to inherited fd N
+
+WORKFLOW:
+  1. Load config from .loop/yoke.conf
+  2. Backup protected files (protocol.md, plan.md, judge.md, yoke.conf)
+  3. Per brute attempt:
+     a. Restore protected files, preserve verdict and guard feedback
+     b. Run plan loop (stages + guards until DONE)
+     c. Invoke judge (fresh OMP session, zero context)
+     d. If judge FAILs, reset STATUS and retry
+  4. Exit when judge returns VERDICT: PASS

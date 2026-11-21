@@ -47,8 +47,8 @@ struct GitInfo {
 
 pub struct RunArtifacts {
     enabled: bool,
-    dir: PathBuf,
-    run_id: String,
+    pub(crate) dir: PathBuf,
+    pub(crate) run_id: String,
     mode: String,
     project: String,
     started_at: u64,
@@ -87,14 +87,6 @@ impl RunArtifacts {
         artifacts.write_manifest(None, 0);
         log(&format!("Run artifacts: {}", artifacts.dir.display()));
         artifacts
-    }
-
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     pub fn snapshot(&mut self, path: &str) {

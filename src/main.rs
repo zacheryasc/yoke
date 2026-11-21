@@ -29,12 +29,7 @@ const PLAN_PATH: &str = ".loop/plan.md";
 const JUDGE_PATH: &str = ".loop/judge.md";
 const VERDICT_PATH: &str = ".loop/verdict.md";
 
-const DEFAULT_BRUTE_PROTOCOL: &str = include_str!("templates/brute/protocol.md");
-const DEFAULT_BRUTE_CONF: &str = include_str!("templates/brute/yoke.conf");
 const DEFAULT_JUDGE: &str = include_str!("templates/brute/judge.md");
-const DEFAULT_BRIEFING: &str = include_str!("templates/brute/briefing.md");
-
-const LAYER_REPL: &str = include_str!("templates/layers/repl.md");
 
 const BRIEFING_PATH: &str = ".loop/briefing.md";
 
@@ -77,7 +72,6 @@ fn format_progress_bar(completed: usize, total: usize) -> String {
 }
 
 use ansi::{BLUE, BOLD, DIM, GREEN, ORANGE, RED, RESET};
-const MAGENTA: &str = "\x1b[38;5;207m";
 
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
@@ -100,13 +94,34 @@ pub(crate) fn log_error(msg: &str) {
 
 fn get_layer(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
-        "repl" => Some(("REPL probing", LAYER_REPL)),
+        "repl" => Some(("REPL probing", include_str!("templates/layers/repl.md"))),
         _ => None,
     }
 }
 
-fn list_layers() -> &'static [&'static str] {
-    &["repl"]
+/// Print usage or per-command help.
+fn show_help(topic: &str) {
+    if topic == "inject" {
+        eprint!(
+            "[yoke inject] steer an active run\n\n\
+             USAGE: yoke inject [--shutdown] <message>\n\n\
+             OPTIONS:\n  --shutdown      Ask the worker to preserve progress and exit promptly\n  --help, -h      Show this help message\n\n\
+             Sends the message to the active run through {}.\n",
+            runtime::YOKE_SOCKET_PATH
+        );
+        return;
+    }
+    eprint!(
+        "{}",
+        match topic {
+            "init" => include_str!("help/init.txt"),
+            "clean" => include_str!("help/clean.txt"),
+            "layer" => include_str!("help/layer.txt"),
+            "run" => include_str!("help/run.txt"),
+            "stats" => include_str!("help/stats.txt"),
+            _ => include_str!("help/usage.txt"),
+        }
+    );
 }
 
 #[allow(clippy::string_slice)] // slices after ASCII prefixes ("## ", ". ")
@@ -116,7 +131,6 @@ fn apply_layers(names_arg: &str) -> i32 {
         log_error("no .loop/judge.md found — run 'yoke init' first");
         return 1;
     }
-
     let mut content = match fs::read_to_string(judge_path) {
         Ok(c) => c,
         Err(e) => {
@@ -125,55 +139,44 @@ fn apply_layers(names_arg: &str) -> i32 {
         }
     };
 
-    let names: Vec<&str> = names_arg.split(',').map(|s| s.trim()).collect();
-
-    for name in &names {
-        let (heading, layer_content) = match get_layer(name) {
-            Some(v) => v,
-            None => {
-                log_error(&format!(
-                    "unknown layer '{}' — use 'yoke layer --list'",
-                    name
-                ));
-                return 2;
-            }
+    for name in names_arg.split(',').map(str::trim) {
+        let Some((heading, layer)) = get_layer(name) else {
+            log_error(&format!(
+                "unknown layer '{}' — use 'yoke layer --list'",
+                name
+            ));
+            return 2;
         };
-
         if content.contains(heading) {
             log(&format!("skip (already present): {}", name));
             continue;
         }
-
-        match content.find("\n## Verdict") {
-            Some(pos) => {
-                content.insert_str(pos, &format!("\n{}\n", layer_content.trim()));
-            }
-            None => {
-                log_error("judge.md has no '## Verdict' section — cannot insert layer");
-                return 1;
-            }
-        }
+        let Some(pos) = content.find("\n## Verdict") else {
+            log_error("judge.md has no '## Verdict' section — cannot insert layer");
+            return 1;
+        };
+        content.insert_str(pos, &format!("\n{}\n", layer.trim()));
         log(&format!("applied layer: {}", name));
     }
 
-    // Re-number ## N. sections sequentially
-    let mut section_num = 1u32;
+    // Re-number "## N. section" headings sequentially.
+    let mut section_num = 0;
     let mut result = String::with_capacity(content.len());
     for line in content.lines() {
-        if line.starts_with("## ") && line.len() > 4 {
-            let rest = &line[3..];
-            if rest.starts_with(|c: char| c.is_ascii_digit()) {
-                let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-                if after_digits.starts_with(". ") {
-                    result.push_str(&format!("## {}. {}", section_num, &after_digits[2..]));
-                    result.push('\n');
-                    section_num += 1;
-                    continue;
-                }
+        let numbered = line
+            .strip_prefix("## ")
+            .and_then(|rest| rest.split_once(". "))
+            .filter(|(num, _)| !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()));
+        match numbered {
+            Some((_, heading)) => {
+                section_num += 1;
+                result.push_str(&format!("## {}. {}\n", section_num, heading));
+            }
+            None => {
+                result.push_str(line);
+                result.push('\n');
             }
         }
-        result.push_str(line);
-        result.push('\n');
     }
 
     if let Err(e) = fs::write(judge_path, result.trim_end().to_string() + "\n") {
@@ -182,135 +185,6 @@ fn apply_layers(names_arg: &str) -> i32 {
     }
 
     0
-}
-
-fn print_layer_help() {
-    eprintln!("Usage: yoke layer <name>[,<name>,...]\n");
-    eprintln!("  Append judge layers to .loop/judge.md\n");
-    eprintln!("  --list   Show available layers");
-    eprintln!("\nAvailable layers:");
-    for name in list_layers() {
-        eprintln!("  {}", name);
-    }
-}
-
-fn print_usage() {
-    eprintln!("{}{}[yoke]{} LLM loop harness", ORANGE, BOLD, RESET);
-    eprintln!();
-    eprintln!("{}USAGE:{} yoke <command> [options]", BOLD, RESET);
-    eprintln!();
-    eprintln!("{}COMMANDS:{}", BOLD, RESET);
-    eprintln!(
-        "  {}init{}             Initialize .loop/ for the brute loop (plan stages + judge)",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}clean{}            Reset .loop/ working files to blank slate",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}stash{}            Snapshot .loop/ state (stash log, stash checkout <hash>)",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}layer{}            Append judge layers to .loop/judge.md",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}run{}              Launch the loop (invoke OMP, run guards, iterate)",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}run --dry-run{}    Single iteration: boundary check + guards only, no OMP",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}inject{}           Send human steering to an active yoke run",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}pause{}            Freeze an active run at the next block boundary",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}resume{}           Continue a paused run in place",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}stop{}             End an active run gracefully",
-        BOLD, RESET
-    );
-    eprintln!(
-        "  {}stats{}            Inspect persisted run metrics (~/.yoke/metrics/)",
-        BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}OPTIONS:{}", BOLD, RESET);
-    eprintln!("  --help, -h       Show this help message");
-    eprintln!();
-    eprintln!("{}CONFIG:{}  {}{}", BOLD, RESET, DIM, CONF_PATH);
-    eprintln!(
-        "{}EXIT:{}   0=success  1=guard failure  2=usage error",
-        BOLD, RESET
-    );
-}
-
-fn print_inject_help() {
-    eprintln!(
-        "{}{}[yoke inject]{} steer an active run",
-        ORANGE, BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}USAGE:{} yoke inject [--shutdown] <message>", BOLD, RESET);
-    eprintln!();
-    eprintln!("{}OPTIONS:{}", BOLD, RESET);
-    eprintln!("  --shutdown      Ask the worker to preserve progress and exit promptly");
-    eprintln!("  --help, -h      Show this help message");
-    eprintln!();
-    eprintln!(
-        "Sends the message to the active run through {}.",
-        runtime::YOKE_SOCKET_PATH
-    );
-}
-
-fn print_run_help() {
-    eprintln!("{}{}[yoke run]{} execute the loop", ORANGE, BOLD, RESET);
-    eprintln!();
-    eprintln!(
-        "{}USAGE:{} yoke run [--dry-run] [--no-sandbox] [--summary-fd N]\n       yoke pause | resume | stop\n       yoke inject [--shutdown] <message>",
-        BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}OPTIONS:{}", BOLD, RESET);
-    eprintln!("  --dry-run       Run one iteration without invoking OMP");
-    eprintln!("                  (boundary check + configured guards only)");
-    eprintln!("  --no-sandbox    Accepted for compatibility; OMP runs locally when image is unset");
-    eprintln!("  --summary-fd N  Write summary NDJSON records to inherited fd N");
-    eprintln!();
-    eprintln!("{}WORKFLOW:{}", BOLD, RESET);
-    eprintln!("  1. Load config from {}", CONF_PATH);
-    eprintln!("  2. Backup protected files (protocol.md, plan.md, judge.md, yoke.conf)");
-    eprintln!("  3. Per brute attempt:");
-    eprintln!("     a. Restore protected files, preserve verdict and guard feedback");
-    eprintln!("     b. Run plan loop (stages + guards until DONE)");
-    eprintln!("     c. Invoke judge (fresh OMP session, zero context)");
-    eprintln!("     d. If judge FAILs, reset STATUS and retry");
-    eprintln!("  4. Exit when judge returns VERDICT: PASS");
-}
-
-fn print_init_help() {
-    eprintln!(
-        "{}{}[yoke init]{} initialize .loop/ for the brute loop",
-        ORANGE, BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}USAGE:{} yoke init", BOLD, RESET);
-    eprintln!();
-    eprintln!("Creates:");
-    eprintln!("  yoke.conf, protocol.md, briefing.md, plan.md, judge.md,");
-    eprintln!("  notes.md, archive/, verdict.md, guard-results.md");
-    eprintln!();
-    eprintln!("Existing files are never overwritten.");
 }
 
 /// Holds loop state and cleans up on drop.
@@ -356,22 +230,6 @@ fn ensure_archive_dir() {
 ///
 /// The previous attempt's guard feedback is preserved so the worker can
 /// read it on the next iteration.
-fn preflight() {
-    for path in [PROTOCOL_PATH, PLAN_PATH, CONF_PATH] {
-        if !Path::new(path).exists() {
-            log_error(&format!("required file not found: {}", path));
-            process::exit(1);
-        }
-    }
-    // Ensure notes file exists
-    if !Path::new(NOTES_PATH).exists()
-        && let Err(e) = fs::write(NOTES_PATH, "")
-    {
-        log_error(&format!("cannot create {}: {}", NOTES_PATH, e));
-        process::exit(1);
-    }
-    ensure_archive_dir();
-}
 
 /// Copy protected files into an existing backup directory. Used both at run
 /// start and when a paused run resumes, so paused edits become the new
@@ -546,10 +404,11 @@ pub(crate) fn build_docker_omp_command(image: &str, omp_args: &[String]) -> Comm
     c
 }
 
-fn build_omp_args(config: &Config, prompt: &str, resume: Option<&str>) -> Vec<String> {
+/// Build the OMP option list shared by print/json and RPC modes.
+pub(crate) fn omp_args(config: &Config, mode: &str) -> Vec<String> {
     let mut args = vec![
         "--mode".to_string(),
-        "json".to_string(),
+        mode.to_string(),
         "--auto-approve".to_string(),
     ];
     if let Some(model) = config.model.as_deref() {
@@ -560,29 +419,34 @@ fn build_omp_args(config: &Config, prompt: &str, resume: Option<&str>) -> Vec<St
         args.push("--thinking".to_string());
         args.push(thinking.as_omp_arg().to_string());
     }
+    args
+}
+
+/// Build a Command for invoking OMP, in a container when configured.
+pub(crate) fn omp_command(config: &Config, omp_args: &[String]) -> Command {
+    match &config.image {
+        Some(image) => build_docker_omp_command(image, omp_args),
+        None => {
+            let mut c = Command::new("omp");
+            c.args(omp_args);
+            c
+        }
+    }
+}
+
+/// Build a print-mode Command for invoking OMP.
+///
+/// `resume` carries an OMP session id when the harness wants to continue the
+/// previous round's conversation. `None` produces a fresh session.
+fn build_command(config: &Config, prompt: &str, resume: Option<&str>) -> Command {
+    let mut args = omp_args(config, "json");
     if let Some(sid) = resume {
         args.push("--resume".to_string());
         args.push(sid.to_string());
     }
     args.push("-p".to_string());
     args.push(prompt.to_string());
-    args
-}
-
-/// Build a Command for invoking OMP.
-///
-/// `resume` carries an OMP session id when the harness wants to continue the
-/// previous round's conversation. `None` produces a fresh session.
-fn build_command(config: &Config, prompt: &str, resume: Option<&str>) -> Command {
-    let omp_args = build_omp_args(config, prompt, resume);
-    match &config.image {
-        Some(image) => build_docker_omp_command(image, &omp_args),
-        None => {
-            let mut c = Command::new("omp");
-            c.args(&omp_args);
-            c
-        }
-    }
+    omp_command(config, &args)
 }
 
 /// Wall-clock + stream summary for one agent invocation.
@@ -798,48 +662,24 @@ fn render_section_banner(title: &str, subtitle: &str, color: &str) {
 
 /// Render a box-drawn table of guard results to stderr.
 fn render_guard_table(results: &[guard::GuardResult]) {
-    if results.is_empty() {
-        return;
-    }
-    let cmd_w = results
-        .iter()
-        .map(|r| r.name.len())
-        .max()
-        .unwrap_or(10)
-        .max(10);
-    let stat_w = 8;
-    let time_w = 6;
-    let top = format!(
-        "  ┌{}┬{}┬{}┐",
-        "─".repeat(cmd_w + 2),
-        "─".repeat(stat_w),
-        "─".repeat(time_w + 1)
-    );
-    let bottom = format!(
-        "  └{}┴{}┴{}┘",
-        "─".repeat(cmd_w + 2),
-        "─".repeat(stat_w),
-        "─".repeat(time_w + 1)
-    );
-    eprintln!("{}", top);
-    for r in results {
-        let cmd_padded = format!("{:<w$}", r.name, w = cmd_w);
-        let status_cell = if r.skipped {
-            format!("{}SKIPPED {}", ORANGE, RESET)
-        } else if r.passed {
-            format!(" {} PASS {}  ", GREEN, RESET)
+    for result in results {
+        let (color, status) = if result.skipped {
+            (ORANGE, "SKIPPED")
+        } else if result.passed {
+            (GREEN, "PASS")
         } else {
-            format!(" {} FAIL {}  ", RED, RESET)
+            (RED, "FAIL")
         };
-        let time_cell = if r.skipped {
-            format!("  -  ")
+        let timing = if result.skipped {
+            String::new()
         } else {
-            let secs = r.elapsed_secs.round() as u64;
-            format!("{:>3}s ", secs)
+            format!(" {:.1}s", result.elapsed_secs)
         };
-        eprintln!("  │ {} │{}│ {} │", cmd_padded, status_cell, time_cell);
+        eprintln!(
+            "  {}{:<7}{} {}{}{}",
+            color, status, RESET, result.name, DIM, timing
+        );
     }
-    eprintln!("{}", bottom);
 }
 
 /// Run guard-after commands for a periodic agent.
@@ -877,68 +717,17 @@ fn run_periodic_guards(periodic: &Periodic, max_tail: usize) {
 /// ╚══════════════════════════════════════╝
 /// ```
 fn render_judge_banner(pass: bool, content: &str) {
-    let inner_w = 38; // inner width of the box (characters between ║ borders)
-    let verdict_label = if pass { "PASS" } else { "FAIL" };
-    let color = if pass { GREEN } else { RED };
-
-    // Build header line: center "JUDGE VERDICT: PASS/FAIL"
-    let title = format!("JUDGE VERDICT: {}", verdict_label);
-    let padding = if inner_w > title.len() {
-        inner_w - title.len()
-    } else {
-        0
-    };
-    let left_pad = padding / 2;
-    let right_pad = padding - left_pad;
-    let title_line = format!(
-        "{:>w_left$}{}{:>w_right$}",
-        "",
-        title,
-        "",
-        w_left = left_pad,
-        w_right = right_pad
-    );
-
-    // Extract reason text: skip the first line (VERDICT: ...) and take up to 2 non-empty lines
-    let reason_lines: Vec<&str> = content
+    let (label, color) = if pass { ("PASS", GREEN) } else { ("FAIL", RED) };
+    eprintln!("\n{}{}  Judge verdict: {}  {}", BOLD, color, label, RESET);
+    for line in content
         .lines()
         .skip(1)
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
         .take(2)
-        .collect();
-
-    let bar = "═".repeat(inner_w);
-
-    eprintln!();
-    eprintln!("{}{}╔{}╗{}", BOLD, color, bar, RESET);
-    eprintln!("{}{}║{}║{}", BOLD, color, title_line, RESET);
-
-    if !reason_lines.is_empty() {
-        eprintln!("{}{}╠{}╣{}", BOLD, color, bar, RESET);
-        for reason in &reason_lines {
-            // Truncate and pad reason to fit within inner_w, with 2-char left margin
-            let max_text = inner_w - 4; // 2 left margin + 2 right margin
-            let text: std::borrow::Cow<str> = if reason.chars().count() > max_text {
-                std::borrow::Cow::Owned(reason.chars().take(max_text).collect())
-            } else {
-                std::borrow::Cow::Borrowed(reason)
-            };
-            let text_right_pad = inner_w - 2 - text.chars().count();
-            eprintln!(
-                "{}{}║  {}{}{}{}║{}",
-                BOLD,
-                color,
-                RESET,
-                text,
-                " ".repeat(text_right_pad),
-                color,
-                RESET
-            );
-        }
+    {
+        eprintln!("{}  {}{}", DIM, line, RESET);
     }
-
-    eprintln!("{}{}╚{}╝{}", BOLD, color, bar, RESET);
     eprintln!();
 }
 
@@ -994,67 +783,8 @@ VERDICT: FAIL
 /// Allowed-scope files get a green ✓, violations get a red ✗.
 #[allow(clippy::string_slice)] // slices at ASCII delimiter positions from .find()
 fn render_violation_tree(violations: &[String]) {
-    use std::collections::BTreeMap;
-
-    // Parse each violation into (file_path, reason)
-    let mut entries: Vec<(&str, &str)> = Vec::new();
-    for v in violations {
-        // Format: "TAG: path (reason)" — extract path after first ": " and before " ("
-        if let Some(colon_pos) = v.find(": ") {
-            let rest = &v[colon_pos + 2..];
-            let (path, reason) = if let Some(paren_pos) = rest.find(" (") {
-                (&rest[..paren_pos], &rest[paren_pos + 1..])
-            } else {
-                (rest, "")
-            };
-            entries.push((path.trim(), reason.trim()));
-        }
-    }
-
-    if entries.is_empty() {
-        return;
-    }
-
-    // Group files by their directory (or root "." for top-level files)
-    let mut tree: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
-    for (path, reason) in &entries {
-        if let Some(slash_pos) = path.rfind('/') {
-            let dir = &path[..slash_pos];
-            let file = &path[slash_pos + 1..];
-            tree.entry(dir).or_default().push((file, reason));
-        } else {
-            tree.entry(".").or_default().push((path, reason));
-        }
-    }
-
-    // Render tree
-    let dirs: Vec<_> = tree.keys().copied().collect();
-    let dir_count = dirs.len();
-    for (di, dir) in dirs.iter().enumerate() {
-        let is_last_dir = di + 1 == dir_count;
-        let dir_prefix = if is_last_dir {
-            "└── "
-        } else {
-            "├── "
-        };
-        let child_prefix = if is_last_dir { "    " } else { "│   " };
-
-        eprintln!("  {}{}{}/{}", dir_prefix, DIM, dir, RESET);
-
-        let files = &tree[dir];
-        let file_count = files.len();
-        for (fi, (file, reason)) in files.iter().enumerate() {
-            let is_last_file = fi + 1 == file_count;
-            let file_conn = if is_last_file {
-                "└── "
-            } else {
-                "├── "
-            };
-            eprintln!(
-                "  {}{}{}✗{} {} {}{}{}",
-                child_prefix, file_conn, RED, RESET, file, DIM, reason, RESET
-            );
-        }
+    for violation in violations {
+        eprintln!("  {}{}{}", RED, violation, RESET);
     }
 }
 
@@ -1126,31 +856,6 @@ fn run_all_guards(config: &Config) -> GuardOutcome {
     }
 }
 
-fn print_clean_help() {
-    eprintln!(
-        "{}{}[yoke clean]{} reset .loop/ working files",
-        ORANGE, BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}USAGE:{} yoke clean", BOLD, RESET);
-    eprintln!();
-    eprintln!("Clears working files back to a blank slate:");
-    eprintln!("  plan.md, notes.md, verdict.md, guard-results.md  →  emptied");
-    eprintln!("  archive/*.md                                    →  removed");
-    eprintln!("  judge.md                                        →  reset to default template");
-    eprintln!();
-    eprintln!("Structural files are left untouched:");
-    eprintln!("  protocol.md, yoke.conf, briefing.md, .loop/runs/ (run artifacts)");
-    eprintln!();
-    eprintln!(
-        "Non-empty working files are auto-stashed to ~/.yoke/stash/<project-slug>/ before wiping."
-    );
-    eprintln!(
-        "Browse with: {}yoke stash log{}   Recover with: {}yoke stash pop{}",
-        BOLD, RESET, BOLD, RESET
-    );
-}
-
 fn clean() -> i32 {
     let loop_dir = Path::new(".loop");
     if !loop_dir.exists() {
@@ -1205,18 +910,6 @@ fn clean() -> i32 {
     0
 }
 
-/// Files created by `yoke init`.
-const BRUTE_FILES: &[(&str, &str)] = &[
-    (CONF_PATH, DEFAULT_BRUTE_CONF),
-    (PROTOCOL_PATH, DEFAULT_BRUTE_PROTOCOL),
-    (BRIEFING_PATH, DEFAULT_BRIEFING),
-    (PLAN_PATH, ""),
-    (JUDGE_PATH, DEFAULT_JUDGE),
-    (NOTES_PATH, ""),
-    (VERDICT_PATH, ""),
-    (GUARD_RESULTS_PATH, ""),
-];
-
 fn init() -> i32 {
     let loop_dir = Path::new(".loop");
     if !loop_dir.exists() {
@@ -1230,7 +923,16 @@ fn init() -> i32 {
 
     log("Initializing brute loop...");
 
-    for (path, content) in BRUTE_FILES {
+    for (path, content) in [
+        (CONF_PATH, include_str!("templates/brute/yoke.conf")),
+        (PROTOCOL_PATH, include_str!("templates/brute/protocol.md")),
+        (BRIEFING_PATH, include_str!("templates/brute/briefing.md")),
+        (PLAN_PATH, ""),
+        (JUDGE_PATH, DEFAULT_JUDGE),
+        (NOTES_PATH, ""),
+        (VERDICT_PATH, ""),
+        (GUARD_RESULTS_PATH, ""),
+    ] {
         let p = Path::new(path);
         if p.exists() {
             log(&format!("skip (exists): {}", path));
@@ -1383,7 +1085,7 @@ fn fire_periodic_agents(runner: &mut LoopRunner, config: &Config, iteration: u32
             render_section_banner(
                 &upper_name,
                 &format!("Periodic agent (iteration {:>4})", iteration),
-                MAGENTA,
+                "\x1b[38;5;207m",
             );
             let ok = invoke_periodic(runner, config, periodic, iteration);
             if !ok {
@@ -1473,7 +1175,7 @@ fn run_iteration_step(
             log("Interrupted \u{2014} shutting down");
             return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
         }
-        if supervisor.shutdown_requested() {
+        if supervisor.shutdown_requested {
             restore_files(&runner.backup_dir, protected);
             log("Shutdown steering handled — stopping run");
             return IterationStepResult::Terminal(PlanLoopOutcome::Interrupt);
@@ -1525,9 +1227,6 @@ fn run_plan_loop(
     run_artifacts: &mut artifacts::RunArtifacts,
     supervisor: &mut runtime::RunSupervisor,
 ) -> PlanLoopOutcome {
-    preflight();
-    validate_loop_config(config);
-    log("Preflight OK");
     if !dry_run {
         if let Err(e) = supervisor.ensure_control_started() {
             log_error(&e);
@@ -1669,15 +1368,6 @@ fn run_plan_loop(
     }
 }
 
-fn brute_outcome_label(o: &BruteResult) -> &'static str {
-    match o {
-        BruteResult::Pass => "judge_pass",
-        BruteResult::Bailout => "bailout",
-        BruteResult::Interrupt => "interrupt",
-        BruteResult::Error => "error",
-    }
-}
-
 /// Render the end-of-run metrics table to stderr.
 fn render_run_summary(r: &metrics::RunMetrics) {
     eprintln!();
@@ -1750,26 +1440,20 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
             ))
     ));
 
-    // Preflight: require protocol.md, judge.md, yoke.conf
-    for path in &[PROTOCOL_PATH, JUDGE_PATH, CONF_PATH] {
+    // Preflight: required files, notes/archive, and non-empty judge spec.
+    for path in &[PROTOCOL_PATH, PLAN_PATH, JUDGE_PATH, CONF_PATH] {
         if !Path::new(path).exists() {
             log_error(&format!("required file not found: {}", path));
             process::exit(1);
         }
     }
-
-    // Fail fast if critical content files are empty
-    for path in &[JUDGE_PATH] {
-        match fs::read_to_string(path) {
-            Ok(content) if content.trim().is_empty() => {
-                log_error(&format!("{} is empty — fill it in before running", path));
-                process::exit(1);
-            }
-            _ => {}
-        }
+    if fs::read_to_string(JUDGE_PATH).is_ok_and(|content| content.trim().is_empty()) {
+        log_error(&format!(
+            "{} is empty — fill it in before running",
+            JUDGE_PATH
+        ));
+        process::exit(1);
     }
-
-    // Create notes.md and verdict.md if missing
     for path in &[NOTES_PATH, VERDICT_PATH] {
         if !Path::new(path).exists()
             && let Err(e) = fs::write(path, "")
@@ -1778,7 +1462,8 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
             process::exit(1);
         }
     }
-
+    ensure_archive_dir();
+    validate_loop_config(&config);
     log("Preflight OK");
     if !dry_run && let Err(e) = supervisor.ensure_control_started() {
         log_error(&e);
@@ -1795,7 +1480,7 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
         ));
     }
     let mut recorder = metrics::RunRecorder::new(mctx);
-    recorder.on_finalize(|r| render_run_summary(r));
+    recorder.on_finalize = Some(render_run_summary);
 
     let mut run_artifacts = artifacts::RunArtifacts::start(&recorder.ctx.run_id, "brute");
     for path in [
@@ -1809,7 +1494,7 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
         run_artifacts.snapshot(path);
     }
 
-    supervisor.start_summary(&config, run_artifacts.run_id(), run_artifacts.dir());
+    supervisor.start_summary(&config, &run_artifacts.run_id, run_artifacts.dir.as_path());
 
     let result = run_brute_core(
         &config,
@@ -1818,8 +1503,13 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
         &mut run_artifacts,
         supervisor,
     );
-    let outcome = brute_outcome_label(&result);
-    recorder.set_outcome(outcome);
+    let outcome = match result {
+        BruteResult::Pass => "judge_pass",
+        BruteResult::Bailout => "bailout",
+        BruteResult::Interrupt => "interrupt",
+        BruteResult::Error => "error",
+    };
+    recorder.outcome = outcome;
     supervisor.finish_summary(outcome);
     run_artifacts.finish(outcome);
     result
@@ -1970,30 +1660,18 @@ fn run_brute(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> i32 {
     }
 }
 
-fn cmd_init(args: &[String]) -> ! {
+/// Run a command that takes no arguments beyond `--help`.
+fn cmd_simple(args: &[String], topic: &str, run: fn() -> i32) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        print_init_help();
+        show_help(topic);
         process::exit(0);
     }
     if let Some(arg) = args.get(2) {
         log_error(&format!("unexpected argument '{}'", arg));
-        print_init_help();
+        show_help(topic);
         process::exit(2);
     }
-    process::exit(init());
-}
-
-fn cmd_clean(args: &[String]) -> ! {
-    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        print_clean_help();
-        process::exit(0);
-    }
-    if args.len() > 2 {
-        log_error(&format!("unexpected argument '{}'", args[2]));
-        print_clean_help();
-        process::exit(2);
-    }
-    process::exit(clean());
+    process::exit(run());
 }
 
 fn cmd_stash(args: &[String]) -> ! {
@@ -2029,42 +1707,22 @@ fn cmd_stash(args: &[String]) -> ! {
 
 fn cmd_layer(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        print_layer_help();
+        show_help("layer");
         process::exit(0);
     }
     if args.get(2).is_some_and(|a| a == "--list") {
-        for name in list_layers() {
-            println!("  {}", name);
-        }
+        println!("  repl");
         process::exit(0);
     }
     let names_arg = match args.get(2) {
         Some(a) => a.clone(),
         None => {
             log_error("missing layer name");
-            print_layer_help();
+            show_help("layer");
             process::exit(2);
         }
     };
     process::exit(apply_layers(&names_arg));
-}
-
-fn print_stats_help() {
-    eprintln!(
-        "{}{}[yoke stats]{} inspect persisted run metrics",
-        ORANGE, BOLD, RESET
-    );
-    eprintln!();
-    eprintln!("{}USAGE:{}", BOLD, RESET);
-    eprintln!("  yoke stats                       List recent runs for the current project");
-    eprintln!("  yoke stats --last N              Limit to last N runs");
-    eprintln!("  yoke stats --project <slug>      Target a different project");
-    eprintln!("  yoke stats --run <run-id>        Show per-iteration rows for one run");
-    eprintln!();
-    eprintln!(
-        "Reads NDJSON from {}~/.yoke/metrics/<project-slug>/{} (or `metrics-dir` from yoke.conf).",
-        DIM, RESET
-    );
 }
 
 /// Resolve the metrics root directory, preferring an existing yoke.conf
@@ -2079,9 +1737,23 @@ fn resolve_metrics_dir() -> PathBuf {
     metrics::default_metrics_dir()
 }
 
+/// Read the value following `args[*i]` and advance past it.
+fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> &'a str {
+    match args.get(*i + 1) {
+        Some(value) => {
+            *i += 2;
+            value
+        }
+        None => {
+            log_error(&format!("{flag} requires a value"));
+            process::exit(2);
+        }
+    }
+}
+
 fn cmd_stats(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        print_stats_help();
+        show_help("stats");
         process::exit(0);
     }
 
@@ -2092,45 +1764,17 @@ fn cmd_stats(args: &[String]) -> ! {
     while i < args.len() {
         match args[i].as_str() {
             "--last" => {
-                let v = match args.get(i + 1) {
-                    Some(v) => v,
-                    None => {
-                        log_error("--last requires a value");
-                        process::exit(2);
-                    }
-                };
-                last = Some(match v.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        log_error(&format!("--last expects an integer, got '{}'", v));
-                        process::exit(2);
-                    }
-                });
-                i += 2;
+                let v = take_value(args, &mut i, "--last");
+                last = Some(v.parse().unwrap_or_else(|_| {
+                    log_error(&format!("--last expects an integer, got '{v}'"));
+                    process::exit(2)
+                }));
             }
-            "--project" => {
-                project = Some(match args.get(i + 1) {
-                    Some(v) => v.clone(),
-                    None => {
-                        log_error("--project requires a slug");
-                        process::exit(2);
-                    }
-                });
-                i += 2;
-            }
-            "--run" => {
-                run_id = Some(match args.get(i + 1) {
-                    Some(v) => v.clone(),
-                    None => {
-                        log_error("--run requires a run-id");
-                        process::exit(2);
-                    }
-                });
-                i += 2;
-            }
+            "--project" => project = Some(take_value(args, &mut i, "--project").to_string()),
+            "--run" => run_id = Some(take_value(args, &mut i, "--run").to_string()),
             other => {
                 log_error(&format!("unknown flag '{}'", other));
-                print_stats_help();
+                show_help("stats");
                 process::exit(2);
             }
         }
@@ -2230,7 +1874,7 @@ fn stats_show_run(slug_dir: &Path, run_id: &str, slug: &str) -> i32 {
 
 fn cmd_inject(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        print_inject_help();
+        show_help("inject");
         process::exit(0);
     }
 
@@ -2241,13 +1885,13 @@ fn cmd_inject(args: &[String]) -> ! {
             "--shutdown" => shutdown = true,
             other if other.starts_with('-') => {
                 log_error(&format!("unknown flag '{}'", other));
-                print_inject_help();
+                show_help("inject");
                 process::exit(2);
             }
             other => {
                 if message.is_some() {
                     log_error("inject expects exactly one message argument");
-                    print_inject_help();
+                    show_help("inject");
                     process::exit(2);
                 }
                 message = Some(other.to_string());
@@ -2257,7 +1901,7 @@ fn cmd_inject(args: &[String]) -> ! {
 
     let Some(message) = message else {
         log_error("inject message is required");
-        print_inject_help();
+        show_help("inject");
         process::exit(2);
     };
     if message.trim().is_empty() {
@@ -2270,32 +1914,32 @@ fn cmd_inject(args: &[String]) -> ! {
     } else {
         runtime::InjectionKind::Normal
     };
-    match runtime::send_inject_command(runtime::YOKE_SOCKET_PATH, kind, &message) {
-        Ok(response) => {
-            if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-                let status = response
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("accepted");
-                let id = response
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                log(&format!("injection {} ({})", status, id));
-                process::exit(0);
-            }
-            let error = response
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("active run rejected injection");
-            log_error(error);
-            process::exit(1);
-        }
+    control_result(runtime::send_inject_command(kind, &message), "injection");
+}
+
+/// Log the outcome of a control request and exit with its status code.
+fn control_result(response: Result<serde_json::Value, String>, label: &str) -> ! {
+    let response = match response {
+        Ok(response) => response,
         Err(e) => {
             log_error(&e);
             process::exit(1);
         }
+    };
+    if response["ok"].as_bool() == Some(true) {
+        let status = response["status"].as_str().unwrap_or("accepted");
+        match response["id"].as_str() {
+            Some(id) => log(&format!("{label} {status} ({id})")),
+            None => log(&format!("{label} {status}")),
+        }
+        process::exit(0);
     }
+    log_error(
+        response["error"]
+            .as_str()
+            .unwrap_or("active run rejected the request"),
+    );
+    process::exit(1);
 }
 
 fn cmd_control(args: &[String], action: &str) -> ! {
@@ -2307,39 +1951,12 @@ fn cmd_control(args: &[String], action: &str) -> ! {
         log_error(&format!("unexpected argument '{}'", arg));
         process::exit(2);
     }
-    let response = match action {
-        "pause" => runtime::send_pause_command(runtime::YOKE_SOCKET_PATH),
-        "resume" => runtime::send_resume_command(runtime::YOKE_SOCKET_PATH),
-        "stop" => runtime::send_stop_command(runtime::YOKE_SOCKET_PATH),
-        _ => unreachable!(),
-    };
-    match response {
-        Ok(response) if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
-            let status = response
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("accepted");
-            log(&format!("{} {}", action, status));
-            process::exit(0);
-        }
-        Ok(response) => {
-            let error = response
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("active run rejected control request");
-            log_error(error);
-            process::exit(1);
-        }
-        Err(e) => {
-            log_error(&e);
-            process::exit(1);
-        }
-    }
+    control_result(runtime::send_command(action), action);
 }
 
 fn cmd_run(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
-        print_run_help();
+        show_help("run");
         process::exit(0);
     }
     let mut dry_run = false;
@@ -2378,7 +1995,7 @@ fn cmd_run(args: &[String]) -> ! {
             }
             other => {
                 log_error(&format!("unknown flag '{}'", other));
-                print_run_help();
+                show_help("run");
                 process::exit(2);
             }
         }
@@ -2393,8 +2010,7 @@ fn cmd_run(args: &[String]) -> ! {
         log_error(&e);
         process::exit(1);
     }
-    let mut supervisor = runtime::RunSupervisor::new();
-    supervisor.set_summary_fd(summary_fd);
+    let mut supervisor = runtime::RunSupervisor::new(summary_fd);
     let code = run_brute(dry_run, &mut supervisor);
     drop(supervisor);
     process::exit(code)
@@ -2405,13 +2021,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        print_usage();
+        show_help("");
         process::exit(2);
     }
 
     match args[1].as_str() {
-        "init" => cmd_init(&args),
-        "clean" => cmd_clean(&args),
+        "init" => cmd_simple(&args, "init", init),
+        "clean" => cmd_simple(&args, "clean", clean),
         "stash" => cmd_stash(&args),
         "layer" => cmd_layer(&args),
         "run" => cmd_run(&args),
@@ -2421,11 +2037,11 @@ fn main() {
         "stop" => cmd_control(&args, "stop"),
         "stats" => cmd_stats(&args),
         "--help" | "-h" | "help" => {
-            print_usage();
+            show_help("");
         }
         other => {
             log_error(&format!("unknown command '{}'", other));
-            print_usage();
+            show_help("");
             process::exit(2);
         }
     }
