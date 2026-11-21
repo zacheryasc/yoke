@@ -12,6 +12,7 @@ mod signal;
 mod stash;
 mod stream;
 mod stream_omp;
+mod summary;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2356,10 +2357,38 @@ fn cmd_run(args: &[String]) -> ! {
     }
     let mut dry_run = false;
     let mut _no_sandbox = false;
-    for arg in &args[2..] {
-        match arg.as_str() {
-            "--dry-run" => dry_run = true,
-            "--no-sandbox" => _no_sandbox = true,
+    let mut summary_fd: Option<i32> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--no-sandbox" => {
+                _no_sandbox = true;
+                i += 1;
+            }
+            "--summary-fd" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value,
+                    None => {
+                        log_error("--summary-fd requires a file descriptor");
+                        process::exit(2);
+                    }
+                };
+                summary_fd = Some(match value.parse::<i32>() {
+                    Ok(fd) if fd >= 0 => fd,
+                    _ => {
+                        log_error(&format!(
+                            "--summary-fd expects a non-negative integer, got '{}'",
+                            value
+                        ));
+                        process::exit(2);
+                    }
+                });
+                i += 2;
+            }
             other => {
                 log_error(&format!("unknown flag '{}'", other));
                 print_run_help();

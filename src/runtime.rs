@@ -179,9 +179,13 @@ impl Drop for ControlServer {
     }
 }
 
-fn handle_inject_client(mut stream: UnixStream, tx: &mpsc::Sender<Injection>, seq: &AtomicU64) {
-    let response = match read_inject_request(&stream, seq) {
-        Ok(mut injection) => {
+fn handle_control_client(
+    mut stream: UnixStream,
+    tx: &mpsc::Sender<ControlCommand>,
+    seq: &AtomicU64,
+) {
+    let response = match read_control_request(&stream, seq) {
+        Ok(ControlCommand::Inject(mut injection)) => {
             append_injection_audit(&injection);
             let id = injection.id.clone();
             let kind = injection.kind;
@@ -266,9 +270,17 @@ fn read_control_request(stream: &UnixStream, seq: &AtomicU64) -> Result<ControlC
     }
 
     let value: Value = serde_json::from_str(line.trim())
-        .map_err(|e| format!("invalid inject request JSON: {}", e))?;
-    if value.get("type").and_then(Value::as_str) != Some("inject") {
-        return Err("inject request type must be 'inject'".to_string());
+        .map_err(|e| format!("invalid control request JSON: {}", e))?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("pause") => return Ok(ControlCommand::Pause),
+        Some("resume") => return Ok(ControlCommand::Resume),
+        Some("stop") => return Ok(ControlCommand::Stop),
+        Some("inject") => {}
+        _ => {
+            return Err(
+                "control request type must be 'inject', 'pause', 'resume', or 'stop'".to_string(),
+            );
+        }
     }
     let kind = value
         .get("kind")
@@ -353,6 +365,38 @@ impl RunSupervisor {
             self.control = Some(ControlServer::start(YOKE_SOCKET_PATH)?);
         }
         Ok(())
+    }
+
+    pub(crate) fn set_summary_fd(&mut self, fd: Option<i32>) {
+        self.summary_fd = fd;
+    }
+
+    /// Start the summary side stream for one run. No-op when summaries are
+    /// not configured or no descriptor was supplied.
+    pub(crate) fn start_summary(&mut self, config: &Config, run_id: &str, artifacts: &Path) {
+        self.summary = Some(SummaryEngine::start(
+            config,
+            run_id,
+            artifacts,
+            self.summary_fd,
+        ));
+        if self.summary.as_ref().is_some_and(SummaryEngine::enabled) {
+            log(&format!(
+                "summary stream enabled (every {} blocks, limit {})",
+                config.summary_every, config.summary_queue_limit
+            ));
+        }
+    }
+
+    pub(crate) fn finish_summary(&mut self, outcome: &str) {
+        if let Some(summary) = self.summary.as_mut() {
+            summary.finish(outcome);
+        }
+    }
+
+    pub(crate) fn set_snapshot_target(&mut self, backup_dir: &Path, protected: &[&str]) {
+        self.backup_dir = Some(backup_dir.to_path_buf());
+        self.protected = protected.iter().map(|s| s.to_string()).collect();
     }
 
     pub(crate) fn reset_worker_session(&mut self) {
@@ -477,12 +521,28 @@ impl RunSupervisor {
                 &mut self.shutdown_requested,
             );
 
-            match worker.recv_line(RPC_EVENT_POLL) {
+            match self
+                .worker
+                .as_mut()
+                .expect("worker")
+                .recv_line(RPC_EVENT_POLL)
+            {
                 Ok(Some(line)) => {
                     if handle_rpc_response(&line, &mut pending) == RpcResponseOutcome::Failure {
                         success = false;
                     }
                     let is_agent_end = formatter.process_line(&line);
+                    if let Some(summary) = self.summary.as_mut() {
+                        summary.observe(&line);
+                    }
+                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
+                    if !is_agent_end
+                        && at_boundary
+                        && (self.pause_explicit || self.pause_backpressure)
+                    {
+                        self.pause_worker();
+                        continue;
+                    }
                     if is_agent_end {
                         saw_agent_end = true;
                         break;
@@ -493,6 +553,11 @@ impl RunSupervisor {
                         log_error(&format!("OMP RPC process exited early: {}", status));
                         success = false;
                         break;
+                    }
+                    let at_boundary = self.summary.as_ref().is_none_or(SummaryEngine::at_boundary);
+                    if at_boundary && (self.pause_explicit || self.pause_backpressure) {
+                        self.pause_worker();
+                        continue;
                     }
                 }
                 Err(e) => {

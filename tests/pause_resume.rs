@@ -181,6 +181,7 @@ fn pause_freezes_worker_and_resume_preserves_paused_edits() {
 
     let status = child.wait().expect("wait yoke run");
     let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(status.success(), "run should pass\nlog:\n{}", log);
     assert!(
         log.contains("worker resumed"),
         "resume should be logged:\n{}",
