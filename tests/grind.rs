@@ -4,15 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn yoke_bin() -> PathBuf {
-    let mut path = std::env::current_exe()
-        .expect("current_exe")
-        .parent()
-        .expect("parent of test binary")
-        .parent()
-        .expect("parent of deps dir")
-        .to_path_buf();
-    path.push("yoke");
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_yoke"))
 }
 
 fn build_yoke() {

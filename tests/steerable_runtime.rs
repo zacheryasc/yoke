@@ -6,15 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn yoke_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe()
-        .expect("current_exe")
-        .parent()
-        .expect("parent of test binary")
-        .parent()
-        .expect("parent of deps dir")
-        .to_path_buf();
-    path.push("yoke");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_yoke"))
 }
 
 fn build_yoke() -> std::path::PathBuf {

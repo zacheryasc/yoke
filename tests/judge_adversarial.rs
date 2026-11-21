@@ -14,17 +14,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-/// Build the yoke binary path (relies on `cargo test` putting it in target/).
+/// Path to the yoke binary built by cargo for this test target.
 fn yoke_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe()
-        .expect("current_exe")
-        .parent()
-        .expect("parent of test binary")
-        .parent()
-        .expect("parent of deps dir")
-        .to_path_buf();
-    path.push("yoke");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_yoke"))
 }
 
 fn project_stash_dir(home: &std::path::Path) -> std::path::PathBuf {

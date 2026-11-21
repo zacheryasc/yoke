@@ -11,15 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 fn yoke_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe()
-        .expect("current_exe")
-        .parent()
-        .expect("parent of test binary")
-        .parent()
-        .expect("parent of deps dir")
-        .to_path_buf();
-    path.push("yoke");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_yoke"))
 }
 
 const PROTOCOL: &str = "\
