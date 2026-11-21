@@ -62,11 +62,7 @@ fn seed_loop(project: &std::path::Path) {
     )
     .unwrap();
     fs::write(loop_dir.join("plan.md"), "## Stage 1\nSteer.\n").unwrap();
-    fs::write(
-        loop_dir.join("judge.md"),
-        "# Judge\nVerify the change.\n",
-    )
-    .unwrap();
+    fs::write(loop_dir.join("judge.md"), "# Judge\nVerify the change.\n").unwrap();
     fs::write(loop_dir.join("yoke.conf"), "metrics off\nallow .\n").unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
     fs::write(loop_dir.join("verdict.md"), "").unwrap();

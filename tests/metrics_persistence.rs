@@ -100,11 +100,7 @@ fn metrics_rows_persist_under_home_and_survive_clean() {
     fs::create_dir(&loop_dir).expect("create .loop");
     fs::write(loop_dir.join("protocol.md"), PROTOCOL).unwrap();
     fs::write(loop_dir.join("plan.md"), PLAN).unwrap();
-    fs::write(
-        loop_dir.join("judge.md"),
-        "# Judge\nVerify the change.\n",
-    )
-    .unwrap();
+    fs::write(loop_dir.join("judge.md"), "# Judge\nVerify the change.\n").unwrap();
     fs::write(loop_dir.join("yoke.conf"), CONF).unwrap();
     fs::write(loop_dir.join("notes.md"), "").unwrap();
     fs::write(loop_dir.join("verdict.md"), "").unwrap();

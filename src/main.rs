@@ -1,6 +1,7 @@
 #![warn(clippy::string_slice)]
 
 mod ansi;
+mod artifacts;
 mod boundary;
 mod config;
 mod guard;
@@ -1126,7 +1127,7 @@ fn print_clean_help() {
     eprintln!("  judge.md                                        →  reset to default template");
     eprintln!();
     eprintln!("Structural files are left untouched:");
-    eprintln!("  protocol.md, yoke.conf, briefing.md");
+    eprintln!("  protocol.md, yoke.conf, briefing.md, .loop/runs/ (run artifacts)");
     eprintln!();
     eprintln!(
         "Non-empty working files are auto-stashed to ~/.yoke/stash/<project-slug>/ before wiping."
@@ -1508,6 +1509,7 @@ fn run_plan_loop(
     config: &Config,
     dry_run: bool,
     recorder: &mut metrics::RunRecorder,
+    run_artifacts: &mut artifacts::RunArtifacts,
     supervisor: &mut runtime::RunSupervisor,
 ) -> PlanLoopOutcome {
     preflight();
@@ -1635,6 +1637,7 @@ fn run_plan_loop(
             status_done,
         };
         recorder.record_iteration(&iter_metrics);
+        run_artifacts.record_iteration(&iter_metrics);
 
         if let Some(outcome) = early_return {
             return outcome;
@@ -1779,8 +1782,28 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
     }
     let mut recorder = metrics::RunRecorder::new(mctx);
     recorder.on_finalize(|r| render_run_summary(r));
-    let result = run_brute_core(&config, dry_run, &mut recorder, supervisor);
+
+    let mut run_artifacts = artifacts::RunArtifacts::start(&recorder.ctx.run_id, "brute");
+    for path in [
+        CONF_PATH,
+        PROTOCOL_PATH,
+        BRIEFING_PATH,
+        PLAN_PATH,
+        JUDGE_PATH,
+        NOTES_PATH,
+    ] {
+        run_artifacts.snapshot(path);
+    }
+
+    let result = run_brute_core(
+        &config,
+        dry_run,
+        &mut recorder,
+        &mut run_artifacts,
+        supervisor,
+    );
     recorder.set_outcome(brute_outcome_label(&result));
+    run_artifacts.finish(brute_outcome_label(&result));
     result
 }
 
@@ -1789,10 +1812,12 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
 /// - `config`: already-loaded Config
 /// - `dry_run`: if true, skip OMP invocation (one iteration only)
 /// - `recorder`: metrics context (shared with the plan loop)
+/// - `run_artifacts`: per-run artifact store (shared with the plan loop)
 fn run_brute_core(
     config: &Config,
     dry_run: bool,
     recorder: &mut metrics::RunRecorder,
+    run_artifacts: &mut artifacts::RunArtifacts,
     supervisor: &mut runtime::RunSupervisor,
 ) -> BruteResult {
     // Backup protected files
@@ -1825,7 +1850,7 @@ fn run_brute_core(
             log("(dry-run) Skipping worker invocation");
         } else {
             log("Using plan runner as worker...");
-            match run_plan_loop(config, false, recorder, supervisor) {
+            match run_plan_loop(config, false, recorder, run_artifacts, supervisor) {
                 PlanLoopOutcome::JudgePass => {
                     // Embedded judge already passed — skip standalone judge
                     log("Plan runner completed with embedded judge PASS");
@@ -1875,6 +1900,7 @@ fn run_brute_core(
             BLUE,
         );
         let pass = invoke_judge(&mut runner, config, iteration);
+        run_artifacts.record_judge(iteration, pass);
 
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
