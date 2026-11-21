@@ -386,6 +386,54 @@ fn shutdown_injection_requests_graceful_wind_down_and_stops_run() {
 }
 
 #[test]
+fn stop_command_gracefully_ends_active_run() {
+    let yoke = build_yoke();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    seed_loop(project);
+    let test_path = install_mock(project, STEERABLE_MOCK_OMP);
+    let loop_dir = project.join(".loop");
+
+    let child = Command::new(&yoke)
+        .args(["run", "--no-sandbox"])
+        .current_dir(project)
+        .env("PATH", &test_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn yoke run");
+
+    wait_until(Duration::from_secs(5), || {
+        loop_dir.join(".rpc-requests").exists()
+    });
+
+    let stop = Command::new(&yoke)
+        .args(["stop"])
+        .current_dir(project)
+        .output()
+        .expect("yoke stop");
+    assert!(
+        stop.status.success(),
+        "stop should be accepted\nstderr={}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    let output = wait_output(child, Duration::from_secs(5));
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "graceful stop ends the run as an interrupt\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let steer = fs::read_to_string(loop_dir.join(".steer-requests")).expect("steer request");
+    assert!(
+        steer.contains("YOKE SHUTDOWN REQUEST"),
+        "stop should send shutdown steering:\n{}",
+        steer
+    );
+}
+
+#[test]
 fn delivery_failure_is_visible_to_inject_and_run() {
     let yoke = build_yoke();
     let tmp = tempfile::tempdir().expect("tempdir");

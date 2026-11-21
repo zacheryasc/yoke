@@ -89,6 +89,14 @@ impl RunArtifacts {
         artifacts
     }
 
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn snapshot(&mut self, path: &str) {
         if !self.enabled {
             return;

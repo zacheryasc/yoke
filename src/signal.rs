@@ -32,6 +32,24 @@ pub fn set_child_pid(pid: i32) {
     CHILD_PID.store(pid, Ordering::Relaxed);
 }
 
+/// Freeze the child process in place. SIGSTOP is uncatchable, so the worker
+/// resumes exactly where it stopped and keeps its session and fds.
+pub fn stop_child(pid: i32) -> bool {
+    pid != 0 && kill(pid, 19) == 0
+}
+
+/// Resume a child frozen by [`stop_child`].
+pub fn continue_child(pid: i32) -> bool {
+    pid != 0 && kill(pid, 18) == 0
+}
+
+/// SIGKILL a worker's process group so tool children do not outlive it.
+pub fn terminate_group(pid: i32) {
+    if pid != 0 {
+        kill(pid, 9);
+    }
+}
+
 pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }

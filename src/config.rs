@@ -59,6 +59,13 @@ pub struct Config {
     pub max_judge_failures: u32,
     pub periodics: Vec<Periodic>,
     pub hooks: Vec<String>,
+    /// Summarize every N parsed blocks. 0 disables the summary stream.
+    pub summary_every: u32,
+    /// Cheap model used only for summaries. Summaries are disabled without it.
+    pub summary_model: Option<String>,
+    pub summary_thinking: Thinking,
+    /// Pause the worker when this many summary batches are outstanding.
+    pub summary_queue_limit: u32,
     /// Resolved absolute path where NDJSON metrics rows are written.
     /// Defaults to `~/.yoke/metrics` so rows survive `yoke clean` / project resets.
     pub metrics_dir: PathBuf,
@@ -78,6 +85,10 @@ struct ConfigBuilder {
     periodics: Vec<Periodic>,
     pending_guard_afters: Vec<(String, String, usize)>,
     hooks: Vec<String>,
+    summary_every: u32,
+    summary_model: Option<String>,
+    summary_thinking: Thinking,
+    summary_queue_limit: u32,
     metrics_dir: Option<String>,
     metrics_enabled: bool,
 }
@@ -106,6 +117,25 @@ fn parse_positive_u32(
 }
 
 #[allow(clippy::string_slice)]
+fn parse_thinking(value: &str, path: &Path, line_num: usize) -> Result<Thinking, String> {
+    match value.trim() {
+        "off" => Ok(Thinking::Off),
+        "low" => Ok(Thinking::Low),
+        "medium" => Ok(Thinking::Medium),
+        "high" => Ok(Thinking::High),
+        "xhigh" => Ok(Thinking::XHigh),
+        "max" => Ok(Thinking::Max),
+        other => Err(cfg_err(
+            path,
+            line_num,
+            &format!(
+                "thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max', got '{}'",
+                other
+            ),
+        )),
+    }
+}
+
 fn parse_periodic(value: &str, path: &Path, line_num: usize) -> Result<Periodic, String> {
     let trimmed = value.trim();
     let split_pos = trimmed
@@ -171,6 +201,10 @@ impl ConfigBuilder {
             periodics: Vec::new(),
             pending_guard_afters: Vec::new(),
             hooks: Vec::new(),
+            summary_every: 12,
+            summary_model: None,
+            summary_thinking: Thinking::Off,
+            summary_queue_limit: 4,
             metrics_dir: None,
             metrics_enabled: true,
         }
@@ -197,26 +231,7 @@ impl ConfigBuilder {
             "log-dir" => self.log_dir = Some(value.to_string()),
             "image" => self.image = Some(value.to_string()),
             "model" => self.model = Some(value.to_string()),
-            "thinking" => {
-                self.thinking = Some(match value.trim() {
-                    "off" => Thinking::Off,
-                    "low" => Thinking::Low,
-                    "medium" => Thinking::Medium,
-                    "high" => Thinking::High,
-                    "xhigh" => Thinking::XHigh,
-                    "max" => Thinking::Max,
-                    other => {
-                        return Err(cfg_err(
-                            path,
-                            line_num,
-                            &format!(
-                                "thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max', got '{}'",
-                                other
-                            ),
-                        ));
-                    }
-                });
-            }
+            "thinking" => self.thinking = Some(parse_thinking(value, path, line_num)?),
             "allow" => self.scope_rules.push(ScopeRule {
                 tag: ScopeTag::Allow,
                 prefix: value.to_string(),
@@ -242,6 +257,23 @@ impl ConfigBuilder {
                 .pending_guard_afters
                 .push(parse_guard_after(value, path, line_num)?),
             "hook" => self.hooks.push(value.to_string()),
+            "summary-every" => {
+                self.summary_every = value.trim().parse::<u32>().map_err(|_| {
+                    cfg_err(
+                        path,
+                        line_num,
+                        &format!("invalid summary-every value '{}'", value),
+                    )
+                })?;
+            }
+            "summary-model" => self.summary_model = Some(value.to_string()),
+            "summary-thinking" => {
+                self.summary_thinking = parse_thinking(value, path, line_num)?;
+            }
+            "summary-queue-limit" => {
+                self.summary_queue_limit =
+                    parse_positive_u32(value, path, line_num, "summary-queue-limit")?
+            }
             "metrics-dir" => self.metrics_dir = Some(value.to_string()),
             "metrics" => match value.trim() {
                 "on" => self.metrics_enabled = true,
@@ -295,6 +327,10 @@ impl ConfigBuilder {
             max_judge_failures: self.max_judge_failures,
             periodics,
             hooks: self.hooks,
+            summary_every: self.summary_every,
+            summary_model: self.summary_model,
+            summary_thinking: self.summary_thinking,
+            summary_queue_limit: self.summary_queue_limit,
             metrics_dir,
             metrics_enabled: self.metrics_enabled,
         })
@@ -385,5 +421,39 @@ mod tests {
             err.contains("thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max'"),
             "error should list valid levels, got: {err}"
         );
+    }
+
+    #[test]
+    fn summary_defaults_are_twelve_blocks_and_four_queued() {
+        let config = load_with_thinking("off").expect("config loads");
+        assert_eq!(config.summary_every, 12);
+        assert_eq!(config.summary_queue_limit, 4);
+        assert_eq!(config.summary_model, None);
+        assert_eq!(config.summary_thinking, Thinking::Off);
+    }
+
+    #[test]
+    fn summary_settings_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("yoke.conf");
+        fs::write(
+            &path,
+            "allow .\nsummary-every 0\nsummary-model cheap/model\nsummary-thinking low\nsummary-queue-limit 2\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("summary config");
+        assert_eq!(config.summary_every, 0);
+        assert_eq!(config.summary_model.as_deref(), Some("cheap/model"));
+        assert_eq!(config.summary_thinking, Thinking::Low);
+        assert_eq!(config.summary_queue_limit, 2);
+    }
+
+    #[test]
+    fn summary_queue_limit_rejects_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("yoke.conf");
+        fs::write(&path, "allow .\nsummary-queue-limit 0\n").unwrap();
+        let err = Config::load(&path).expect_err("zero limit should fail");
+        assert!(err.contains("summary-queue-limit must be > 0"), "{err}");
     }
 }

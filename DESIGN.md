@@ -223,3 +223,42 @@ Properties:
 - Initial value of X and initial summary model.
 
 These are implementation details; the behavior above is the contract.
+
+## 12. Implementation notes
+
+The contract above is implemented with these choices:
+
+- **Summary transport:** `yoke run --summary-fd N` (or `YOKE_SUMMARY_FD`)
+  writes NDJSON to an inherited descriptor. The OMP extension passes fd 3.
+  Records are `run_start`, `summary`, and `run_end`; the descriptor is
+  close-on-exec so summarizer children do not inherit it. No summary bytes go
+  to stdout, stderr, or `.loop/runs/`.
+- **Block boundary:** a completed text block, thinking block, or executed tool
+  call (`text_end`, `thinking_end`, `tool_execution_end`). `toolcall_end` is
+  grouped with the tool execution it describes.
+- **Cadence and queue:** `summary-every` defaults to 12 blocks, and
+  `summary-queue-limit` defaults to 4 outstanding batches. Batch depth counts
+  the batch currently being summarized. Config keys are `summary-every`,
+  `summary-model`, `summary-thinking`, and `summary-queue-limit`.
+- **Summarizer:** a separate `omp --mode text --no-session --no-tools`
+  invocation using `summary-model` and `summary-thinking`, never the worker
+  model or session.
+- **Pause:** OMP RPC has no pause command (only `abort`/`resume`, which cancel
+  the active turn). Yoke therefore stops the RPC worker's process group with
+  `SIGSTOP` after a block boundary and continues it with `SIGCONT`. This also
+  freezes tool children. The process, session, pipes, and filesystem state
+  survive. On resume, protected files are re-snapshotted into the iteration
+  backup before the next restore. With `image` sandboxing the docker client is
+  frozen; container-side processes may continue until the client resumes.
+- **Control surface:** the existing Unix socket gains `pause`, `resume`, and
+  `stop` alongside `inject`; the CLI exposes the same commands. The extension
+  in `extensions/yoke.ts` exposes the five-action `yoke` tool and consumes the
+  side stream live; final results come from `run.json` when the child exits.
+  Set `YOKE_BIN` when `yoke` is not on the supervising session's `PATH`.
+- **Verification:** `tests/summary_stream.rs` covers cadence, side-stream
+  isolation, backpressure pause/resume, and no dropped batches;
+  `tests/pause_resume.rs` covers block-boundary freeze, same-process resume,
+  paused steering, and paused edits surviving restore. The extension loads in
+  a real OMP RPC session, its `yoke` tool appears in the tool prompt, and a
+  full outer-OMP start/pause/edit/resume/inject/stop cycle completed with the
+  paused edit surviving into the final artifacts.

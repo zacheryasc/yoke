@@ -228,6 +228,18 @@ fn print_usage() {
         BOLD, RESET
     );
     eprintln!(
+        "  {}pause{}            Freeze an active run at the next block boundary",
+        BOLD, RESET
+    );
+    eprintln!(
+        "  {}resume{}           Continue a paused run in place",
+        BOLD, RESET
+    );
+    eprintln!(
+        "  {}stop{}             End an active run gracefully",
+        BOLD, RESET
+    );
+    eprintln!(
         "  {}stats{}            Inspect persisted run metrics (~/.yoke/metrics/)",
         BOLD, RESET
     );
@@ -264,7 +276,7 @@ fn print_run_help() {
     eprintln!("{}{}[yoke run]{} execute the loop", ORANGE, BOLD, RESET);
     eprintln!();
     eprintln!(
-        "{}USAGE:{} yoke run [--dry-run] [--no-sandbox]\\n       yoke inject [--shutdown] <message>",
+        "{}USAGE:{} yoke run [--dry-run] [--no-sandbox] [--summary-fd N]\n       yoke pause | resume | stop\n       yoke inject [--shutdown] <message>",
         BOLD, RESET
     );
     eprintln!();
@@ -272,6 +284,7 @@ fn print_run_help() {
     eprintln!("  --dry-run       Run one iteration without invoking OMP");
     eprintln!("                  (boundary check + configured guards only)");
     eprintln!("  --no-sandbox    Accepted for compatibility; OMP runs locally when image is unset");
+    eprintln!("  --summary-fd N  Write summary NDJSON records to inherited fd N");
     eprintln!();
     eprintln!("{}WORKFLOW:{}", BOLD, RESET);
     eprintln!("  1. Load config from {}", CONF_PATH);
@@ -365,6 +378,25 @@ fn preflight() {
     ensure_archive_dir();
 }
 
+/// Copy protected files into an existing backup directory. Used both at run
+/// start and when a paused run resumes, so paused edits become the new
+/// restore point instead of being clobbered by the next iteration.
+pub(crate) fn snapshot_files_to<S: AsRef<str>>(backup_dir: &Path, files: &[S]) -> bool {
+    let mut ok = true;
+    for path in files {
+        let path = path.as_ref();
+        let src = Path::new(path);
+        if src.exists() {
+            let dest = backup_dir.join(src.file_name().unwrap());
+            if let Err(e) = fs::copy(src, &dest) {
+                log_error(&format!("failed to snapshot {}: {}", path, e));
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
 /// Copy the given files to a backup directory inside .loop/. Returns the backup path.
 fn backup_files(files: &[&str]) -> PathBuf {
     let backup_dir = PathBuf::from(format!(".loop/backups-{}", process::id()));
@@ -372,15 +404,8 @@ fn backup_files(files: &[&str]) -> PathBuf {
         log_error(&format!("failed to create backup dir: {}", e));
         process::exit(1);
     }
-    for path in files {
-        let src = Path::new(path);
-        if src.exists() {
-            let dest = backup_dir.join(src.file_name().unwrap());
-            if let Err(e) = fs::copy(src, &dest) {
-                log_error(&format!("failed to backup {}: {}", path, e));
-                process::exit(1);
-            }
-        }
+    if !snapshot_files_to(&backup_dir, files) {
+        process::exit(1);
     }
     backup_dir
 }
@@ -1536,6 +1561,7 @@ fn run_plan_loop(
     log(&format!("Backups in {}", backup_dir.display()));
 
     let mut runner = LoopRunner::new(backup_dir);
+    supervisor.set_snapshot_target(&runner.backup_dir, &protected);
     let mut iteration: u32 = 0;
     let mut total_cost: f64 = 0.0;
     let mut consecutive_judge_failures: u32 = 0;
@@ -1795,6 +1821,8 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
         run_artifacts.snapshot(path);
     }
 
+    supervisor.start_summary(&config, run_artifacts.run_id(), run_artifacts.dir());
+
     let result = run_brute_core(
         &config,
         dry_run,
@@ -1802,8 +1830,10 @@ fn run_brute_inner(dry_run: bool, supervisor: &mut runtime::RunSupervisor) -> Br
         &mut run_artifacts,
         supervisor,
     );
-    recorder.set_outcome(brute_outcome_label(&result));
-    run_artifacts.finish(brute_outcome_label(&result));
+    let outcome = brute_outcome_label(&result);
+    recorder.set_outcome(outcome);
+    supervisor.finish_summary(outcome);
+    run_artifacts.finish(outcome);
     result
 }
 
@@ -2280,6 +2310,45 @@ fn cmd_inject(args: &[String]) -> ! {
     }
 }
 
+fn cmd_control(args: &[String], action: &str) -> ! {
+    if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
+        eprintln!("{}USAGE:{} yoke {action}", BOLD, RESET);
+        process::exit(0);
+    }
+    if let Some(arg) = args.get(2) {
+        log_error(&format!("unexpected argument '{}'", arg));
+        process::exit(2);
+    }
+    let response = match action {
+        "pause" => runtime::send_pause_command(runtime::YOKE_SOCKET_PATH),
+        "resume" => runtime::send_resume_command(runtime::YOKE_SOCKET_PATH),
+        "stop" => runtime::send_stop_command(runtime::YOKE_SOCKET_PATH),
+        _ => unreachable!(),
+    };
+    match response {
+        Ok(response) if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
+            let status = response
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("accepted");
+            log(&format!("{} {}", action, status));
+            process::exit(0);
+        }
+        Ok(response) => {
+            let error = response
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("active run rejected control request");
+            log_error(error);
+            process::exit(1);
+        }
+        Err(e) => {
+            log_error(&e);
+            process::exit(1);
+        }
+    }
+}
+
 fn cmd_run(args: &[String]) -> ! {
     if args.get(2).is_some_and(|a| a == "--help" || a == "-h") {
         print_run_help();
@@ -2298,11 +2367,18 @@ fn cmd_run(args: &[String]) -> ! {
             }
         }
     }
+    if summary_fd.is_none()
+        && let Ok(raw) = std::env::var("YOKE_SUMMARY_FD")
+        && let Ok(fd) = raw.parse::<i32>()
+    {
+        summary_fd = Some(fd);
+    }
     if let Err(e) = Config::load(Path::new(CONF_PATH)) {
         log_error(&e);
         process::exit(1);
     }
     let mut supervisor = runtime::RunSupervisor::new();
+    supervisor.set_summary_fd(summary_fd);
     let code = run_brute(dry_run, &mut supervisor);
     drop(supervisor);
     process::exit(code)
@@ -2324,6 +2400,9 @@ fn main() {
         "layer" => cmd_layer(&args),
         "run" => cmd_run(&args),
         "inject" => cmd_inject(&args),
+        "pause" => cmd_control(&args, "pause"),
+        "resume" => cmd_control(&args, "resume"),
+        "stop" => cmd_control(&args, "stop"),
         "stats" => cmd_stats(&args),
         "--help" | "-h" | "help" => {
             print_usage();
