@@ -17,9 +17,10 @@ flag is needed. Set `YOKE_BIN` to the executable path if `yoke` isn't on `PATH`.
 
 Initialize the project's loop with `yoke init`. Live summaries default to
 `deepseek/deepseek-flash`. Set `summary-model` in `.loop/yoke.conf` to override
-it, or set `summary-every 0` to disable summaries. The `yoke` tool can `start`,
-`pause`, `resume`, `inject` steering, and `stop` a run. Summaries and the final
-result appear as session messages; artifacts are under `.loop/runs/<run-id>/`.
+it, or set `summary-every 0` to disable summaries. In OMP, use the `yoke` tool,
+not the shell CLI, to `start`, `pause`, `resume`, `inject` steering, or `stop`.
+After `start`, end your turn without polling. Summaries and the final result
+wake the session; artifacts are under `.loop/runs/<run-id>/`.
 Yoke's worker and judge sessions don't get the supervisor tool.
 
 ## Choose the judge's thinking level

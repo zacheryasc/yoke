@@ -236,8 +236,7 @@ export default function (pi: ExtensionAPI) {
 		name: "yoke",
 		label: "Yoke",
 		description:
-			"Drive a yoke brute run. Actions: start, pause, resume, inject, stop. " +
-			"Summaries arrive automatically as messages; inspect .loop/runs/<run-id>/ for details.",
+			"In OMP, use this tool—not the shell CLI—to start and steer Yoke. After start, end your turn; summaries wake you. Use inject if the worker drifts.",
 		parameters: z.object({
 			action: z.enum(["start", "pause", "resume", "inject", "stop"]),
 			message: z.string().optional(),
@@ -317,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `Started yoke run ${info.runId}. Artifacts: ${info.artifacts || "(none)"}. Summaries arrive as messages.`,
+								text: `Started Yoke run ${info.runId}. Artifacts: ${info.artifacts || "(none)"}. End your turn without polling; summaries and the final result will wake you. Act only on updates for this run ID.`,
 							},
 						],
 						details: info,
