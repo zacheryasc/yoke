@@ -230,8 +230,8 @@ fn resolve_stash_entry<'a>(entries: &'a [StashEntry], target_hash: &str) -> Opti
     }
 }
 
-/// Auto-stash current state, then replace `.loop/` files with those from `entry_dir`.
-fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
+/// Auto-stash current state, then replace `.loop/` files with a loaded snapshot.
+fn swap_loop_files(restored_files: Vec<(String, Vec<u8>)>, mode: &str) -> Result<(), String> {
     let current_files = collect_stashable_files();
     if !current_files.is_empty() {
         let hash = stash_snapshot(mode, &current_files)?;
@@ -241,12 +241,10 @@ fn swap_loop_files(entry_dir: &Path, mode: &str) -> Result<(), String> {
         ));
     }
 
-    for (name, _) in &collect_stashable_files() {
+    for (name, _) in current_files {
         let _ = fs::remove_file(Path::new(".loop").join(name));
     }
 
-    let mut restored_files = Vec::new();
-    collect_regular_files(&mut restored_files, entry_dir, "", false);
     for (name, contents) in restored_files {
         let dest = Path::new(".loop").join(&name);
         if let Some(parent) = dest.parent() {
@@ -277,12 +275,26 @@ pub(crate) fn stash_checkout(target_hash: &str, mode: &str) -> i32 {
     };
 
     let entry_dir = stash_base_dir().join(&target.hash);
-    if !entry_dir.exists() {
-        log_error("stash entry directory missing — index is corrupt");
+    if !entry_dir.is_dir() {
+        log_error("stash entry is missing or is not a directory");
+        return 1;
+    }
+    let mut restored_files = Vec::new();
+    collect_regular_files(&mut restored_files, &entry_dir, "", false);
+    restored_files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // Compare the index's comma-separated representation, including names
+    // that themselves contain commas.
+    if restored_files.is_empty()
+        || restored_files
+            .iter()
+            .flat_map(|(name, _)| name.split(','))
+            .ne(target.files.iter().map(String::as_str))
+    {
+        log_error("stash entry files do not match the index");
         return 1;
     }
 
-    if let Err(msg) = swap_loop_files(&entry_dir, mode) {
+    if let Err(msg) = swap_loop_files(restored_files, mode) {
         log_error(&msg);
         return 1;
     }
@@ -310,7 +322,7 @@ pub(crate) fn print_stash_help() {
          {BOLD}SUBCOMMANDS:{RESET}\n  \
          {BOLD}(none){RESET}           Snapshot .loop/ files to stash, then clear the directory\n  \
          {BOLD}log{RESET}              List all stash entries (hash, timestamp, mode, files)\n  \
-         {BOLD}checkout <hash>{RESET}  Auto-stash current state, then restore target entry\n  \
+         {BOLD}checkout <hash>{RESET}  Validate the target snapshot, then auto-stash and restore\n  \
          {BOLD}pop{RESET}              Alias for checkout of the most recent entry\n\n\
          Storage: ~/.yoke/stash/<project-slug>/\n\n\
          {BOLD}EXAMPLES:{RESET}\n  \

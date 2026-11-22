@@ -72,6 +72,34 @@ fn stash_roundtrip_after_extraction() {
 }
 
 #[test]
+fn stash_checkout_preserves_working_files_when_snapshot_is_corrupt() {
+    let p = Project::new();
+    ok!(&p.run(&["init"]), "yoke init");
+    ok!(&p.run(&["stash"]), "yoke stash");
+    let stash = stash_dir(&p);
+    let index = fs::read_to_string(stash.join("index")).unwrap();
+    let hash = index.split('|').next().unwrap();
+    let snapshot = stash.join(hash);
+    p.write(".loop/notes.md", "Keep these working notes.\n");
+
+    fs::remove_file(snapshot.join("notes.md")).unwrap();
+    let out = p.run(&["stash", "checkout", hash]);
+    failed!(&out, "checkout of an incomplete snapshot");
+    assert_eq!(p.read(".loop/notes.md"), "Keep these working notes.\n");
+    assert!(
+        !p.exists(".loop/plan.md"),
+        "must not restore a partial snapshot"
+    );
+
+    fs::remove_dir_all(&snapshot).unwrap();
+    fs::write(&snapshot, b"not a directory").unwrap();
+    let out = p.run(&["stash", "checkout", hash]);
+    failed!(&out, "checkout of a non-directory snapshot");
+    assert_eq!(p.read(".loop/notes.md"), "Keep these working notes.\n");
+    assert_eq!(fs::read_to_string(stash.join("index")).unwrap(), index);
+}
+
+#[test]
 fn plan_loop_exits_on_status_done() {
     let p = Project::new();
     seed_loop(&p, "allow .\n");
