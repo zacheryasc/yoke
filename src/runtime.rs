@@ -714,7 +714,8 @@ struct OmpRpcWorker {
 
 impl OmpRpcWorker {
     fn start(config: &Config) -> Result<Self, String> {
-        let mut cmd = crate::omp_command(config, "rpc", config.thinking);
+        let mut cmd =
+            crate::omp_command(config, "rpc", config.thinking.map(|level| level.as_omp_arg()));
         // Own process group: pause can freeze tool children along with the
         // RPC process, and Ctrl+C can terminate the whole tree.
         cmd.process_group(0);

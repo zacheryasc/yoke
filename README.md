@@ -23,13 +23,12 @@ Yoke's worker and judge sessions don't get the supervisor tool.
 
 ## Choose the judge's thinking level
 
-In `.loop/yoke.conf`:
+To override the judge only, add this optional line to `.loop/yoke.conf`:
 
 ```text
-thinking       low
-judge-thinking high
+judge-thinking auto
 ```
 
-`judge-thinking` accepts `off`, `low`, `medium`, `high`, `xhigh`, or `max`.
-If omitted, the judge inherits `thinking`; if both are omitted, omp chooses
-its default. The override does not change the worker or periodic agents.
+Yoke passes the value through to `omp --thinking`. If omitted, the judge
+inherits `thinking`; if both are omitted, omp chooses its default. The
+override does not change the worker or periodic agents.

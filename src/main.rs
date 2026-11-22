@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 
-use config::{Config, Periodic, Thinking};
+use config::{Config, Periodic};
 
 const CONF_PATH: &str = ".loop/yoke.conf";
 const NOTES_PATH: &str = ".loop/notes.md";
@@ -392,7 +392,7 @@ fn build_docker_omp_command(image: &str) -> Command {
 }
 
 /// Build the shared native or container command for OMP's JSON and RPC modes.
-pub(crate) fn omp_command(config: &Config, mode: &str, thinking: Option<Thinking>) -> Command {
+pub(crate) fn omp_command(config: &Config, mode: &str, thinking: Option<&str>) -> Command {
     let mut command = match config.image.as_deref() {
         Some(image) => build_docker_omp_command(image),
         None => Command::new("omp"),
@@ -403,7 +403,7 @@ pub(crate) fn omp_command(config: &Config, mode: &str, thinking: Option<Thinking
         command.args(["--model", model]);
     }
     if let Some(thinking) = thinking {
-        command.args(["--thinking", thinking.as_omp_arg()]);
+        command.args(["--thinking", thinking]);
     }
     command
 }
@@ -424,7 +424,7 @@ pub(crate) struct AgentRunStats {
 fn invoke_process(
     runner: &mut LoopRunner,
     config: &Config,
-    thinking: Option<Thinking>,
+    thinking: Option<&str>,
     prompt: &str,
     label: &str,
     log_prefix: &str,
@@ -622,7 +622,10 @@ VERDICT: FAIL
     if !invoke_process(
         runner,
         config,
-        config.judge_thinking.or(config.thinking),
+        config
+            .judge_thinking
+            .as_deref()
+            .or_else(|| config.thinking.map(|level| level.as_omp_arg())),
         judge_prompt,
         "judge",
         "judge",
@@ -919,7 +922,7 @@ fn fire_periodic_agents(runner: &mut LoopRunner, config: &Config, iteration: u32
             if !invoke_process(
                 runner,
                 config,
-                config.thinking,
+                config.thinking.map(|level| level.as_omp_arg()),
                 &prompt,
                 &periodic.name,
                 &format!("periodic-{}", periodic.name),

@@ -36,12 +36,17 @@ fn default_backend_invokes_omp_with_model_and_thinking() {
 
 #[test]
 fn judge_thinking_overrides_worker_thinking_only_for_judge() {
-    for (override_config, expected_judge) in [("", "xhigh"), ("judge-thinking off\n", "off")] {
+    for (settings, expected_worker, expected_judge) in [
+        ("", None, None),
+        ("thinking xhigh\n", Some("xhigh"), Some("xhigh")),
+        (
+            "thinking xhigh\njudge-thinking auto\n",
+            Some("xhigh"),
+            Some("auto"),
+        ),
+    ] {
         let p = Project::new();
-        seed_loop(
-            &p,
-            &format!("metrics off\nallow .\nthinking xhigh\n{override_config}"),
-        );
+        seed_loop(&p, &format!("metrics off\nallow .\n{settings}"));
         let path = install_mock(&p, MOCK);
         let out = p.run_env(&["run"], &[("PATH", &path)]);
         ok!(&out, "yoke run");
@@ -53,11 +58,15 @@ fn judge_thinking_overrides_worker_thinking_only_for_judge() {
             .split_once("\nCALL\n")
             .unwrap();
         has!(worker, "--mode\nrpc", "worker argv");
-        has!(worker, "--thinking\nxhigh", "worker argv");
+        assert_eq!(
+            worker.lines().skip_while(|arg| *arg != "--thinking").nth(1),
+            expected_worker,
+            "worker argv: {worker}"
+        );
         has!(judge, "Read .loop/judge.md.", "judge argv");
         assert_eq!(
             judge.lines().skip_while(|arg| *arg != "--thinking").nth(1),
-            Some(expected_judge),
+            expected_judge,
             "judge argv: {judge}"
         );
     }
