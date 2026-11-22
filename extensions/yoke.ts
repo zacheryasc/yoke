@@ -1,7 +1,6 @@
 // Yoke extension for an outer OMP session.
 //
-// Load it in the supervising session:
-//   omp -e /path/to/yoke/extensions/yoke.ts
+// Link the package with `omp plugin link .` from the Yoke checkout.
 // Set YOKE_BIN if the yoke binary is not on PATH. The project's
 // `.loop/yoke.conf` must set `summary-model` to enable live summaries.
 //
@@ -88,6 +87,9 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Do not offer the supervisor tool to Yoke's own workers and judges.
+	if (process.env.YOKE_CHILD_OMP === "1") return;
+
 	const z = pi.zod;
 	let active: ActiveRun | undefined;
 	let shuttingDown = false;

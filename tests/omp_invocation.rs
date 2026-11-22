@@ -33,3 +33,32 @@ fn default_backend_invokes_omp_with_model_and_thinking() {
         "rpc stdin"
     );
 }
+
+#[test]
+fn judge_thinking_overrides_worker_thinking_only_for_judge() {
+    for (override_config, expected_judge) in [("", "xhigh"), ("judge-thinking off\n", "off")] {
+        let p = Project::new();
+        seed_loop(
+            &p,
+            &format!("metrics off\nallow .\nthinking xhigh\n{override_config}"),
+        );
+        let path = install_mock(&p, MOCK);
+        let out = p.run_env(&["run"], &[("PATH", &path)]);
+        ok!(&out, "yoke run");
+
+        let argv = p.read(".loop/.omp-argv");
+        let (worker, judge) = argv
+            .strip_prefix("CALL\n")
+            .unwrap()
+            .split_once("\nCALL\n")
+            .unwrap();
+        has!(worker, "--mode\nrpc", "worker argv");
+        has!(worker, "--thinking\nxhigh", "worker argv");
+        has!(judge, "Read .loop/judge.md.", "judge argv");
+        assert_eq!(
+            judge.lines().skip_while(|arg| *arg != "--thinking").nth(1),
+            Some(expected_judge),
+            "judge argv: {judge}"
+        );
+    }
+}

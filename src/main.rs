@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 
-use config::{Config, Periodic};
+use config::{Config, Periodic, Thinking};
 
 const CONF_PATH: &str = ".loop/yoke.conf";
 const NOTES_PATH: &str = ".loop/notes.md";
@@ -358,7 +358,7 @@ fn build_docker_omp_command(image: &str) -> Command {
         "--cap-add=NET_ADMIN",
         "--cap-add=NET_RAW",
     ]);
-    c.args(["--entrypoint", "omp"]);
+    c.args(["--entrypoint", "omp", "--env", "YOKE_CHILD_OMP"]);
     c.arg("-v")
         .arg(format!("{}:/workspace", workdir.to_string_lossy()));
     c.arg("-w").arg("/workspace");
@@ -392,16 +392,17 @@ fn build_docker_omp_command(image: &str) -> Command {
 }
 
 /// Build the shared native or container command for OMP's JSON and RPC modes.
-pub(crate) fn omp_command(config: &Config, mode: &str) -> Command {
+pub(crate) fn omp_command(config: &Config, mode: &str, thinking: Option<Thinking>) -> Command {
     let mut command = match config.image.as_deref() {
         Some(image) => build_docker_omp_command(image),
         None => Command::new("omp"),
     };
+    command.env("YOKE_CHILD_OMP", "1");
     command.args(["--mode", mode, "--auto-approve"]);
     if let Some(model) = config.model.as_deref() {
         command.args(["--model", model]);
     }
-    if let Some(thinking) = config.thinking {
+    if let Some(thinking) = thinking {
         command.args(["--thinking", thinking.as_omp_arg()]);
     }
     command
@@ -423,6 +424,7 @@ pub(crate) struct AgentRunStats {
 fn invoke_process(
     runner: &mut LoopRunner,
     config: &Config,
+    thinking: Option<Thinking>,
     prompt: &str,
     label: &str,
     log_prefix: &str,
@@ -437,7 +439,7 @@ fn invoke_process(
         iteration
     ));
 
-    let mut cmd = omp_command(config, "json");
+    let mut cmd = omp_command(config, "json", thinking);
 
     let mut child = match cmd
         .args(["-p", prompt])
@@ -617,7 +619,15 @@ VERDICT: FAIL
 <what you tested, what went wrong, and what the correct behavior should be>";
 
     // Judge is always a fresh session — independence per behavioral-specification §2.1.
-    if !invoke_process(runner, config, judge_prompt, "judge", "judge", iteration) {
+    if !invoke_process(
+        runner,
+        config,
+        config.judge_thinking.or(config.thinking),
+        judge_prompt,
+        "judge",
+        "judge",
+        iteration,
+    ) {
         return false;
     }
 
@@ -909,6 +919,7 @@ fn fire_periodic_agents(runner: &mut LoopRunner, config: &Config, iteration: u32
             if !invoke_process(
                 runner,
                 config,
+                config.thinking,
                 &prompt,
                 &periodic.name,
                 &format!("periodic-{}", periodic.name),
