@@ -79,7 +79,7 @@ for arg in "$@"; do
 done
 
 if [[ " $* " == *" --mode text "* ]]; then
-    if [[ "$*" != *"--model fake-cheap"* ]]; then
+    if [[ "$*" != *"--model ${MOCK_SUMMARY_MODEL:-fake-cheap}"* ]]; then
         echo "summarizer used wrong model" >&2
         exit 9
     fi

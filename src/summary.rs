@@ -142,9 +142,7 @@ pub struct SummaryEngine {
 }
 
 impl SummaryEngine {
-    /// Build the engine. Summaries are enabled only when a side-stream file
-    /// descriptor was supplied, `summary-every` is non-zero, and a cheap
-    /// `summary-model` is configured.
+    /// Summaries require a side-stream file descriptor and non-zero cadence.
     pub fn start(config: &Config, run_id: &str, artifacts: &Path, fd: Option<i32>) -> Self {
         let mut engine = Self {
             every: None,
@@ -178,26 +176,22 @@ impl SummaryEngine {
                 "type": "run_start",
                 "run_id": run_id,
                 "artifacts": engine.artifacts,
-                "summary_every": config.summary_model.as_ref().map(|_| config.summary_every),
+                "summary_every": config.summary_every,
                 "cwd": std::env::current_dir().ok(),
             }),
         );
         engine.writer = Some(Arc::clone(&writer));
 
-        let Some(model) = config.summary_model.as_ref() else {
-            if config.summary_every > 0 {
-                log_error(
-                    "summary side stream is open but summary-model is not set; summaries disabled",
-                );
-            }
-            return engine;
-        };
         if config.summary_every == 0 {
             return engine;
         }
         let queue = Arc::clone(&engine.queue);
         let settings = SummarySettings {
-            model: model.clone(),
+            model: config
+                .summary_model
+                .as_deref()
+                .unwrap_or("deepseek/deepseek-flash")
+                .to_owned(),
             thinking: config.summary_thinking,
         };
         let (sender, receiver) = mpsc::channel();

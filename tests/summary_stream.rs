@@ -9,10 +9,7 @@ use std::process::Stdio;
 #[test]
 fn summaries_arrive_on_the_side_stream_in_block_batches() {
     let p = Project::new();
-    seed_loop(
-        &p,
-        "metrics off\nallow .\nsummary-every 2\nsummary-model fake-cheap\nsummary-thinking off\nsummary-queue-limit 4\n",
-    );
+    seed_loop(&p, "metrics off\nallow .\nsummary-every 2\n");
     let path = install_mock(&p, MOCK);
     let log_path = p.path_of(".loop/run.log");
     let (mut child, stream) = spawn_with_summary(
@@ -21,6 +18,7 @@ fn summaries_arrive_on_the_side_stream_in_block_batches() {
             ("PATH", &path),
             ("MOCK_WORKER", "summary"),
             ("MOCK_SUMMARY", "inspect"),
+            ("MOCK_SUMMARY_MODEL", "deepseek/deepseek-flash"),
         ],
         Stdio::from(fs::File::create(&log_path).unwrap()),
     );
@@ -105,4 +103,21 @@ fn slow_summaries_pause_the_worker_and_resume_when_drained() {
         summaries >= 6,
         "no summarizer work should be dropped, got {summaries}: {records:?}"
     );
+}
+
+#[test]
+fn zero_cadence_disables_default_summaries_but_keeps_lifecycle_records() {
+    let p = Project::new();
+    seed_loop(&p, "metrics off\nallow .\nsummary-every 0\n");
+    let path = install_mock(&p, MOCK);
+    let (mut child, stream) = spawn_with_summary(
+        &p,
+        &[("PATH", &path), ("MOCK_WORKER", "summary")],
+        Stdio::null(),
+    );
+    let records = summary_records(stream);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(records.first().unwrap()["type"], "run_start");
+    assert_eq!(records.last().unwrap()["type"], "run_end");
+    lacks!(&p.read(".loop/.omp-argv"), "--mode\ntext", "omp calls");
 }

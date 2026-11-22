@@ -62,7 +62,7 @@ pub struct Config {
     pub hooks: Vec<String>,
     /// Summarize every N parsed blocks. 0 disables the summary stream.
     pub summary_every: u32,
-    /// Cheap model used only for summaries. Summaries are disabled without it.
+    /// Optional override for the built-in summary model.
     pub summary_model: Option<String>,
     pub summary_thinking: Thinking,
     /// Pause the worker when this many summary batches are outstanding.
