@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Parameterized mock `omp` used by the integration tests.
 # Behavior is selected by env vars set on the yoke invocation:
-#   MOCK_JUDGE=pass|fail|fail-first|fail-always|no-verdict
+#   MOCK_JUDGE=pass|fail|fail-first|fail-always
+#   MOCK_JUDGE_SEQUENCE="check:first pass crash missing malformed no-id check:second"
+#   MOCK_WORKER_REPEAT=1 keeps the RPC worker available for more prompts.
 #   MOCK_WORKER=done|cost|patch|await-steer|pause|summary|slow-summary|model-error
 #   MOCK_SET_MODEL=accept|reject
 #   MOCK_STEER=accept|reject
@@ -23,14 +25,30 @@ bump() {
 }
 
 pass_judge() { printf 'VERDICT: PASS\n\nmock judge okay\n' > .loop/verdict.md; }
-fail_judge() { printf 'VERDICT: FAIL\n\nmock judge feedback\n' > .loop/verdict.md; }
+fail_judge() {
+    printf 'VERDICT: FAIL\nFAILURE-ID: %s\n\nmock judge feedback %s\n' \
+        "${1:-mock:check-failed}" "${2:-}" > .loop/verdict.md
+}
 
 judge() {
+    if [[ -n "${MOCK_JUDGE_SEQUENCE:-}" ]]; then
+        local sequence attempt
+        read -ra sequence <<< "$MOCK_JUDGE_SEQUENCE"
+        attempt=$(bump .loop/.judge-count)
+        case "${sequence[attempt-1]:-pass}" in
+            pass) pass_judge ;;
+            crash) pass_judge; exit 1 ;;
+            missing) : ;;
+            malformed) printf 'VERDICT: PASSING\n' > .loop/verdict.md ;;
+            no-id) printf 'VERDICT: FAIL\n' > .loop/verdict.md ;;
+            *) fail_judge "${sequence[attempt-1]}" "$attempt" ;;
+        esac
+        return
+    fi
     case "${MOCK_JUDGE:-pass}" in
         fail) fail_judge ;;
         fail-first) if [[ $(bump .loop/.judge-count) -eq 1 ]]; then fail_judge; else pass_judge; fi ;;
         fail-always) bump .loop/.judge-count >/dev/null; fail_judge ;;
-        no-verdict) : ;;
         *) pass_judge ;;
     esac
 }
@@ -164,7 +182,7 @@ while IFS= read -r line; do
             *)
                 stream
                 complete "$id"
-                exit 0
+                if [[ "${MOCK_WORKER_REPEAT:-}" != 1 ]]; then exit 0; fi
                 ;;
         esac
     elif [[ "$line" == *'"type":"set_model"'* ]]; then

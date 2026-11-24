@@ -604,9 +604,24 @@ fn render_judge_banner(pass: bool, content: &str) {
     eprintln!();
 }
 
+enum JudgeVerdict {
+    Pass,
+    Fail(String),
+    InvocationError,
+}
+
+fn judge_invocation_error(reason: &str) -> JudgeVerdict {
+    log_error(&format!(
+        "Judge invocation error: {reason}. Failure streak unchanged."
+    ));
+    if let Err(e) = fs::write(VERDICT_PATH, format!("JUDGE ERROR: {reason}\n")) {
+        log_error(&format!("failed to record judge invocation error: {e}"));
+    }
+    JudgeVerdict::InvocationError
+}
+
 /// Invoke the judge — a fresh agent with zero implementation context.
-/// Returns true if the judge's verdict is PASS.
-fn invoke_judge(runner: &mut LoopRunner, config: &Config, iteration: u32) -> bool {
+fn invoke_judge(runner: &mut LoopRunner, config: &Config, iteration: u32) -> JudgeVerdict {
     let judge_prompt = "\
 Read .loop/judge.md. It describes what to verify.
 Test the feature exactly as described. You have full shell access.
@@ -619,16 +634,20 @@ VERDICT: PASS
 or
 
 VERDICT: FAIL
+FAILURE-ID: <check>:<failure-mode>
 
-<what you tested, what went wrong, and what the correct behavior should be>";
+<what you tested, what went wrong, and what the correct behavior should be>
+
+Use a stable FAILURE-ID for the same failed check and failure mode across retries.
+Use lowercase ASCII letters, digits, hyphens, underscores, dots and colons only.
+Do not include changing details such as line numbers, timestamps or actual output.";
 
     // Judge is always a fresh session — independence per behavioral-specification §2.1.
-    if let Err(e) = fs::write(
-        VERDICT_PATH,
-        "VERDICT: FAIL\n\nThe current judge has not recorded a verdict.\n",
-    ) {
-        log_error(&format!("failed to invalidate previous verdict: {e}"));
-        return false;
+    if let Err(e) = fs::write(VERDICT_PATH, "") {
+        log_error(&format!(
+            "Judge invocation error: failed to invalidate previous verdict: {e}"
+        ));
+        return JudgeVerdict::InvocationError;
     }
     let cmd = omp_command(
         config,
@@ -639,21 +658,48 @@ VERDICT: FAIL
             .as_deref()
             .or_else(|| config.thinking.map(|level| level.as_omp_arg())),
     );
-    if !invoke_process(runner, config, cmd, judge_prompt, "judge", "judge", iteration) {
-        return false;
+    if !invoke_process(
+        runner,
+        config,
+        cmd,
+        judge_prompt,
+        "judge",
+        "judge",
+        iteration,
+    ) {
+        return judge_invocation_error("judge process did not exit successfully");
     }
 
-    // Read verdict
-    match fs::read_to_string(VERDICT_PATH) {
-        Ok(content) => {
-            let pass = content.starts_with("VERDICT: PASS");
-            render_judge_banner(pass, &content);
-            pass
+    let content = match fs::read_to_string(VERDICT_PATH) {
+        Ok(content) => content,
+        Err(e) => return judge_invocation_error(&format!("failed to read {VERDICT_PATH}: {e}")),
+    };
+    let mut lines = content.lines();
+    match lines.next() {
+        Some("VERDICT: PASS") => {
+            render_judge_banner(true, &content);
+            JudgeVerdict::Pass
         }
-        Err(e) => {
-            log_error(&format!("failed to read {}: {}", VERDICT_PATH, e));
-            false
+        Some("VERDICT: FAIL") => {
+            let Some(id) = lines
+                .next()
+                .and_then(|line| line.strip_prefix("FAILURE-ID: "))
+            else {
+                return judge_invocation_error("FAIL verdict is missing FAILURE-ID");
+            };
+            if !id.bytes().any(|b| b.is_ascii_alphanumeric())
+                || !id.bytes().all(|b| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || matches!(b, b'-' | b'_' | b'.' | b':')
+                })
+            {
+                return judge_invocation_error("FAIL verdict has an invalid FAILURE-ID");
+            }
+            render_judge_banner(false, &content);
+            JudgeVerdict::Fail(id.to_owned())
         }
+        _ => judge_invocation_error("judge did not write a valid verdict"),
     }
 }
 
@@ -817,19 +863,40 @@ enum RunOutcome {
     Error,
 }
 
-/// Check if consecutive judge failures have hit the bail threshold.
-/// Returns true if the loop should bail out.
-fn is_judge_bailout(consecutive: u32, max: u32) -> bool {
-    if consecutive >= max {
-        eprintln!();
-        eprintln!(
-            "{}{}  {} consecutive judge FAILs \u{2014} bailing out  {}",
-            RED, BOLD, max, RESET
-        );
-        eprintln!();
-        true
-    } else {
-        false
+#[derive(Default)]
+struct JudgeFailureStreak {
+    id: String,
+    count: u32,
+}
+
+impl JudgeFailureStreak {
+    fn observe(&mut self, verdict: JudgeVerdict, max: u32) -> Option<RunOutcome> {
+        match verdict {
+            JudgeVerdict::Pass => {
+                *self = Self::default();
+                Some(RunOutcome::Pass)
+            }
+            JudgeVerdict::Fail(id) => {
+                if self.id == id {
+                    self.count += 1;
+                } else {
+                    *self = Self { id, count: 1 };
+                }
+                log(&format!(
+                    "{}Judge FAIL [{}] ({}/{}){}",
+                    ORANGE, self.id, self.count, max, RESET
+                ));
+                if self.count >= max {
+                    eprintln!(
+                        "\n{}{}  {} consecutive judge FAILs for [{}] — bailing out  {}\n",
+                        RED, BOLD, max, self.id, RESET
+                    );
+                    return Some(RunOutcome::Bailout);
+                }
+                None
+            }
+            JudgeVerdict::InvocationError => None,
+        }
     }
 }
 
@@ -840,7 +907,7 @@ fn evaluate_judge_every(
     config: &Config,
     iteration: u32,
     guards_passed: bool,
-    consecutive_judge_failures: &mut u32,
+    judge_failures: &mut JudgeFailureStreak,
     judge_every: u32,
     judge_secs_out: &mut Option<f64>,
 ) -> Option<RunOutcome> {
@@ -863,25 +930,17 @@ fn evaluate_judge_every(
         );
     }
     let judge_start = std::time::Instant::now();
-    let pass = invoke_judge(runner, config, iteration);
+    let verdict = invoke_judge(runner, config, iteration);
     *judge_secs_out = Some(judge_start.elapsed().as_secs_f64());
-    if pass {
-        if done {
-            return Some(RunOutcome::Pass);
-        }
-        *consecutive_judge_failures = 0;
-        return None;
+    if signal::interrupted() {
+        return Some(RunOutcome::Interrupt);
     }
-
-    *consecutive_judge_failures += 1;
-    if is_judge_bailout(*consecutive_judge_failures, config.max_judge_failures) {
-        return Some(RunOutcome::Bailout);
+    let outcome = judge_failures.observe(verdict, config.max_judge_failures);
+    if matches!(outcome, Some(RunOutcome::Bailout)) || (done && outcome.is_some()) {
+        return outcome;
     }
     if done {
-        log(&format!(
-            "{}Judge FAIL ({}/{}) \u{2014} resetting STATUS for retry{}",
-            ORANGE, *consecutive_judge_failures, config.max_judge_failures, RESET
-        ));
+        log("Resetting STATUS for retry");
         reset_notes_status();
     }
     None
@@ -1077,7 +1136,7 @@ fn run_plan_loop(
     supervisor.set_snapshot_target(&runner.backup_dir, &protected);
     let mut iteration: u32 = 0;
     let mut total_cost: f64 = 0.0;
-    let mut consecutive_judge_failures: u32 = 0;
+    let mut judge_failures = JudgeFailureStreak::default();
 
     loop {
         if signal::interrupted() {
@@ -1125,7 +1184,7 @@ fn run_plan_loop(
                 config,
                 iteration,
                 step_stats.guards_passed,
-                &mut consecutive_judge_failures,
+                &mut judge_failures,
                 judge_every,
                 &mut judge_secs,
             )
@@ -1334,7 +1393,7 @@ fn run_brute_core(
 
     let mut runner = LoopRunner::new(backup_dir);
     let mut iteration: u32 = 0;
-    let mut consecutive_failures: u32 = 0;
+    let mut judge_failures = JudgeFailureStreak::default();
 
     loop {
         if signal::interrupted() {
@@ -1393,41 +1452,32 @@ fn run_brute_core(
             &format!("Invoking judge (attempt {:>4})", iteration),
             BLUE,
         );
-        let pass = invoke_judge(&mut runner, config, iteration);
-        run_artifacts.record_judge(iteration, pass);
+        let verdict = invoke_judge(&mut runner, config, iteration);
+        run_artifacts.record_judge(
+            iteration,
+            match &verdict {
+                JudgeVerdict::Pass => Some(true),
+                JudgeVerdict::Fail(_) => Some(false),
+                JudgeVerdict::InvocationError => None,
+            },
+        );
 
         if signal::interrupted() {
             log("Interrupted \u{2014} shutting down");
             return RunOutcome::Interrupt;
         }
 
-        if pass {
+        let outcome = judge_failures.observe(verdict, config.max_judge_failures);
+        if matches!(outcome, Some(RunOutcome::Pass)) {
             eprintln!();
             eprintln!(
                 "{}{}  Judge says PASS \u{2014} brute loop complete  {}",
                 GREEN, BOLD, RESET
             );
             eprintln!();
-            return RunOutcome::Pass;
         }
-
-        consecutive_failures += 1;
-        let max_failures = config.max_judge_failures;
-        log(&format!(
-            "{}Judge says FAIL ({}/{}) \u{2014} {}{}",
-            ORANGE,
-            consecutive_failures,
-            max_failures,
-            if consecutive_failures >= max_failures {
-                "bailing out"
-            } else {
-                "worker will see verdict next iteration"
-            },
-            RESET
-        ));
-
-        if is_judge_bailout(consecutive_failures, max_failures) {
-            return RunOutcome::Bailout;
+        if let Some(outcome) = outcome {
+            return outcome;
         }
 
         // Reset STATUS to IN_PROGRESS so the plan runner re-executes on the

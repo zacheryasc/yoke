@@ -102,7 +102,7 @@ elif echo "$PROMPT" | grep -q "judge.md"; then
     echo "$N" > "$COUNTER_FILE"
 
     if [[ "$N" -eq 1 ]]; then
-        printf 'VERDICT: FAIL\n\nFeature is broken — step counter never increments.' > .loop/verdict.md
+        printf 'VERDICT: FAIL\nFAILURE-ID: step-counter:not-incremented\n\nFeature is broken — step counter never increments.' > .loop/verdict.md
     else
         printf 'VERDICT: PASS\n\nAll checks passed.' > .loop/verdict.md
     fi
@@ -169,7 +169,8 @@ Verify the feature works.
 
 ## Verdict
 
-Write VERDICT: PASS or VERDICT: FAIL to .loop/verdict.md.
+Write VERDICT: PASS or VERDICT: FAIL to .loop/verdict.md, with a stable
+FAILURE-ID on the next line for FAIL.
 EOF
 
 cat > "$LOOP_DIR/yoke.conf" <<EOF

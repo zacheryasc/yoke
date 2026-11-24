@@ -166,8 +166,8 @@ impl RunArtifacts {
         self.capture_diff(&iter_dir.join("diff.patch"), &iter_dir.join("diffstat.txt"));
     }
 
-    /// Record a standalone judge verdict from one brute attempt.
-    pub fn record_judge(&mut self, attempt: u32, pass: bool) {
+    /// Record a standalone judge attempt; `pass` is absent on invocation errors.
+    pub fn record_judge(&mut self, attempt: u32, pass: Option<bool>) {
         if !self.enabled {
             return;
         }

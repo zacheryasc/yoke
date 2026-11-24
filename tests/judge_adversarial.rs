@@ -128,9 +128,41 @@ fn a_judge_that_writes_no_verdict_cannot_reuse_a_previous_pass() {
     seed_loop(&p, "allow .\nmax-judge-failures 1\n");
     p.write(".loop/verdict.md", "VERDICT: PASS\n\nPrevious run.\n");
     let path = install_mock(&p, MOCK);
-    let out = p.run_env(&["run"], &[("PATH", &path), ("MOCK_JUDGE", "no-verdict")]);
-    failed!(&out, "judge did not write a verdict");
-    assert!(p.read(".loop/verdict.md").starts_with("VERDICT: FAIL"));
+    let out = p.run_env(
+        &["run"],
+        &[
+            ("PATH", &path),
+            ("MOCK_JUDGE_SEQUENCE", "missing pass"),
+            ("MOCK_WITNESS", "1"),
+        ],
+    );
+    ok!(&out, "retry after missing verdict");
+    assert_eq!(p.read(".loop/.judge-count").trim(), "2");
+    assert!(p.read(".loop/.witness-2").starts_with("JUDGE ERROR:"));
+}
+
+#[test]
+fn brute_bails_only_on_repeated_failure_id() {
+    let p = Project::new();
+    seed_loop(&p, "allow .\nmax-judge-failures 2\n");
+    let path = install_mock(&p, MOCK);
+    let out = p.run_env(
+        &["run"],
+        &[
+            ("PATH", &path),
+            (
+                "MOCK_JUDGE_SEQUENCE",
+                "check:a crash missing malformed no-id check:b missing check:b",
+            ),
+        ],
+    );
+    failed!(&out, "repeated failure on the eighth judge attempt");
+    assert_eq!(p.read(".loop/.judge-count").trim(), "8");
+    has!(
+        &stderr(&out),
+        "FAILs for [check:b] — bailing out",
+        "run stderr"
+    );
 }
 
 #[test]
@@ -171,6 +203,32 @@ fn judge_every_fires_on_done_and_exits() {
     ok!(&out, "judge-every run");
     has!(&stderr(&out), "Judge (DONE)", "run stderr");
     assert!(p.read(".loop/verdict.md").starts_with("VERDICT: PASS"));
+}
+
+#[test]
+fn judge_every_pass_clears_the_failure_streak() {
+    let p = Project::new();
+    seed_loop(
+        &p,
+        "allow .\njudge-every 2\nmax-judge-failures 2\n\
+         hook if [ \"$YOKE_ITERATION\" -lt 9 ]; then echo 'STATUS: IN_PROGRESS' > .loop/notes.md; fi\n",
+    );
+    let path = install_mock(&p, MOCK);
+    let out = p.run_env(
+        &["run"],
+        &[
+            ("PATH", &path),
+            ("MOCK_WORKER_REPEAT", "1"),
+            ("MOCK_JUDGE_SEQUENCE", "check:a pass check:a check:a"),
+        ],
+    );
+    failed!(&out, "fourth checkpoint repeats the post-PASS failure");
+    assert_eq!(p.read(".loop/.judge-count").trim(), "4");
+    has!(
+        &stderr(&out),
+        "FAILs for [check:a] — bailing out",
+        "run stderr"
+    );
 }
 
 #[test]

@@ -17,5 +17,9 @@ WORKFLOW:
      a. Restore protected files, preserve verdict and guard feedback
      b. Run plan loop (stages + guards until DONE)
      c. Invoke judge (fresh OMP session, zero context)
-     d. If judge FAILs, reset STATUS and retry
-  4. Exit when judge returns VERDICT: PASS
+     d. On FAIL or judge invocation error, reset STATUS and retry
+  4. Exit on PASS or after max-judge-failures FAILs in a row for the same FAILURE-ID
+
+A FAIL verdict must include a stable FAILURE-ID on the next line, e.g.
+FAILURE-ID: checkout:duplicate-charge. A different ID starts a new streak;
+PASS clears it. Skipped checks and invalid or missing verdicts do not count.
