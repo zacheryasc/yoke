@@ -2,7 +2,7 @@
 //
 // Link the package with `omp plugin link .` from the Yoke checkout.
 // Set YOKE_BIN if the yoke binary is not on PATH. Set `summary-model` in
-// `.loop/yoke.conf` to override the default, or `summary-every 0` to opt out.
+// `.loop/yoke.conf` to override the default, or `summary-tokens 0` to opt out.
 //
 // The `yoke` tool exposes exactly: start, pause, resume, inject, stop.
 // Summaries and the final result arrive as session messages; deep inspection

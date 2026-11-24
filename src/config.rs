@@ -61,8 +61,8 @@ pub struct Config {
     pub max_judge_failures: u32,
     pub periodics: Vec<Periodic>,
     pub hooks: Vec<String>,
-    /// Summarize every N parsed blocks. 0 disables the summary stream.
-    pub summary_every: u32,
+    /// Rendered transcript token threshold. 0 disables live summaries.
+    pub summary_tokens: u32,
     /// Optional override for the built-in summary model.
     pub summary_model: Option<String>,
     pub summary_thinking: Thinking,
@@ -166,8 +166,8 @@ impl Config {
                 self.max_judge_failures = parse_positive_u32(value, path, line_num, directive)?
             }
             "periodic" => self.periodics.push(parse_periodic(value, path, line_num)?),
-            "summary-every" => {
-                self.summary_every = parse_number(value.trim(), path, line_num, directive)?
+            "summary-tokens" => {
+                self.summary_tokens = parse_number(value.trim(), path, line_num, directive)?
             }
             "summary-thinking" => self.summary_thinking = parse_thinking(value, path, line_num)?,
             "summary-queue-limit" => {
@@ -232,7 +232,7 @@ impl Default for Config {
             max_judge_failures: 3,
             periodics: Vec::new(),
             hooks: Vec::new(),
-            summary_every: 12,
+            summary_tokens: 1024,
             summary_model: None,
             summary_thinking: Thinking::Off,
             summary_queue_limit: 4,
@@ -340,9 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn summary_defaults_are_twelve_blocks_and_four_queued() {
+    fn summary_defaults_to_1024_tokens_and_four_queued() {
         let config = load_fixture("allow .\nthinking off\n").expect("config loads");
-        assert_eq!(config.summary_every, 12);
+        assert_eq!(config.summary_tokens, 1024);
         assert_eq!(config.summary_queue_limit, 4);
         assert_eq!(config.summary_model, None);
         assert_eq!(config.summary_thinking, Thinking::Off);
@@ -351,9 +351,9 @@ mod tests {
     #[test]
     fn summary_settings_parse() {
         let config = load_fixture(
-            "allow .\nsummary-every 0\nsummary-model cheap/model\nsummary-thinking low\nsummary-queue-limit 2\n",
+            "allow .\nsummary-tokens 0\nsummary-model cheap/model\nsummary-thinking low\nsummary-queue-limit 2\n",
         ).expect("summary config");
-        assert_eq!(config.summary_every, 0);
+        assert_eq!(config.summary_tokens, 0);
         assert_eq!(config.summary_model.as_deref(), Some("cheap/model"));
         assert_eq!(config.summary_thinking, Thinking::Low);
         assert_eq!(config.summary_queue_limit, 2);

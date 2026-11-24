@@ -13,6 +13,7 @@ mod stash;
 mod stream;
 mod stream_omp;
 mod summary;
+mod summary_transcript;
 
 use std::fs;
 use std::path::{Path, PathBuf};

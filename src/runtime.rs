@@ -336,8 +336,8 @@ impl RunSupervisor {
         let summary = SummaryEngine::start(config, run_id, artifacts, self.summary_fd);
         if self.summary.insert(summary).enabled() {
             log(&format!(
-                "summary stream enabled (every {} blocks, limit {})",
-                config.summary_every, config.summary_queue_limit
+                "summary stream enabled ({} tokens, queue limit {})",
+                config.summary_tokens, config.summary_queue_limit
             ));
         }
     }
@@ -355,6 +355,9 @@ impl RunSupervisor {
 
     pub(crate) fn reset_worker_session(&mut self) {
         self.worker = None;
+        if let Some(summary) = self.summary.as_mut() {
+            summary.reset_worker_session();
+        }
         self.shutdown_requested = false;
         self.paused = false;
         self.pause_explicit = false;
@@ -428,7 +431,7 @@ impl RunSupervisor {
                     }
                     formatter.process_line(&line);
                     if let Some(summary) = self.summary.as_mut() {
-                        summary.observe(&line, &frame);
+                        summary.observe(&frame);
                     }
                     completion.observe(&frame, &prompt_id);
                     if completion.yielded && completion.settled {

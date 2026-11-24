@@ -51,10 +51,14 @@ stream() {
             ;;
         summary)
             echo '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}'
-            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"checking files"}}'
-            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"first block"}}'
-            echo '{"type":"tool_execution_start","toolName":"bash","toolCallId":"t1","args":{"command":"cargo test"}}'
-            echo '{"type":"tool_execution_end","toolName":"bash","toolCallId":"t1","isError":false}'
+            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"checking "}}'
+            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"files"}}'
+            echo '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"checking files"}}'
+            echo '{"type":"tool_execution_start","toolName":"bash","toolCallId":"t1","args":{"command":"cargo test","async":true}}'
+            echo '{"type":"tool_execution_end","toolName":"bash","toolCallId":"t1","isError":false,"result":{"details":{"async":{"state":"running","jobId":"bg_1","type":"bash"}}}}'
+            echo '{"type":"message_end","message":{"role":"custom","customType":"async-result","content":"&lt;system-notice>\nResume your work using the result below.\nexpected build failure\nCommand exited with code 17\n&lt;/system-notice>","details":{"jobs":[{"jobId":"bg_1","label":"cargo test","status":"failed","type":"bash"}]}}}'
+            echo '{"type":"tool_execution_start","toolName":"wait","toolCallId":"t2","args":{}}'
+            echo '{"type":"tool_execution_end","toolName":"wait","toolCallId":"t2","isError":false,"result":{"details":{"jobs":[{"id":"bg_1","label":"cargo test","status":"failed","type":"bash","exitCode":17,"errorText":"expected build failure"}]}}}'
             echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"partial block"}}'
             ;;
         slow-summary)

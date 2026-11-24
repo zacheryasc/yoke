@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 fn pause_freezes_worker_and_resume_preserves_paused_edits() {
     let p = Project::new();
     ok!(&p.run(&["init"]), "yoke init");
-    p.write(".loop/yoke.conf", "metrics off\nallow .\nsummary-every 0\n");
+    p.write(".loop/yoke.conf", "metrics off\nallow .\nsummary-tokens 0\n");
     let path = install_mock(&p, MOCK);
 
     let log_path = p.path_of(".loop/run.log");

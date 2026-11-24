@@ -1,4 +1,4 @@
-//! `--summary-fd` emits block-driven summary records on the side descriptor
+//! `--summary-fd` emits token-budgeted summaries on the side descriptor
 //! only, and slow summaries apply worker backpressure.
 
 mod common;
@@ -7,9 +7,9 @@ use std::fs;
 use std::process::Stdio;
 
 #[test]
-fn summaries_arrive_on_the_side_stream_in_block_batches() {
+fn summaries_keep_launch_and_completion_separate_and_flush_partial_text() {
     let p = Project::new();
-    seed_loop(&p, "metrics off\nallow .\nsummary-every 2\n");
+    seed_loop(&p, "metrics off\nallow .\nsummary-tokens 12\n");
     let path = install_mock(&p, MOCK);
     let log_path = p.path_of(".loop/run.log");
     let (mut child, stream) = spawn_with_summary(
@@ -32,23 +32,34 @@ fn summaries_arrive_on_the_side_stream_in_block_batches() {
         .find(|r| r["type"] == "run_start")
         .expect("run_start record");
     assert!(start["run_id"].as_str().is_some(), "run_start run id");
+    assert_eq!(start["summary_tokens"], 12);
 
     let summaries: Vec<_> = records.iter().filter(|r| r["type"] == "summary").collect();
-    assert!(!summaries.is_empty(), "at least one summary: {records:?}");
+    assert_eq!(summaries.len(), 3, "{records:?}");
     for s in &summaries {
         assert_eq!(s["text"], "cheap summary of the batch");
     }
-    assert!(
-        summaries.iter().any(|s| s["blocks"] == 2),
-        "first batch is exactly summary-every blocks: {summaries:?}"
-    );
+    assert!(summaries[0]["tokens"].as_u64().unwrap() >= 12);
+    assert!(summaries[1]["tokens"].as_u64().unwrap() >= 12);
+    assert!(summaries[2]["tokens"].as_u64().unwrap() < 12);
 
     let prompts =
         fs::read_to_string(p.path_of(".loop/.summary-prompts")).expect("summary prompts captured");
-    assert!(
-        prompts.contains("cargo test"),
-        "summary prompt should contain terminal-visible tool text: {prompts:?}"
+    let batches: Vec<_> = prompts.split("\n---PROMPT---\n").skip(1).collect();
+    assert_eq!(batches.len(), 3, "{prompts}");
+    has!(
+        batches[0],
+        "checking files\n\nbash cargo test — started bg_1; result pending",
+        "launch"
     );
+    lacks!(batches[0], "expected build failure", "launch");
+    has!(
+        batches[1],
+        "bash job bg_1 finished — failed; exit 17 (cargo test)\nexpected build failure",
+        "completion"
+    );
+    has!(batches[2], "partial block", "final flush");
+    assert_eq!(prompts.matches("expected build failure").count(), 1);
     assert!(
         !prompts.contains("assistantMessageEvent") && !prompts.contains("tool_execution_start"),
         "summary prompt leaked raw JSON: {prompts:?}"
@@ -77,7 +88,7 @@ fn slow_summaries_pause_the_worker_and_resume_when_drained() {
     let p = Project::new();
     seed_loop(
         &p,
-        "metrics off\nallow .\nsummary-every 1\nsummary-model fake-cheap\nsummary-queue-limit 1\n",
+        "metrics off\nallow .\nsummary-tokens 1\nsummary-model fake-cheap\nsummary-queue-limit 1\n",
     );
     let path = install_mock(&p, MOCK);
     let log_path = p.path_of(".loop/run.log");
@@ -108,7 +119,7 @@ fn slow_summaries_pause_the_worker_and_resume_when_drained() {
 #[test]
 fn zero_cadence_disables_default_summaries_but_keeps_lifecycle_records() {
     let p = Project::new();
-    seed_loop(&p, "metrics off\nallow .\nsummary-every 0\n");
+    seed_loop(&p, "metrics off\nallow .\nsummary-tokens 0\n");
     let path = install_mock(&p, MOCK);
     let (mut child, stream) = spawn_with_summary(
         &p,
