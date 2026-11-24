@@ -585,7 +585,12 @@ impl RunSupervisor {
                 .ok_or_else(|| SwitchModelError::Fatal("worker is not running".to_string()))?;
             let id = worker.next_id("model");
             worker
-                .send_set_model(&id, &fallback.provider, &fallback.id)
+                .send_set_model(
+                    &id,
+                    &fallback.provider,
+                    &fallback.id,
+                    fallback.thinking.map(|level| level.as_omp_arg()),
+                )
                 .map_err(|e| SwitchModelError::Fatal(format!("failed to send set_model: {e}")))?;
             id
         };
@@ -1021,13 +1026,22 @@ impl OmpRpcWorker {
         self.stdin.flush()
     }
 
-    fn send_set_model(&mut self, id: &str, provider: &str, model_id: &str) -> io::Result<()> {
-        let request = json!({
+    fn send_set_model(
+        &mut self,
+        id: &str,
+        provider: &str,
+        model_id: &str,
+        thinking: Option<&str>,
+    ) -> io::Result<()> {
+        let mut request = json!({
             "type": "set_model",
             "id": id,
             "provider": provider,
             "modelId": model_id,
         });
+        if let Some(level) = thinking {
+            request["thinkingLevel"] = json!(level);
+        }
         writeln!(self.stdin, "{}", request)?;
         self.stdin.flush()
     }

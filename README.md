@@ -50,12 +50,13 @@ Add one or more fallback models to `.loop/yoke.conf`:
 ```text
 model openai-codex/gpt-6.2-sol
 fallback-model openai/gpt-5.2
-fallback-model deepseek/deepseek-v4
+fallback-model deepseek/deepseek-flash:max
 ```
 
 When a worker turn ends in a provider error — including a Codex safety flag or
 a rate/quota failure — yoke pauses that turn, switches the live OMP session to
 the next fallback model, and continues the same iteration with the existing
-conversation context. Entries are tried in order and stay active for the rest
-of the current plan loop; a brute judge retry starts again on the primary
-model. Judge and periodic agents keep their configured models.
+conversation context. Append `:<thinking>` to a fallback entry to set that
+model's thinking level when it takes over. Entries are tried in order and stay
+active for the rest of the current plan loop; a brute judge retry starts again
+on the primary model. Judge and periodic agents keep their configured models.

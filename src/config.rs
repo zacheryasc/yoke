@@ -43,11 +43,16 @@ pub struct ScopeRule {
 pub struct FallbackModel {
     pub provider: String,
     pub id: String,
+    /// Optional thinking level applied when this model takes over.
+    pub thinking: Option<Thinking>,
 }
 
 impl FallbackModel {
     pub fn as_selector(&self) -> String {
-        format!("{}/{}", self.provider, self.id)
+        match self.thinking {
+            Some(level) => format!("{}/{}:{}", self.provider, self.id, level.as_omp_arg()),
+            None => format!("{}/{}", self.provider, self.id),
+        }
     }
 }
 
@@ -141,23 +146,40 @@ fn parse_fallback_model(
     line_num: usize,
 ) -> Result<FallbackModel, String> {
     let value = value.trim();
-    let (provider, id) = value.split_once('/').ok_or_else(|| {
+    let (target, thinking) = match value.rsplit_once(':') {
+        Some((target, suffix)) => {
+            let level = parse_thinking(suffix, path, line_num).map_err(|_| {
+                cfg_err(
+                    path,
+                    line_num,
+                    &format!(
+                        "invalid fallback-model thinking '{suffix}'; use off, low, medium, high, \
+                         xhigh, or max"
+                    ),
+                )
+            })?;
+            (target, Some(level))
+        }
+        None => (value, None),
+    };
+    let (provider, id) = target.split_once('/').ok_or_else(|| {
         cfg_err(
             path,
             line_num,
-            &format!("fallback-model requires '<provider>/<model-id>', got '{value}'"),
+            &format!("fallback-model requires '<provider>/<model-id>[:thinking]', got '{value}'"),
         )
     })?;
     if provider.is_empty() || id.is_empty() {
         return Err(cfg_err(
             path,
             line_num,
-            &format!("fallback-model requires '<provider>/<model-id>', got '{value}'"),
+            &format!("fallback-model requires '<provider>/<model-id>[:thinking]', got '{value}'"),
         ));
     }
     Ok(FallbackModel {
         provider: provider.to_string(),
         id: id.to_string(),
+        thinking,
     })
 }
 
@@ -397,6 +419,27 @@ mod tests {
                 .map(FallbackModel::as_selector)
                 .collect::<Vec<_>>(),
             ["openai/gpt-5.2", "deepseek/deepseek-v4"]
+        );
+    }
+
+    #[test]
+    fn fallback_model_accepts_thinking_suffix() {
+        let config = load_fixture("allow .\nfallback-model deepseek/deepseek-flash:max\n")
+            .expect("fallback thinking loads");
+        let fallback = &config.fallback_models[0];
+        assert_eq!(fallback.provider, "deepseek");
+        assert_eq!(fallback.id, "deepseek-flash");
+        assert_eq!(fallback.thinking, Some(Thinking::Max));
+        assert_eq!(fallback.as_selector(), "deepseek/deepseek-flash:max");
+    }
+
+    #[test]
+    fn fallback_model_rejects_invalid_thinking() {
+        let err = load_fixture("allow .\nfallback-model deepseek/deepseek-flash:mxa\n")
+            .expect_err("invalid fallback thinking should fail");
+        assert!(
+            err.contains("invalid fallback-model thinking 'mxa'"),
+            "{err}"
         );
     }
 

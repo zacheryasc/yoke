@@ -9,7 +9,9 @@ fn provider_error_switches_model_and_continues_iteration() {
     let p = Project::new();
     seed_loop(
         &p,
-        "model openai-codex/gpt-6.2-sol\nfallback-model openai/gpt-5.2\nallow .\n",
+        "model openai-codex/gpt-6.2-sol\n\
+         fallback-model deepseek/deepseek-flash:max\n\
+         allow .\n",
     );
     let path = install_mock(&p, MOCK);
 
@@ -18,8 +20,9 @@ fn provider_error_switches_model_and_continues_iteration() {
 
     let stdin = p.read(".loop/.omp-stdin");
     has!(&stdin, "\"type\":\"set_model\"", "rpc stdin");
-    has!(&stdin, "\"provider\":\"openai\"", "rpc stdin");
-    has!(&stdin, "\"modelId\":\"gpt-5.2\"", "rpc stdin");
+    has!(&stdin, "\"provider\":\"deepseek\"", "rpc stdin");
+    has!(&stdin, "\"modelId\":\"deepseek-flash\"", "rpc stdin");
+    has!(&stdin, "\"thinkingLevel\":\"max\"", "rpc stdin");
     has!(&stdin, "[YOKE MODEL FAILOVER]", "continuation prompt");
     assert_eq!(
         stdin.matches("\"type\":\"prompt\"").count(),
@@ -28,7 +31,11 @@ fn provider_error_switches_model_and_continues_iteration() {
     );
 
     let err = stderr(&out);
-    has!(&err, "switching model to openai/gpt-5.2", "run stderr");
+    has!(
+        &err,
+        "switching model to deepseek/deepseek-flash:max",
+        "run stderr"
+    );
     has!(&err, "continuing the same iteration", "run stderr");
     has!(&p.read(".loop/notes.md"), "STATUS: DONE", "worker notes");
 }
