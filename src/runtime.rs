@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::config::Config;
+use crate::config::{Config, FallbackModel};
 use crate::summary::SummaryEngine;
 use crate::{AgentRunStats, log, log_error, signal, stream, stream_omp};
 
@@ -22,6 +22,7 @@ const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_EVENT_POLL: Duration = Duration::from_millis(50);
 // Paused workers keep injections queued, so bound the wait for delivery.
 const INJECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const RPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InjectionKind {
@@ -313,6 +314,7 @@ pub(crate) struct RunSupervisor {
     summary_fd: Option<i32>,
     backup_dir: Option<PathBuf>,
     protected: Vec<String>,
+    fallback_cursor: usize,
 }
 
 impl RunSupervisor {
@@ -355,6 +357,7 @@ impl RunSupervisor {
 
     pub(crate) fn reset_worker_session(&mut self) {
         self.worker = None;
+        self.fallback_cursor = 0;
         if let Some(summary) = self.summary.as_mut() {
             summary.reset_worker_session();
         }
@@ -392,16 +395,116 @@ impl RunSupervisor {
         let worker = self.worker.as_mut().expect("worker just ensured");
         signal::set_child_pid(-(worker.child.id() as i32));
 
-        let prompt_id = worker.next_id("prompt");
-        if let Err(e) = worker.send_message_command("prompt", &prompt_id, prompt) {
-            log_error(&format!("failed to send OMP RPC prompt: {}", e));
-            signal::set_child_pid(0);
-            return failed_run(wall_start);
-        }
-
         let mut formatter = stream_omp::OmpStreamProcessor::new(log_path.as_deref(), prior_total);
+        let mut prompt_text = prompt.to_owned();
+        let success = loop {
+            if signal::interrupted() {
+                break false;
+            }
+            let prompt_id = self
+                .worker
+                .as_mut()
+                .expect("worker just ensured")
+                .next_id("prompt");
+            if let Err(e) = self.send_worker_prompt(&prompt_id, &prompt_text) {
+                log_error(&format!("failed to send OMP RPC prompt: {}", e));
+                break false;
+            }
+
+            let turn = self.run_worker_turn(config, &prompt_id, &mut formatter);
+            if turn.success {
+                break true;
+            }
+            if !turn.switchable || signal::interrupted() {
+                break false;
+            }
+
+            self.drain_control();
+            if self.shutdown_requested {
+                break false;
+            }
+            let detail = turn
+                .error
+                .as_deref()
+                .map_or_else(String::new, |error| format!(": {error}"));
+            let Some(fallback) = self.next_fallback(config) else {
+                if !config.fallback_models.is_empty() {
+                    log_error(&format!(
+                        "worker provider error{detail}; no fallback models remain"
+                    ));
+                }
+                break false;
+            };
+            log(&format!(
+                "worker provider error{detail} \u{2014} switching model to {} and continuing",
+                fallback.as_selector()
+            ));
+            prompt_text = failover_prompt(turn.error.as_deref());
+
+            // A paused worker is stopped with SIGSTOP, so thaw it long enough
+            // to acknowledge set_model, then restore the pause.
+            let was_paused = self.paused;
+            if was_paused {
+                self.set_worker_paused(false);
+            }
+            let switched = self.switch_worker_model(&fallback, &mut formatter);
+            if was_paused {
+                self.set_worker_paused(true);
+            }
+            if let Err(e) = switched {
+                let (error, fatal) = match e {
+                    SwitchModelError::Rejected(error) => (error, false),
+                    SwitchModelError::Fatal(error) => (error, true),
+                };
+                log_error(&format!(
+                    "failed to switch worker model to {}: {}",
+                    fallback.as_selector(),
+                    error
+                ));
+                if fatal {
+                    break false;
+                }
+                continue;
+            }
+            log(&format!(
+                "worker model switched to {}; continuing the same iteration",
+                fallback.as_selector()
+            ));
+        };
+
+        signal::set_child_pid(0);
+        let summary = formatter.finish();
+        let success = !signal::interrupted() && success;
+
+        log(&format!(
+            "OMP RPC turn {} ({})",
+            iteration,
+            if success { "success" } else { "failure" }
+        ));
+        AgentRunStats {
+            success,
+            wall_secs: wall_start.elapsed().as_secs_f64(),
+            stream: summary,
+        }
+    }
+
+    fn send_worker_prompt(&mut self, prompt_id: &str, prompt: &str) -> Result<(), String> {
+        let worker = self.worker.as_mut().ok_or("worker is not running")?;
+        worker
+            .send_message_command("prompt", prompt_id, prompt)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Collect one prompt turn. `switchable` is true only for a provider
+    /// error that a model change can plausibly route around.
+    fn run_worker_turn(
+        &mut self,
+        config: &Config,
+        prompt_id: &str,
+        formatter: &mut stream_omp::OmpStreamProcessor,
+    ) -> TurnResult {
         let mut pending: HashMap<String, PendingRpc> = HashMap::new();
-        pending.insert(prompt_id.clone(), PendingRpc::Prompt);
+        pending.insert(prompt_id.to_string(), PendingRpc::Prompt);
         let mut completion = TurnCompletion::default();
 
         let success = loop {
@@ -433,7 +536,7 @@ impl RunSupervisor {
                     if let Some(summary) = self.summary.as_mut() {
                         summary.observe(&frame);
                     }
-                    completion.observe(&frame, &prompt_id);
+                    completion.observe(&frame, prompt_id);
                     if completion.yielded && completion.settled {
                         break !completion.failed;
                     }
@@ -455,19 +558,91 @@ impl RunSupervisor {
             }
         };
 
-        signal::set_child_pid(0);
-        let summary = formatter.finish();
-        let success = !signal::interrupted() && success;
-
-        log(&format!(
-            "OMP RPC turn {} ({})",
-            iteration,
-            if success { "success" } else { "failure" }
-        ));
-        AgentRunStats {
+        let switchable = completion.status.as_deref() == Some("error")
+            && completion.error_code.as_deref() != Some("cost_cap");
+        TurnResult {
             success,
-            wall_secs: wall_start.elapsed().as_secs_f64(),
-            stream: summary,
+            switchable,
+            error: completion.error,
+        }
+    }
+
+    fn next_fallback(&mut self, config: &Config) -> Option<FallbackModel> {
+        let fallback = config.fallback_models.get(self.fallback_cursor)?.clone();
+        self.fallback_cursor += 1;
+        Some(fallback)
+    }
+
+    fn switch_worker_model(
+        &mut self,
+        fallback: &FallbackModel,
+        formatter: &mut stream_omp::OmpStreamProcessor,
+    ) -> Result<(), SwitchModelError> {
+        let request_id = {
+            let worker = self
+                .worker
+                .as_mut()
+                .ok_or_else(|| SwitchModelError::Fatal("worker is not running".to_string()))?;
+            let id = worker.next_id("model");
+            worker
+                .send_set_model(&id, &fallback.provider, &fallback.id)
+                .map_err(|e| SwitchModelError::Fatal(format!("failed to send set_model: {e}")))?;
+            id
+        };
+
+        let deadline = std::time::Instant::now() + RPC_COMMAND_TIMEOUT;
+        loop {
+            if signal::interrupted() {
+                return Err(SwitchModelError::Fatal(
+                    "interrupted while switching models".to_string(),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SwitchModelError::Fatal(
+                    "timed out waiting for set_model response".to_string(),
+                ));
+            }
+            let line = {
+                let worker = self
+                    .worker
+                    .as_mut()
+                    .ok_or_else(|| SwitchModelError::Fatal("worker is not running".to_string()))?;
+                match worker.recv_line(remaining.min(RPC_EVENT_POLL)) {
+                    Ok(Some(line)) => Some(line),
+                    Ok(None) => {
+                        if let Ok(Some(status)) = worker.child.try_wait() {
+                            return Err(SwitchModelError::Fatal(format!(
+                                "OMP RPC process exited during model switch: {status}"
+                            )));
+                        }
+                        None
+                    }
+                    Err(e) => return Err(SwitchModelError::Fatal(e.to_string())),
+                }
+            };
+            let Some(line) = line else {
+                continue;
+            };
+            let frame = serde_json::from_str(&line).unwrap_or(Value::Null);
+            formatter.process_line(&line);
+            if let Some(summary) = self.summary.as_mut() {
+                summary.observe(&frame);
+            }
+            if frame.get("type").and_then(Value::as_str) == Some("response")
+                && frame.get("id").and_then(Value::as_str) == Some(request_id.as_str())
+            {
+                if frame.get("success").and_then(Value::as_bool) == Some(true) {
+                    return Ok(());
+                }
+                return Err(SwitchModelError::Rejected(
+                    frame
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("set_model rejected")
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -637,6 +812,23 @@ struct TurnCompletion {
     yielded: bool,
     settled: bool,
     failed: bool,
+    status: Option<String>,
+    error: Option<String>,
+    error_code: Option<String>,
+}
+
+/// Outcome of one prompt turn, including whether a model switch can recover it.
+struct TurnResult {
+    success: bool,
+    switchable: bool,
+    error: Option<String>,
+}
+
+enum SwitchModelError {
+    /// The session stayed healthy but refused this model; try the next one.
+    Rejected(String),
+    /// The RPC worker can no longer be trusted; stop the run.
+    Fatal(String),
 }
 
 impl TurnCompletion {
@@ -648,12 +840,33 @@ impl TurnCompletion {
             Some("prompt_result") if frame.get("id").and_then(Value::as_str) == Some(prompt_id) => {
                 self.yielded = true;
                 self.settled = frame.get("sessionSettled").and_then(Value::as_bool) == Some(true);
-                self.failed |= frame.get("status").and_then(Value::as_str) != Some("completed");
+                self.status = frame
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.failed |= self.status.as_deref() != Some("completed");
+                if let Some(error) = frame.get("error") {
+                    self.error = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| error.as_str())
+                        .map(str::to_owned);
+                    self.error_code = error.get("code").and_then(Value::as_str).map(str::to_owned);
+                }
             }
             Some("session_settled") => self.settled = true,
             _ => {}
         }
     }
+}
+
+fn failover_prompt(error: Option<&str>) -> String {
+    let detail = error.map_or_else(String::new, |error| format!("\nProvider error: {error}"));
+    format!(
+        "[YOKE MODEL FAILOVER]{detail}\n\nThe previous model request failed. Continue the same \
+         task from where it stopped using the remaining context. Do not restart or repeat work \
+         that already completed."
+    )
 }
 
 #[derive(Debug)]
@@ -803,6 +1016,17 @@ impl OmpRpcWorker {
             "type": command,
             "id": id,
             "message": message,
+        });
+        writeln!(self.stdin, "{}", request)?;
+        self.stdin.flush()
+    }
+
+    fn send_set_model(&mut self, id: &str, provider: &str, model_id: &str) -> io::Result<()> {
+        let request = json!({
+            "type": "set_model",
+            "id": id,
+            "provider": provider,
+            "modelId": model_id,
         });
         writeln!(self.stdin, "{}", request)?;
         self.stdin.flush()

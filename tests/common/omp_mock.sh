@@ -2,7 +2,8 @@
 # Parameterized mock `omp` used by the integration tests.
 # Behavior is selected by env vars set on the yoke invocation:
 #   MOCK_JUDGE=pass|fail|fail-first|fail-always|no-verdict
-#   MOCK_WORKER=done|cost|patch|await-steer|pause|summary|slow-summary
+#   MOCK_WORKER=done|cost|patch|await-steer|pause|summary|slow-summary|model-error
+#   MOCK_SET_MODEL=accept|reject
 #   MOCK_STEER=accept|reject
 #   MOCK_SUMMARY=cheap|slow
 #   MOCK_WITNESS=1 copies verdict.md to .loop/.witness-N on each agent run.
@@ -128,6 +129,15 @@ while IFS= read -r line; do
     id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
     if [[ "$line" == *'"type":"prompt"'* ]]; then
         prompt_id="$id"
+        if [[ "${MOCK_WORKER:-}" == model-error && ! -f .loop/.model-switched ]]; then
+            printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+            echo '{"type":"session","version":3,"id":"sess-failover","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/project"}'
+            echo '{"type":"turn_start"}'
+            echo '{"type":"agent_end","messages":[],"isTerminal":true,"yielded":true}'
+            printf '{"type":"prompt_result","id":"%s","agentInvoked":true,"status":"error","sessionSettled":true,"error":{"message":"400 The request was flagged by the provider.","provider":"openai-codex","model":"gpt-6.2-sol","retryable":false,"httpStatus":400}}\n' "$id"
+            echo '{"type":"session_settled"}'
+            continue
+        fi
         case "${MOCK_WORKER:-done}" in
             pause|await-steer) ;;
             *) agent ;;
@@ -157,6 +167,14 @@ while IFS= read -r line; do
                 exit 0
                 ;;
         esac
+    elif [[ "$line" == *'"type":"set_model"'* ]]; then
+        echo "$line" >> .loop/.set-model
+        if [[ "${MOCK_SET_MODEL:-accept}" == reject ]]; then
+            printf '{"id":"%s","type":"response","command":"set_model","success":false,"error":"model is not available"}\n' "$id"
+        else
+            touch .loop/.model-switched
+            printf '{"id":"%s","type":"response","command":"set_model","success":true,"data":{"provider":"openai","id":"gpt-5.2"}}\n' "$id"
+        fi
     elif [[ "$line" == *'"type":"steer"'* ]]; then
         echo "$line" >> .loop/.steer-requests
         if [[ "${MOCK_STEER:-accept}" == reject ]]; then

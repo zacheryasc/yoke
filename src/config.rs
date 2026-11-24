@@ -38,6 +38,19 @@ pub struct ScopeRule {
     pub prefix: String,
 }
 
+/// One model in the worker's ordered error-fallback chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FallbackModel {
+    pub provider: String,
+    pub id: String,
+}
+
+impl FallbackModel {
+    pub fn as_selector(&self) -> String {
+        format!("{}/{}", self.provider, self.id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Periodic {
     pub path: String, // e.g., ".loop/cleaner.md"
@@ -52,6 +65,8 @@ pub struct Config {
     pub log_dir: Option<String>,
     pub image: Option<String>,
     pub model: Option<String>,
+    /// Ordered models tried when a worker turn ends in a provider error.
+    pub fallback_models: Vec<FallbackModel>,
     pub judge_model: Option<String>,
     pub thinking: Option<Thinking>,
     pub judge_thinking: Option<String>,
@@ -118,6 +133,32 @@ fn parse_thinking(value: &str, path: &Path, line_num: usize) -> Result<Thinking,
             ),
         )),
     }
+}
+
+fn parse_fallback_model(
+    value: &str,
+    path: &Path,
+    line_num: usize,
+) -> Result<FallbackModel, String> {
+    let value = value.trim();
+    let (provider, id) = value.split_once('/').ok_or_else(|| {
+        cfg_err(
+            path,
+            line_num,
+            &format!("fallback-model requires '<provider>/<model-id>', got '{value}'"),
+        )
+    })?;
+    if provider.is_empty() || id.is_empty() {
+        return Err(cfg_err(
+            path,
+            line_num,
+            &format!("fallback-model requires '<provider>/<model-id>', got '{value}'"),
+        ));
+    }
+    Ok(FallbackModel {
+        provider: provider.to_string(),
+        id: id.to_string(),
+    })
 }
 
 fn parse_periodic(value: &str, path: &Path, line_num: usize) -> Result<Periodic, String> {
@@ -189,6 +230,9 @@ impl Config {
             "log-dir" => self.log_dir = Some(value.to_owned()),
             "image" => self.image = Some(value.to_owned()),
             "model" => self.model = Some(value.to_owned()),
+            "fallback-model" => self
+                .fallback_models
+                .push(parse_fallback_model(value, path, line_num)?),
             "allow" | "add-only" | "no-modify" => {
                 let tag = match directive {
                     "allow" => ScopeTag::Allow,
@@ -223,6 +267,7 @@ impl Default for Config {
             log_dir: None,
             image: None,
             model: None,
+            fallback_models: Vec::new(),
             judge_model: None,
             thinking: None,
             judge_thinking: None,
@@ -337,6 +382,33 @@ mod tests {
             err.contains("thinking must be 'off', 'low', 'medium', 'high', 'xhigh', or 'max'"),
             "error should list valid levels, got: {err}"
         );
+    }
+
+    #[test]
+    fn fallback_models_parse_in_order() {
+        let config = load_fixture(
+            "allow .\nfallback-model openai/gpt-5.2\nfallback-model deepseek/deepseek-v4\n",
+        )
+        .expect("fallback config loads");
+        assert_eq!(
+            config
+                .fallback_models
+                .iter()
+                .map(FallbackModel::as_selector)
+                .collect::<Vec<_>>(),
+            ["openai/gpt-5.2", "deepseek/deepseek-v4"]
+        );
+    }
+
+    #[test]
+    fn fallback_model_requires_provider_and_id() {
+        let err = load_fixture("allow .\nfallback-model gpt-5.2\n")
+            .expect_err("missing provider should fail");
+        assert!(err.contains("<provider>/<model-id>"), "{err}");
+
+        let err = load_fixture("allow .\nfallback-model openai/\n")
+            .expect_err("empty model id should fail");
+        assert!(err.contains("<provider>/<model-id>"), "{err}");
     }
 
     #[test]
