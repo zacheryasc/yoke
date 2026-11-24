@@ -52,6 +52,7 @@ pub struct Config {
     pub log_dir: Option<String>,
     pub image: Option<String>,
     pub model: Option<String>,
+    pub judge_model: Option<String>,
     pub thinking: Option<Thinking>,
     pub judge_thinking: Option<String>,
     pub scope_rules: Vec<ScopeRule>,
@@ -156,6 +157,7 @@ impl Config {
         match directive {
             "max-tail" => self.max_tail = parse_number(value, path, line_num, directive)?,
             "thinking" => self.thinking = Some(parse_thinking(value, path, line_num)?),
+            "judge-model" => self.judge_model = Some(value.to_owned()),
             "judge-thinking" => self.judge_thinking = Some(value.to_owned()),
             "judge-every" => {
                 self.judge_every = Some(parse_positive_u32(value, path, line_num, directive)?)
@@ -221,6 +223,7 @@ impl Default for Config {
             log_dir: None,
             image: None,
             model: None,
+            judge_model: None,
             thinking: None,
             judge_thinking: None,
             scope_rules: Vec::new(),

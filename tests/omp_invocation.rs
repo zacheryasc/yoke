@@ -35,39 +35,60 @@ fn default_backend_invokes_omp_with_model_and_thinking() {
 }
 
 #[test]
-fn judge_thinking_overrides_worker_thinking_only_for_judge() {
-    for (settings, expected_worker, expected_judge) in [
-        ("", None, None),
-        ("thinking xhigh\n", Some("xhigh"), Some("xhigh")),
+fn judge_options_override_worker_and_periodic_defaults() {
+    for (settings, models, thinking) in [
+        ("", [None; 3], [None; 3]),
         (
-            "thinking xhigh\njudge-thinking auto\n",
-            Some("xhigh"),
-            Some("auto"),
+            "model worker\nthinking xhigh\n",
+            [Some("worker"); 3],
+            [Some("xhigh"); 3],
+        ),
+        (
+            "model worker\nthinking xhigh\njudge-thinking auto\n",
+            [Some("worker"); 3],
+            [Some("xhigh"), Some("xhigh"), Some("auto")],
+        ),
+        (
+            "model worker\nthinking high\njudge-model provider/judge\njudge-thinking low\n",
+            [Some("worker"), Some("worker"), Some("provider/judge")],
+            [Some("high"), Some("high"), Some("low")],
+        ),
+        (
+            "judge-model provider/judge\n",
+            [None, None, Some("provider/judge")],
+            [None; 3],
         ),
     ] {
         let p = Project::new();
-        seed_loop(&p, &format!("metrics off\nallow .\n{settings}"));
+        seed_loop(
+            &p,
+            &format!("metrics off\nallow .\nperiodic .loop/reviewer.md 1\n{settings}"),
+        );
+        p.write(".loop/reviewer.md", "Review the work.\n");
         let path = install_mock(&p, MOCK);
         let out = p.run_env(&["run"], &[("PATH", &path)]);
         ok!(&out, "yoke run");
 
         let argv = p.read(".loop/.omp-argv");
-        let (worker, judge) = argv
+        let (worker, rest) = argv
             .strip_prefix("CALL\n")
             .unwrap()
             .split_once("\nCALL\n")
             .unwrap();
+        let (periodic, judge) = rest.split_once("\nCALL\n").unwrap();
         has!(worker, "--mode\nrpc", "worker argv");
-        assert_eq!(
-            worker.lines().skip_while(|arg| *arg != "--thinking").nth(1),
-            expected_worker,
-            "worker argv: {worker}"
-        );
+        has!(periodic, "Read .loop/reviewer.md", "periodic argv");
         has!(judge, "Read .loop/judge.md.", "judge argv");
+        let calls = [worker, periodic, judge];
         assert_eq!(
-            judge.lines().skip_while(|arg| *arg != "--thinking").nth(1),
-            expected_judge,
-            "judge argv: {judge}"
+            calls.map(|call| call.lines().skip_while(|arg| *arg != "--model").nth(1)),
+            models,
+            "model arguments: {argv}"
+        );
+        assert_eq!(
+            calls.map(|call| call.lines().skip_while(|arg| *arg != "--thinking").nth(1)),
+            thinking,
+            "thinking arguments: {argv}"
         );
     }
 }

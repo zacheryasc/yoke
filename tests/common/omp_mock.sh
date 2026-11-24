@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Parameterized mock `omp` used by the integration tests.
 # Behavior is selected by env vars set on the yoke invocation:
-#   MOCK_JUDGE=pass|fail|fail-first|fail-always
+#   MOCK_JUDGE=pass|fail|fail-first|fail-always|no-verdict
 #   MOCK_WORKER=done|cost|patch|await-steer|pause|summary|slow-summary
 #   MOCK_STEER=accept|reject
 #   MOCK_SUMMARY=cheap|slow
@@ -29,6 +29,7 @@ judge() {
         fail) fail_judge ;;
         fail-first) if [[ $(bump .loop/.judge-count) -eq 1 ]]; then fail_judge; else pass_judge; fi ;;
         fail-always) bump .loop/.judge-count >/dev/null; fail_judge ;;
+        no-verdict) : ;;
         *) pass_judge ;;
     esac
 }

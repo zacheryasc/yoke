@@ -23,14 +23,17 @@ After `start`, end your turn without polling. Summaries and the final result
 wake the session; artifacts are under `.loop/runs/<run-id>/`.
 Yoke's worker and judge sessions don't get the supervisor tool.
 
-## Choose the judge's thinking level
+## Choose the judge's model and thinking level
 
-To override the judge only, add this optional line to `.loop/yoke.conf`:
+Set optional judge-only overrides in `.loop/yoke.conf`:
 
 ```text
+model openai/gpt-5.2
+thinking high
+judge-model openai/gpt-5.5
 judge-thinking auto
 ```
 
-Yoke passes the value through to `omp --thinking`. If omitted, the judge
-inherits `thinking`; if both are omitted, omp chooses its default. The
-override does not change the worker or periodic agents.
+Both checkpoint and final judges use these overrides. Each omitted `judge-*`
+setting inherits its shared counterpart, or OMP's default if neither is set.
+Workers and periodic agents keep the shared settings.

@@ -392,14 +392,19 @@ fn build_docker_omp_command(image: &str) -> Command {
 }
 
 /// Build the shared native or container command for OMP's JSON and RPC modes.
-pub(crate) fn omp_command(config: &Config, mode: &str, thinking: Option<&str>) -> Command {
+pub(crate) fn omp_command(
+    config: &Config,
+    mode: &str,
+    model: Option<&str>,
+    thinking: Option<&str>,
+) -> Command {
     let mut command = match config.image.as_deref() {
         Some(image) => build_docker_omp_command(image),
         None => Command::new("omp"),
     };
     command.env("YOKE_CHILD_OMP", "1");
     command.args(["--mode", mode, "--auto-approve"]);
-    if let Some(model) = config.model.as_deref() {
+    if let Some(model) = model {
         command.args(["--model", model]);
     }
     if let Some(thinking) = thinking {
@@ -424,7 +429,7 @@ pub(crate) struct AgentRunStats {
 fn invoke_process(
     runner: &mut LoopRunner,
     config: &Config,
-    thinking: Option<&str>,
+    mut cmd: Command,
     prompt: &str,
     label: &str,
     log_prefix: &str,
@@ -438,8 +443,6 @@ fn invoke_process(
         if in_container { "in container " } else { "" },
         iteration
     ));
-
-    let mut cmd = omp_command(config, "json", thinking);
 
     let mut child = match cmd
         .args(["-p", prompt])
@@ -619,18 +622,23 @@ VERDICT: FAIL
 <what you tested, what went wrong, and what the correct behavior should be>";
 
     // Judge is always a fresh session — independence per behavioral-specification §2.1.
-    if !invoke_process(
-        runner,
+    if let Err(e) = fs::write(
+        VERDICT_PATH,
+        "VERDICT: FAIL\n\nThe current judge has not recorded a verdict.\n",
+    ) {
+        log_error(&format!("failed to invalidate previous verdict: {e}"));
+        return false;
+    }
+    let cmd = omp_command(
         config,
+        "json",
+        config.judge_model.as_deref().or(config.model.as_deref()),
         config
             .judge_thinking
             .as_deref()
             .or_else(|| config.thinking.map(|level| level.as_omp_arg())),
-        judge_prompt,
-        "judge",
-        "judge",
-        iteration,
-    ) {
+    );
+    if !invoke_process(runner, config, cmd, judge_prompt, "judge", "judge", iteration) {
         return false;
     }
 
@@ -919,10 +927,16 @@ fn fire_periodic_agents(runner: &mut LoopRunner, config: &Config, iteration: u32
                 "\x1b[38;5;207m",
             );
             let prompt = format!("Read {} and follow its instructions.", periodic.path);
+            let cmd = omp_command(
+                config,
+                "json",
+                config.model.as_deref(),
+                config.thinking.map(|level| level.as_omp_arg()),
+            );
             if !invoke_process(
                 runner,
                 config,
-                config.thinking.map(|level| level.as_omp_arg()),
+                cmd,
                 &prompt,
                 &periodic.name,
                 &format!("periodic-{}", periodic.name),

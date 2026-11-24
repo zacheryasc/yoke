@@ -123,6 +123,17 @@ fn brute_judge_fail_then_pass() {
 }
 
 #[test]
+fn a_judge_that_writes_no_verdict_cannot_reuse_a_previous_pass() {
+    let p = Project::new();
+    seed_loop(&p, "allow .\nmax-judge-failures 1\n");
+    p.write(".loop/verdict.md", "VERDICT: PASS\n\nPrevious run.\n");
+    let path = install_mock(&p, MOCK);
+    let out = p.run_env(&["run"], &[("PATH", &path), ("MOCK_JUDGE", "no-verdict")]);
+    failed!(&out, "judge did not write a verdict");
+    assert!(p.read(".loop/verdict.md").starts_with("VERDICT: FAIL"));
+}
+
+#[test]
 fn guard_results_written_after_output_field_removal() {
     let p = Project::new();
     seed_loop(&p, "allow .\nguard  echo SENTINEL_GUARD_OUTPUT && exit 1\n");
